@@ -30,7 +30,7 @@ jobs:
       - name: Restaurar keystore a partir do secret
         working-directory: android
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release-key.jks
 
       - name: Build APK assinado (release)
         working-directory: android
