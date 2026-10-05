@@ -98,7 +98,18 @@ function dropEntry(db, contentDir, row) {
  * status() says so.
  */
 const PINNED_SQL = `content_id IN (SELECT content_id FROM playlist_items WHERE content_id IS NOT NULL)
-                    OR content_id IN (SELECT default_content_id FROM devices WHERE default_content_id IS NOT NULL)`;
+                    OR content_id IN (SELECT default_content_id FROM devices WHERE default_content_id IS NOT NULL)
+                    OR content_id IN (SELECT json_extract(j.value, '$.content_id')
+                                        FROM playlists p, json_each(p.published_snapshot) j
+                                       WHERE p.smart_rules IS NOT NULL AND json_valid(p.published_snapshot))
+                    OR content_id IN (SELECT json_extract(j.value, '$.content_id')
+                                        FROM playlists p, json_each(p.published_snapshot) j
+                                       WHERE json_valid(p.published_snapshot)
+                                         AND EXISTS (SELECT 1 FROM playlist_items k JOIN playlists c ON c.id = k.child_playlist_id
+                                                      WHERE k.playlist_id = p.id AND c.smart_rules IS NOT NULL))`;
+// ⚠️ The last two arms: a SMART playlist's files are chosen by rules and have no playlist_items row,
+// so the first arm cannot see them, and neither can it see them flattened into a parent's snapshot.
+// What is in a published snapshot is on screen, so it is pinned.
 
 /** Evict least-recently-read UNPINNED entries of this edge until `need` bytes fit under the cap. */
 function makeRoom(db, contentDir, edgeId, need, capBytes) {

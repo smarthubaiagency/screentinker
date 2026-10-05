@@ -705,9 +705,33 @@ export async function render(container) {
         break;
       case 'webpage':
         html += `
-          <div class="form-group"><label>${t('widget.field.url')}</label><input type="text" id="wUrl" class="input" value="${config.url || ''}" placeholder="https://example.com"></div>
-          <div class="form-group"><label>${t('widget.field.zoom_pct')}</label><input type="number" id="wZoom" class="input" value="${config.zoom || 100}"></div>
-          <div class="form-group"><label>${t('widget.field.refresh_interval')}</label><input type="number" id="wRefresh" class="input" value="${config.refresh_interval || 0}"></div>`;
+          <div class="form-group"><label>${t('widget.field.url')}</label><input type="text" id="wUrl" class="input" value="${esc(config.url || '')}" placeholder="https://example.com"></div>
+          <div class="form-group"><label>${t('widget.field.zoom_pct')}</label><input type="number" id="wZoom" class="input" value="${Number(config.zoom) || 100}"></div>
+          <div class="form-group"><label>${t('widget.field.refresh_interval')}</label><input type="number" id="wRefresh" class="input" value="${Number(config.refresh_interval) || 0}"></div>
+          <!-- #473: walk-up interactive page. Android players only; elsewhere it stays a passive page. -->
+          <div class="form-group" style="padding:10px;border:1px dashed var(--border);border-radius:6px">
+            <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+              <input type="checkbox" id="wInteractive" ${config.interactive ? 'checked' : ''} style="margin-top:3px">
+              <span><strong>${t('widget.web.interactive')}</strong><br><span style="font-size:12px;color:var(--text-muted)">${t('widget.web.interactive_hint')}</span></span>
+            </label>
+            <div id="wInteractiveOpts" style="margin-top:10px;${config.interactive ? '' : 'display:none'}">
+              <div id="wInteractiveSupport" style="font-size:12px;color:var(--text-muted);margin-bottom:10px"></div>
+              <div class="form-group"><label>${t('widget.web.idle_timeout')}</label><input type="number" id="wIdle" class="input" min="15" max="3600" value="${Number(config.idle_timeout_sec) || 60}"></div>
+              <div class="form-group"><label>${t('widget.web.allowed_domains')}</label><input type="text" id="wDomains" class="input" value="${esc(Array.isArray(config.allowed_domains) ? config.allowed_domains.join(', ') : (config.allowed_domains || ''))}" placeholder="${esc(t('widget.web.allowed_domains_ph'))}">
+                <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.web.allowed_domains_hint')}</div></div>
+              <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;margin-bottom:8px">
+                <input type="checkbox" id="wHomeBtn" ${config.home_button === false ? '' : 'checked'} style="margin-top:3px">
+                <span>${t('widget.web.home_button')}</span>
+              </label>
+              <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+                <input type="checkbox" id="wKeepConsent" ${config.keep_consent ? 'checked' : ''} style="margin-top:3px">
+                <span>${t('widget.web.keep_consent')}<br><span style="font-size:12px;color:var(--text-muted)">${t('widget.web.keep_consent_hint')}</span></span>
+              </label>
+              <div id="wKeepNamesRow" class="form-group" style="margin-top:8px;${config.keep_consent ? '' : 'display:none'}"><label>${t('widget.web.keep_cookie_names')}</label><input type="text" id="wKeepNames" class="input" value="${esc(Array.isArray(config.keep_cookie_names) ? config.keep_cookie_names.join(', ') : (config.keep_cookie_names || ''))}" placeholder="${esc(t('widget.web.keep_cookie_names_ph'))}">
+                <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.web.keep_cookie_names_hint')}</div></div>
+              <div style="font-size:12px;color:var(--text-muted);margin-top:8px">${t('widget.web.zoom_hint')}</div>
+            </div>
+          </div>`;
         break;
       case 'social':
         html += `
@@ -813,6 +837,29 @@ export async function render(container) {
     // Transitions carry their own live preview, so the iframe "Preview" button doesn't apply.
     const pvBtn = document.getElementById('previewWidgetBtn');
     if (pvBtn) pvBtn.style.display = (type === 'transition') ? 'none' : '';
+
+    if (type === 'webpage') {
+      const box = document.getElementById('wInteractive');
+      const opts = document.getElementById('wInteractiveOpts');
+      if (box && opts) box.addEventListener('change', () => { opts.style.display = box.checked ? '' : 'none'; });
+      // Which screens here will actually give a visitor the full kiosk (#473): full, limited, or none.
+      const sup = document.getElementById('wInteractiveSupport');
+      if (sup) {
+        api.getDevices().then((list) => {
+          const n = { full: 0, framed: 0, none: 0 };
+          for (const d of (Array.isArray(list) ? list : [])) {
+            const c = Array.isArray(d.capabilities) ? d.capabilities : [];
+            if (c.includes('playback.web_interactive')) n.full++;
+            else if (c.includes('playback.web_interactive_framed')) n.framed++;
+            else n.none++;
+          }
+          if (n.full + n.framed + n.none) sup.textContent = t('widget.web.support', n);
+        }).catch(() => {});
+      }
+      const keep = document.getElementById('wKeepConsent');
+      const names = document.getElementById('wKeepNamesRow');
+      if (keep && names) keep.addEventListener('change', () => { names.style.display = keep.checked ? '' : 'none'; });
+    }
 
     if (type === 'directory-board') {
       dirState.logo_url = config.logo_url || '';
@@ -1294,7 +1341,21 @@ export async function render(container) {
         locale: (val('wWeatherLocale') || '').trim() }); break;
       case 'rss': Object.assign(config, { feed_url: val('wFeedUrl'), scroll_speed: parseInt(val('wScrollSpeed')) || 30, max_items: parseInt(val('wMaxItems')) || 10, font_size: parseInt(val('wFontSize')) || 24, color: val('wColor'), background: val('wBg') }); break;
       case 'text': Object.assign(config, { html: val('wHtml'), css: val('wCss'), background: val('wBg') }); break;
-      case 'webpage': Object.assign(config, { url: val('wUrl'), zoom: parseInt(val('wZoom')) || 100, refresh_interval: parseInt(val('wRefresh')) || 0 }); break;
+      case 'webpage': {
+        Object.assign(config, { url: val('wUrl'), zoom: parseInt(val('wZoom')) || 100, refresh_interval: parseInt(val('wRefresh')) || 0 });
+        const on = !!document.getElementById('wInteractive')?.checked;
+        config.interactive = on;
+        if (on) {
+          config.idle_timeout_sec = Math.min(3600, Math.max(15, parseInt(val('wIdle')) || 60));
+          config.allowed_domains = String(val('wDomains') || '').split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
+          config.home_button = !!document.getElementById('wHomeBtn')?.checked;
+          config.keep_consent = !!document.getElementById('wKeepConsent')?.checked;
+          config.keep_cookie_names = config.keep_consent
+            ? String(val('wKeepNames') || '').split(/[\s,]+/).map((d) => d.trim()).filter((d) => /^[A-Za-z0-9_.-]+[*]?$/.test(d) && d !== '*')
+            : [];
+        }
+        break;
+      }
       case 'social': Object.assign(config, { platform: val('wPlatform'), query: val('wQuery') }); break;
       case 'transition': {
         const shaders = Array.from(document.querySelectorAll('#wTransList input[type=checkbox]:checked')).map(c => c.dataset.id);

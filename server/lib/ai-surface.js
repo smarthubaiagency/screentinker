@@ -248,33 +248,7 @@ function linkHeader(base, { markdownOf = null } = {}) {
 /*
  * Does this request want Markdown?
  *
- * ⚠️ A BROWSER SENDS `Accept: text/html,...,*​/*;q=0.8`, and that trailing wildcard matches
- * text/markdown. Treating any match as a yes would serve Markdown to every human visitor. So the
- * test is comparative: markdown must be asked for EXPLICITLY and must outrank text/html.
- */
-function prefersMarkdown(accept) {
-  // Parsed, not pattern-matched: an Accept header is a list with parameters, and the q values are the
-  // whole question here. A regex over the raw string got the escaping wrong and quietly answered
-  // "no" to every request, which looks exactly like the feature not being deployed.
-  const entries = String(accept || '').toLowerCase().split(',').map((part) => {
-    const [type, ...params] = part.trim().split(';').map((x) => x.trim());
-    const qParam = params.find((p) => p.startsWith('q='));
-    const q = qParam ? parseFloat(qParam.slice(2)) : 1;
-    return { type, q: Number.isFinite(q) ? q : 1 };
-  }).filter((e) => e.type);
-
-  const qOf = (t) => {
-    const hit = entries.find((e) => e.type === t);
-    return hit ? hit.q : -1;
-  };
-  const md = Math.max(qOf('text/markdown'), qOf('text/x-markdown'));
-  // ⚠️ Must be asked for EXPLICITLY. A browser sends `*/*;q=0.8`, which matches text/markdown by the
-  // wildcard — honouring that would serve Markdown to every human visitor.
-  if (md <= 0) return false;
-  return md >= qOf('text/html');
-}
-
-/* The pages that have a Markdown rendition: our own published HTML, nothing else. */
+ * ⚠️ A BROWSER SENDS `Accept: text/html,...,*​/* The pages that have a Markdown rendition: our own published HTML, nothing else. */
 function markdownSource(frontendDir, urlPath) {
   // Strip the extension we added, then resolve inside frontendDir only.
   const rel = urlPath.replace(/\.md$/, '');
@@ -308,4 +282,4 @@ function markdownSource(frontendDir, urlPath) {
   return null;
 }
 
-module.exports = { origin, apiCatalog, aiCatalog, authMarkdown, protectedResourceMetadata, linkHeader, prefersMarkdown, markdownSource };
+module.exports = { origin, apiCatalog, aiCatalog, authMarkdown, protectedResourceMetadata, linkHeader, markdownSource };

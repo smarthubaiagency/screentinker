@@ -1,5 +1,14 @@
 const express = require('express');
 const router = express.Router();
+
+// A folder rule includes subfolders, so moving or deleting a folder can change what a smart
+// playlist selects (lib/smart-playlist.js debounces and republishes only real changes).
+router.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.on('finish', () => { if (res.statusCode < 400) require('../lib/smart-playlist').notifyContentChanged(req.workspaceId); });
+  }
+  next();
+});
 const { v4: uuidv4 } = require('uuid');
 const { db } = require('../db/database');
 const { PLATFORM_ROLES } = require('../middleware/auth');

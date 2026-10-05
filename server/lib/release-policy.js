@@ -50,6 +50,18 @@ function depsOf(db, type, id) {
       if (it.widget_id) out.widget[it.widget_id] = stamp('widgets', it.widget_id);
       if (it.child_playlist_id) out.playlist[it.child_playlist_id] = stamp('playlists', it.child_playlist_id);
     }
+    /*
+     * ⚠️ A smart playlist's content is whatever its rules match, not playlist_items. Without this an
+     * approval would cover the RULES only: content tagged or uploaded after the approval would ride
+     * the approved release onto screens unreviewed. With it, a change in the matches makes the
+     * approval stale, exactly as editing a hand-built playlist's items does.
+     */
+    try {
+      const row = db.prepare('SELECT * FROM playlists WHERE id = ?').get(id);
+      if (row && row.smart_rules) {
+        for (const c of require('./smart-playlist').matchContent(db, row)) out.content[c.id] = String(c.updated_at || 0);
+      }
+    } catch (_) { /* a playlist without the column (embedded schema) has no rules */ }
   } else if (type === 'slide_deck') {
     const cap = revisions.captureState(db, 'slide_deck', id);
     const doc = cap && cap.state.doc || {};

@@ -27,6 +27,7 @@ import com.remotedisplay.player.data.ServerConfig
 import com.remotedisplay.player.telemetry.DeviceInfo
 import io.socket.client.IO
 import io.socket.client.Socket
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URI
@@ -449,6 +450,22 @@ class WebSocketService : Service() {
                     flushConnectivityReport()
                     // #299: authenticated now, so any plays recorded while offline can be replayed.
                     flushOfflinePlays()
+                    // #473 v2: interactive-page sessions queued while offline (or before this boot).
+                    kioskFlushInFlight = false
+                    flushKioskSessions()
+                    flushKioskErrors()
+                }
+
+                // #473 v2: the server stored these session ids (or already had them): drop them.
+                safeOn("device:kiosk-sessions-ack") { args ->
+                    val data = args.firstOrNull() as? JSONObject ?: return@safeOn
+                    val ids = data.optJSONArray("ids") ?: JSONArray()
+                    val list = (0 until ids.length()).map { ids.optString(it, "") }.filter { it.isNotEmpty() }
+                    com.remotedisplay.player.kiosk.KioskSessionLog.ack(applicationContext, list)
+                    kioskFlushInFlight = false
+                    if (list.isNotEmpty() && com.remotedisplay.player.kiosk.KioskSessionLog.peek(applicationContext).isNotEmpty()) {
+                        handler.post { flushKioskSessions() }
+                    }
                 }
 
                 // v4 degrade-safe ARM: the watchdog arms ONLY after the first heartbeat-ack, so a
@@ -647,6 +664,7 @@ class WebSocketService : Service() {
                 }
 
                 safeOn("device:remote-touch") { args ->
+                    if (privacyOn()) { Log.i("WebSocketService", "remote touch refused: interactive session in progress"); return@safeOn }
                     val data = args.firstOrNull() as? JSONObject ?: return@safeOn
                     val x = data.optDouble("x", 0.0).toFloat()
                     val y = data.optDouble("y", 0.0).toFloat()
@@ -672,6 +690,7 @@ class WebSocketService : Service() {
                 }
 
                 safeOn("device:remote-key") { args ->
+                    if (privacyOn()) { Log.i("WebSocketService", "remote key refused: interactive session in progress"); return@safeOn }
                     val data = args.firstOrNull() as? JSONObject ?: return@safeOn
                     val keycode = data.optString("keycode", "")
                     if (keycode.isEmpty()) return@safeOn
@@ -1209,6 +1228,24 @@ class WebSocketService : Service() {
     // Callback for Activity to provide screenshot
     var onCaptureScreenshot: (() -> String?)? = null
 
+    /**
+     * #473: true while a visitor is using an interactive web page. Every capture tier then returns a
+     * blank frame and remote input is refused: the operator must not watch, or type into, a stranger's
+     * form. (FLAG_SECURE already blacks MediaProjection and the live video; this also covers the
+     * in-app view-draw tier and the accessibility screenshot, which FLAG_SECURE may not.)
+     */
+    @Volatile var privacyActive: (() -> Boolean)? = null
+    private fun privacyOn(): Boolean = try { privacyActive?.invoke() == true } catch (_: Throwable) { false }
+
+    private val blankFrame: String by lazy {
+        val bmp = android.graphics.Bitmap.createBitmap(160, 90, android.graphics.Bitmap.Config.RGB_565)
+        bmp.eraseColor(android.graphics.Color.BLACK)
+        val out = java.io.ByteArrayOutputStream()
+        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 40, out)
+        bmp.recycle()
+        android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+    }
+
     /** The tier the NEXT capture would use. Reported in telemetry so the dashboard can say why a
      *  screenshot shows only the playlist. Must stay in step with captureScreen() below. */
     fun currentCaptureMode(): CaptureMode = CaptureMode.current(onCaptureScreenshot != null)
@@ -1228,6 +1265,7 @@ class WebSocketService : Service() {
         }
 
     private fun captureScreen(): String? {
+        if (privacyOn()) return blankFrame
         // Priority 1: MediaProjection (system-wide, works in background) — needs operator consent.
         if (ScreenCaptureService.isReady) {
             val result = ScreenCaptureService.captureScreen(40)
@@ -1667,6 +1705,51 @@ class WebSocketService : Service() {
             socket?.emit("device:connectivity-report", data)
             Log.i("WebSocketService", "connectivity-report offline_ms=$offlineMs link_lost=$linkLost internet_ok=$internetOk cold_start=$coldStart ip_changed=$ipChanged")
         } catch (e: Throwable) { Log.w("WebSocketService", "emitConnectivityReport: ${e.message}") }
+    }
+
+    // ── #473 v2: interactive web pages ──────────────────────────────────────────────────────────
+    @Volatile private var kioskFlushInFlight = false
+
+    /**
+     * Send queued interactive-page sessions, one batch at a time. Records leave the queue only on
+     * device:kiosk-sessions-ack; a lost ack just means the batch is resent and the server ignores the
+     * duplicates (it keys on the record id).
+     */
+    fun flushKioskSessions() {
+        if (kioskFlushInFlight || socket?.connected() != true || config.deviceId.isEmpty()) return
+        val batch = com.remotedisplay.player.kiosk.KioskSessionLog.peek(applicationContext)
+        if (batch.isEmpty()) return
+        kioskFlushInFlight = true
+        try {
+            socket?.emit("device:kiosk-sessions", JSONObject().apply {
+                put("device_id", config.deviceId)
+                put("sessions", JSONArray().apply { batch.forEach { put(it.toJson()) } })
+            })
+            // An older server never acks: stop waiting after a while so a later flush can retry.
+            handler.postDelayed({ kioskFlushInFlight = false }, 30_000)
+        } catch (e: Throwable) {
+            kioskFlushInFlight = false
+            Log.w("WebSocketService", "flushKioskSessions: ${e.message}")
+        }
+    }
+
+    /**
+     * A failed interactive page, as a dashboard incident. Already rate-limited by the caller.
+     * ⚠️ The commonest failure is "no network", which is exactly when it cannot be sent, so the
+     * last few are held (in memory) and sent on the next registration.
+     */
+    private val pendingKioskErrors = ArrayDeque<Pair<String, String>>()
+    fun sendKioskError(reason: String, detail: String) {
+        val d = detail.take(400)
+        if (socket?.connected() == true && config.deviceId.isNotEmpty()) { emitEvent("web_error", reason, d); return }
+        synchronized(pendingKioskErrors) {
+            pendingKioskErrors.addLast(reason to "$d (while offline)")
+            while (pendingKioskErrors.size > 10) pendingKioskErrors.removeFirst()
+        }
+    }
+    private fun flushKioskErrors() {
+        val list = synchronized(pendingKioskErrors) { pendingKioskErrors.toList().also { pendingKioskErrors.clear() } }
+        for ((r, d) in list) emitEvent("web_error", r, d)
     }
 
     /** Emit a typed incident (device_events). Guarded + no-op when unpaired/disconnected. */

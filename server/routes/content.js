@@ -1,5 +1,18 @@
 const express = require('express');
 const router = express.Router();
+
+// Smart playlists select content by rule, so any successful content write can change what they
+// play. Notify once per write; lib/smart-playlist debounces per workspace and republishes only the
+// playlists whose matches actually changed.
+router.use((req, res, next) => {
+  // Not upload chunks: they change nothing until finalize, and finalize notifies via content-ingest.
+  if (req.method !== 'GET' && req.method !== 'HEAD' && !req.path.startsWith('/uploads') && !req.path.endsWith('/bundle-preview')) {
+    res.on('finish', () => {
+      if (res.statusCode < 400) require('../lib/smart-playlist').notifyContentChanged(req.workspaceId);
+    });
+  }
+  next();
+});
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
@@ -648,6 +661,11 @@ function purgeContentRow(content) {
       const filtered = items.filter(item => item.content_id !== id);
       if (filtered.length !== items.length) {
         db.prepare('UPDATE playlists SET published_snapshot = ? WHERE id = ?').run(JSON.stringify(filtered), pl.id);
+        // ⚠️ The snapshot, not playlist_items, is what screens play. A smart playlist (or a parent
+        // that flattened one) holds this content with no playlist_items row, so the join above misses
+        // its screens; and the later smart refresh rebuilds a list identical to this scrubbed one, so
+        // it pushes nothing either. Push from here.
+        for (const r of db.prepare('SELECT device_id FROM device_resolved_playlist WHERE playlist_id = ?').all(pl.id)) affected.push(r.device_id);
       }
     } catch (e) { /* corrupt snapshot, skip */ }
   }

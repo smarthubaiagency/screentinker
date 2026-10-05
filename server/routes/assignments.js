@@ -164,6 +164,7 @@ router.post('/device/:deviceId', (req, res) => {
   }
 
   const playlistId = ensureDevicePlaylist(req.params.deviceId, req.user.id);
+  { const smartErr = require('../lib/smart-playlist').smartAddError(db, playlistId); if (smartErr) return res.status(400).json({ error: smartErr }); }
   if (child_playlist_id) {
     const bad = require('../lib/playlist-nesting').nestingError(db, playlistId, child_playlist_id, access.device.workspace_id);
     if (bad) return res.status(bad.status).json({ error: bad.error });
@@ -365,6 +366,7 @@ router.post('/device/:deviceId/copy-to/:targetDeviceId', (req, res) => {
   if (!target) return res.status(404).json({ error: 'Target device not found' });
 
   const targetPlaylistId = ensureDevicePlaylist(req.params.targetDeviceId, target.user_id || req.user.id);
+  { const smartErr = require('../lib/smart-playlist').smartAddError(db, targetPlaylistId); if (smartErr) return res.status(400).json({ error: smartErr }); }
 
   if (req.body.replace) {
     db.prepare('DELETE FROM playlist_items WHERE playlist_id = ?').run(targetPlaylistId);

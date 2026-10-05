@@ -40,7 +40,7 @@ function forkInheritedPlaylist(deviceId, userId) {
   if (!resolved.playlist_id || resolved.source === 'device' || resolved.source === 'schedule') return null;
 
   const device = db.prepare('SELECT workspace_id, name FROM devices WHERE id = ?').get(deviceId);
-  const source = db.prepare('SELECT name, status, published_snapshot, published_structure, playback_order, published_playback_order FROM playlists WHERE id = ?')
+  const source = db.prepare('SELECT name, status, published_snapshot, published_structure, playback_order, published_playback_order, smart_rules FROM playlists WHERE id = ?')
     .get(resolved.playlist_id);
   if (!source) return null;
 
@@ -58,15 +58,30 @@ function forkInheritedPlaylist(deviceId, userId) {
     db.prepare('UPDATE playlists SET playback_order = ?, published_playback_order = ? WHERE id = ?')
       .run(source.playback_order || 'sequential', source.published_playback_order || null, newId);
 
+    /*
+     * ⚠️ A SMART source has no items to copy: its content comes from its rules. Copying nothing
+     * would leave the fork's draft holding only the item being added, and its next publish would
+     * take the screen from the whole rule-selected set down to that one item, forever detached from
+     * the rules. Instead the fork NESTS the smart playlist, so the screen keeps the live rule set and
+     * gains its own items around it (smart playlists hold no children, so one level is respected).
+     */
+    if (source.smart_rules) {
+      db.prepare('INSERT INTO playlist_items (playlist_id, child_playlist_id, sort_order, duration_sec) VALUES (?, ?, 0, 10)')
+        .run(newId, resolved.playlist_id);
+      db.prepare('UPDATE playlists SET published_structure = ? WHERE id = ?')
+        .run(JSON.stringify([{ content_id: null, widget_id: null, child_playlist_id: resolved.playlist_id, zone_id: null, sort_order: 0, duration_sec: 10, muted: 0, play_from: null, play_until: null, enabled: 1, log_play: 1, fit_mode: null, play_when: null, weight: 1 }]), newId);
+      db.prepare("UPDATE devices SET playlist_id = ?, playlist_source = 'device' WHERE id = ?").run(newId, deviceId);
+      return;
+    }
     // Every column, including child_playlist_id and muted: a fork that quietly drops nesting or
     // un-mutes an item is not a copy of what the screen was showing.
     const items = db.prepare(`SELECT id, content_id, widget_id, child_playlist_id, zone_id, sort_order,
-                                     duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight
+                                     duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec
                                 FROM playlist_items WHERE playlist_id = ? ORDER BY sort_order ASC`)
       .all(resolved.playlist_id);
     const insItem = db.prepare(`INSERT INTO playlist_items
-      (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const scheds = db.prepare(`SELECT active_days, start_time, end_time, start_date, end_date, sort_order
                                  FROM playlist_item_schedules WHERE playlist_item_id = ?`);
     const insSched = db.prepare(`INSERT INTO playlist_item_schedules
@@ -76,7 +91,7 @@ function forkInheritedPlaylist(deviceId, userId) {
     for (const it of items) {
       const res = insItem.run(newId, it.content_id, it.widget_id, it.child_playlist_id, it.zone_id,
                               it.sort_order, it.duration_sec, it.muted ? 1 : 0, it.play_from || null, it.play_until || null,
-                              it.enabled === 0 ? 0 : 1, it.log_play === 0 ? 0 : 1, it.fit_mode || null, it.play_when || null, it.weight || 1);
+                              it.enabled === 0 ? 0 : 1, it.log_play === 0 ? 0 : 1, it.fit_mode || null, it.play_when || null, it.weight || 1, it.repeat_every_sec || null);
       itemIdMap.set(it.id, res.lastInsertRowid);
       // Per-item dayparting is part of what the screen was showing, so it travels too.
       for (const s of scheds.all(it.id)) {

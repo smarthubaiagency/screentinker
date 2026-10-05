@@ -127,6 +127,7 @@ router.post('/playlists/:playlistId/items', (req, res) => {
   if (!TIME_RE.test(st)) return res.status(400).json({ error: 'start must be HH:MM' });
   if (!(TIME_RE.test(en) || en === '24:00')) return res.status(400).json({ error: 'end must be HH:MM or 24:00' });
 
+  { const smartErr = require('../lib/smart-playlist').smartAddError(db, req.params.playlistId); if (smartErr) return res.status(400).json({ error: smartErr }); }
   const order = db.prepare('SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM playlist_items WHERE playlist_id = ?').get(req.params.playlistId).n;
   const itemId = db.prepare('INSERT INTO playlist_items (playlist_id, content_id, sort_order, duration_sec) VALUES (?, ?, ?, ?)')
     .run(req.params.playlistId, content_id, order, duration_sec).lastInsertRowid;

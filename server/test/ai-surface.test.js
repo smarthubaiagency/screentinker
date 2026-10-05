@@ -237,28 +237,6 @@ test('the discovery documents point at the root copy we actually serve', () => {
   assert.match(ai.linkHeader(BASE), /<https:\/\/screentinker\.com\/auth\.md>; rel="service-meta"/);
 });
 
-// ───────────────────────────── content negotiation ─────────────────────────────
-
-test('a browser never gets Markdown', () => {
-  // The real header Chrome, Firefox and Safari send. The trailing wildcard matches text/markdown.
-  const browser = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
-  assert.equal(ai.prefersMarkdown(browser), false);
-  assert.equal(ai.prefersMarkdown('*/*'), false);
-  assert.equal(ai.prefersMarkdown(''), false);
-  assert.equal(ai.prefersMarkdown(undefined), false);
-});
-
-test('markdown is served only when asked for explicitly and preferred', () => {
-  assert.equal(ai.prefersMarkdown('text/markdown'), true);
-  assert.equal(ai.prefersMarkdown('text/x-markdown'), true, 'the older spelling');
-  assert.equal(ai.prefersMarkdown('text/markdown;q=0.9,text/html;q=0.8'), true);
-  assert.equal(ai.prefersMarkdown('text/markdown,text/html'), true, 'equal q, both named');
-  // Asked for, but ranked BELOW html: the client would rather have the page.
-  assert.equal(ai.prefersMarkdown('text/html,text/markdown;q=0.5'), false);
-  // q=0 is a refusal, not a request.
-  assert.equal(ai.prefersMarkdown('text/markdown;q=0'), false);
-});
-
 // ───────────────────────────── which pages have a rendition ─────────────────────────────
 
 test('published pages resolve, including directory indexes', () => {
@@ -435,5 +413,7 @@ test('llms.txt names the guides that exist and no others', () => {
   for (const f of fs.readdirSync(path.join(FRONTEND, 'guides')).filter((f) => f.endsWith('.html'))) {
     assert.ok(guides.includes(f), `llms.txt does not mention guides/${f}`);
   }
-  assert.match(llms, /Accept: text\/markdown/, 'it should say how to get the plain-text form');
+  assert.match(llms, /append `\.md`/, 'it should say how to get the plain-text form');
+  // ⚠️ and must not promise Accept negotiation: page URLs answer HTML only (cdn-cache-poisoning.test.js).
+  assert.doesNotMatch(llms, /send\s+`Accept: text\/markdown`/, 'Accept negotiation was removed; do not advertise it');
 });

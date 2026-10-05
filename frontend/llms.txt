@@ -83,9 +83,9 @@ so plainly when it has none.
 
 ## Reading this site as an agent
 
-- Every published page has a **Markdown rendition**: append `.md` to its path, or send
-  `Accept: text/markdown`. Responses carry `Link` headers pointing at the catalogue, the OpenAPI
-  description and this file.
+- Every published page has a **Markdown rendition**: append `.md` to its path (`/` is `/index.md`).
+  Page URLs always return HTML, whatever `Accept` says. Responses carry `Link` headers pointing at
+  the page's `.md`, the catalogue, the OpenAPI description and this file.
 - `robots.txt` carries Content Signals: `search=yes, ai-input=yes, ai-train=yes`. Quoting and
   summarising this site is welcome; attribution to https://screentinker.com is appreciated.
 - ⚠️ There is no way for an agent to obtain an API token on its own. A human creates one in the

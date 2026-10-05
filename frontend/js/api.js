@@ -616,7 +616,8 @@ export const api = {
 
   // Playlists
   getPlaylists: () => request('/playlists'),
-  createPlaylist: (name, description) => request('/playlists', { method: 'POST', body: JSON.stringify({ name, description }) }),
+  createPlaylist: (name, description, smart_rules) => request('/playlists', { method: 'POST', body: JSON.stringify({ name, description, ...(smart_rules ? { smart_rules } : {}) }) }),
+  smartPlaylistPreview: (smart_rules) => request('/playlists/smart-preview', { method: 'POST', body: JSON.stringify({ smart_rules }) }),
   getPlaylist: (id) => request(`/playlists/${id}`),
   updatePlaylist: (id, data) => request(`/playlists/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deletePlaylist: (id) => request(`/playlists/${id}`, { method: 'DELETE' }),

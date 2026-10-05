@@ -409,6 +409,9 @@ CREATE TABLE IF NOT EXISTS playlists (
     -- change does not hit devices until publish.
     playback_order  TEXT NOT NULL DEFAULT 'sequential',
     published_playback_order TEXT,
+    -- Smart playlist rule set (JSON, lib/smart-playlist.js). NULL = items are added by hand.
+    smart_rules     TEXT,
+    published_smart_rules TEXT,
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
@@ -436,6 +439,8 @@ CREATE TABLE IF NOT EXISTS playlist_items (
     play_when       TEXT,
     -- Used only when the playlist's playback_order is 'weighted'. Default 1.
     weight          INTEGER NOT NULL DEFAULT 1,
+    -- Sequential playlists only: weave this item in every N seconds (lib/repeat-every.js). NULL = once per loop.
+    repeat_every_sec INTEGER,
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );

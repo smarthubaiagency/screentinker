@@ -382,13 +382,19 @@ router.post('/:id/assign-content', requireGroupWrite, (req, res) => {
       const playlistId = ensureDevicePlaylist(m.device_id, req.user.id);
       if (seen.has(playlistId)) continue;
       seen.add(playlistId);
+      // A member on a smart playlist would store an item that never plays; refuse the whole add.
+      const smartErr = require('../lib/smart-playlist').smartAddError(db, playlistId);
+      if (smartErr) { const e = new Error(smartErr); e.smartRefusal = true; throw e; }
       const max = db.prepare('SELECT COALESCE(MAX(sort_order),0)+1 as next FROM playlist_items WHERE playlist_id = ?').get(playlistId);
       db.prepare('INSERT INTO playlist_items (playlist_id, content_id, sort_order, duration_sec) VALUES (?, ?, ?, ?)')
         .run(playlistId, content_id, max.next, itemDuration);
       markDraft(playlistId);
     }
   });
-  transaction();
+  try { transaction(); } catch (e) {
+    if (e && e.smartRefusal) return res.status(400).json({ error: `A screen in this group plays a smart playlist. ${e.message}` });
+    throw e;
+  }
 
   res.json({ success: true, devices_updated: members.length });
 });

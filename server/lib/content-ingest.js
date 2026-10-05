@@ -197,6 +197,7 @@ async function ingestUploadedFile({ file, userId, workspaceId, folderId = null }
       mime,
     });
   } catch { /* hooks must not fail an upload */ }
+  require('./smart-playlist').notifyContentChanged(workspaceId);
 
   return db.prepare('SELECT * FROM content WHERE id = ?').get(id);
 }

@@ -33,7 +33,6 @@ Disallow: /scripts/
 Disallow: /unsubscribe
 
 # Machine-readable descriptions of this site, for agents that would rather not parse HTML.
-# Every published page is also available as Markdown: append .md to its path, or send
-# `Accept: text/markdown`.
+# Every published page is also available as Markdown: append .md to its path (/ is /index.md).
 Sitemap: https://screentinker.com/sitemap.xml
 Agentmap: https://screentinker.com/.well-known/ai-catalog.json

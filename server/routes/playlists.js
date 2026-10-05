@@ -9,6 +9,8 @@ const config = require('../config');
 const { accessContext } = require('../lib/tenancy');
 const { resolveItemDuration } = require('../lib/item-duration');
 const { parseTags, parseMeta } = require('../lib/content-tags');
+const smartPlaylist = require('../lib/smart-playlist');
+const { applyRepeatEvery, normalizeRepeatEvery } = require('../lib/repeat-every');
 const { emitMuteChanged } = require('../lib/mute-sync');
 
 // Per-item play window: local YYYY-MM-DDTHH:MM, inclusive. Empty/null clears.
@@ -212,9 +214,20 @@ function buildSnapshotItems(playlistId, _depth = 0, _ancestors = null) {
     console.warn(`[playlist] nesting cycle at ${playlistId} — reference dropped`);
     return [];
   }
+  // Named columns, not *: this runs for every build (children included), and * would drag the large
+  // published_snapshot blob along each time. user_id is read only for a smart playlist, because the
+  // embedded build's playlists table has no such column.
+  const own = db.prepare('SELECT id, workspace_id, smart_rules, playback_order FROM playlists WHERE id = ?').get(playlistId);
+  // A smart playlist's items come from its rules, never from playlist_items. Same output shape, so
+  // nesting, publish and the players cannot tell the difference (lib/smart-playlist.js).
+  if (own && own.smart_rules) {
+    let userId = null;
+    try { userId = (db.prepare('SELECT user_id FROM playlists WHERE id = ?').get(playlistId) || {}).user_id || null; } catch (_) { userId = null; }
+    return smartPlaylist.snapshotItems(db, { ...own, user_id: userId });
+  }
   const items = db.prepare(`
     SELECT pi.id AS _iid, pi.content_id, pi.widget_id, pi.child_playlist_id, pi.zone_id, pi.sort_order, pi.duration_sec, pi.muted,
-           pi.play_from, pi.play_until, pi.enabled, pi.log_play, pi.fit_mode, pi.play_when, pi.weight,
+           pi.play_from, pi.play_until, pi.enabled, pi.log_play, pi.fit_mode, pi.play_when, pi.weight, pi.repeat_every_sec,
            COALESCE(c.filename, w.name) as filename, c.mime_type, c.filepath, c.file_size,
            c.duration_sec as content_duration, c.remote_url, c.unstable_connection,
            c.captions_enabled, c.captions_lang, c.subtitle_url, c.subtitle_lang,
@@ -261,6 +274,7 @@ function buildSnapshotItems(playlistId, _depth = 0, _ancestors = null) {
     if (meta && Object.keys(meta).length) it.meta = meta;
     delete it.content_meta;
     if (it.weight && Number(it.weight) !== 1) it.weight = Number(it.weight); else delete it.weight;
+    if (!it.repeat_every_sec) delete it.repeat_every_sec;
     delete it._iid;
     attachSlideAudio(it);
   }
@@ -286,7 +300,17 @@ function buildSnapshotItems(playlistId, _depth = 0, _ancestors = null) {
    * The `depth` guard below is belt-and-braces against a row written by some other path (an
    * import, a migration, a manual fix-up). It is not the primary defence and must not become it.
    */
-  return expandChildPlaylists(items, _depth, [...ancestors, playlistId]);
+  const flat = expandChildPlaylists(items, _depth, [...ancestors, playlistId]);
+  /*
+   * "Play every N minutes" is woven in HERE, after nesting is flattened, so the result is still one
+   * flat list and no player learns about it (lib/repeat-every.js). Sequential only: in shuffle or
+   * weighted order there is no fixed spacing to keep, and the copies would just skew the odds.
+   */
+  if ((own && own.playback_order || 'sequential') !== 'sequential') {
+    for (const it of flat) if (it) delete it.repeat_every_sec;
+    return flat;
+  }
+  return applyRepeatEvery(flat);
 }
 
 /** Max nesting depth. 1 = a playlist may contain playlists, but those may not. */
@@ -315,6 +339,13 @@ function expandChildPlaylists(items, depth, ancestors) {
       out.push(merged);
     }
   }
+  /*
+   * ⚠️ Renumber: an expanded child keeps ITS OWN sort_order (0..n), which collides with the
+   * parent's, and Tizen re-sorts every playlist by sort_order (the web player, Android and native
+   * do per zone). Without this a nested child's items get shuffled in among the parent's on those
+   * players. Only reached when a child was actually expanded, so a flat playlist is byte-identical.
+   */
+  out.forEach((it, i) => { it.sort_order = i; });
   return out;
 }
 
@@ -451,13 +482,13 @@ function publishPlaylist(playlistId, reqOrIo, seen = new Set([playlistId])) {
    * which Carousel proved requires a player release (CSL-9211). Deferred, and named in the design
    * doc so it is not rediscovered.
    */
-  const prev = db.prepare('SELECT status, published_snapshot, published_structure, playback_order, published_playback_order FROM playlists WHERE id = ?').get(playlistId);
+  const prev = db.prepare('SELECT status, published_snapshot, published_structure, playback_order, published_playback_order, smart_rules, published_smart_rules FROM playlists WHERE id = ?').get(playlistId);
   const order = normalizePlaybackOrder(prev && prev.playback_order) || 'sequential';
 
   // ⚠️ Structure is captured PRE-expansion so "discard" can restore the nesting the flat snapshot
   // cannot describe. Device-facing data stays in published_snapshot; this is never sent anywhere.
   const structureRows = db.prepare(`
-    SELECT id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight
+    SELECT id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec
       FROM playlist_items WHERE playlist_id = ? ORDER BY sort_order ASC
   `).all(playlistId);
   // ⚠️ Per-item schedule blocks (dayparting/validity) must be captured too, or a discard rebuilds
@@ -481,9 +512,13 @@ function publishPlaylist(playlistId, reqOrIo, seen = new Set([playlistId])) {
     if (prev.published_structure !== structure) {
       db.prepare('UPDATE playlists SET published_structure = ? WHERE id = ?').run(structure, playlistId);
     }
+    // Same for a smart rule edit that happens to select the same items: discard must restore it.
+    if ((prev.published_smart_rules || null) !== (prev.smart_rules || null)) {
+      db.prepare('UPDATE playlists SET published_smart_rules = smart_rules WHERE id = ?').run(playlistId);
+    }
     return { changed: false, items: snapshotItems.length };
   }
-  db.prepare("UPDATE playlists SET status = 'published', published_snapshot = ?, published_structure = ?, published_playback_order = ?, updated_at = strftime('%s','now') WHERE id = ?")
+  db.prepare("UPDATE playlists SET status = 'published', published_snapshot = ?, published_structure = ?, published_playback_order = ?, published_smart_rules = smart_rules, updated_at = strftime('%s','now') WHERE id = ?")
     .run(next, structure, order, playlistId);
   pushToDevices(playlistId, reqOrIo);
   try {
@@ -583,12 +618,41 @@ router.post('/', (req, res) => {
   }
   const { name, description } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: 'name required' });
+  let rules = null;
+  if (req.body.smart_rules !== undefined && req.body.smart_rules !== null) {
+    rules = smartPlaylist.normalizeRules(req.body.smart_rules);
+    if (!rules) return res.status(400).json({ error: SMART_RULES_ERROR });
+  }
   const id = uuidv4();
-  db.prepare('INSERT INTO playlists (id, user_id, workspace_id, name, description) VALUES (?, ?, ?, ?, ?)')
-    .run(id, req.user.id, req.workspaceId, name.trim(), (description || '').trim());
+  db.prepare('INSERT INTO playlists (id, user_id, workspace_id, name, description, smart_rules) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(id, req.user.id, req.workspaceId, name.trim(), (description || '').trim(), rules ? JSON.stringify(rules) : null);
   res.status(201).json(db.prepare(`
     SELECT p.*, 0 as item_count, 0 as display_count FROM playlists p WHERE p.id = ?
   `).get(id));
+});
+
+const SMART_RULES_ERROR = 'smart_rules must be { match: "all"|"any", rules: [{ field, op, value }...] } with 1 to 20 rules '
+  + '(fields: tag, meta, type, folder, name)';
+
+/*
+ * What a rule set would select right now, for the editor's live preview. POST so a draft rule set
+ * can be tried before it is saved. Scoped exactly like publish: the caller's own workspace only.
+ */
+router.post('/smart-preview', (req, res) => {
+  if (!req.workspaceId) return res.status(400).json({ error: 'No active workspace' });
+  const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(req.workspaceId);
+  if (!ws || !accessContext(req.user.id, req.user.role, ws)) return res.status(403).json({ error: 'Access denied' });
+  const rules = smartPlaylist.normalizeRules(req.body && req.body.smart_rules);
+  if (!rules) return res.status(400).json({ error: SMART_RULES_ERROR });
+  const rows = smartPlaylist.matchContent(db, { workspace_id: req.workspaceId, user_id: req.user.id }, rules);
+  res.json({
+    count: rows.length,
+    limit: rules.limit,
+    items: rows.slice(0, 100).map((c) => ({
+      id: c.id, filename: c.filename, mime_type: c.mime_type, thumbnail_path: c.thumbnail_path,
+      duration_sec: c.duration_sec, type: smartPlaylist.contentType(c),
+    })),
+  });
 });
 
 // Get single playlist with items
@@ -615,7 +679,21 @@ router.get('/:id', requirePlaylistRead, (req, res) => {
   // zoned items) means fullscreen, which the UI draws as a single frame.
   let layout = null;
   try { layout = derivePreviewLayout(items); } catch (e) { layout = null; }
-  res.json({ ...req.playlist, items: decorateEditorItems(items), item_count: items.length, display_count: displayCount, layout });
+  // A smart playlist shows what its rules select right now, so the editor never has to guess.
+  let smart = null;
+  if (req.playlist.smart_rules) {
+    const rules = smartPlaylist.parseRules(req.playlist.smart_rules);
+    const rows = rules ? smartPlaylist.matchContent(db, req.playlist, rules) : [];
+    smart = {
+      rules,
+      count: rows.length,
+      items: rows.slice(0, 100).map((c) => ({
+        id: c.id, filename: c.filename, mime_type: c.mime_type, thumbnail_path: c.thumbnail_path,
+        duration_sec: c.duration_sec, type: smartPlaylist.contentType(c),
+      })),
+    };
+  }
+  res.json({ ...req.playlist, items: decorateEditorItems(items), item_count: items.length, display_count: displayCount, layout, smart });
 });
 
 // #104: device-free draft preview payload. Same shape the device player consumes
@@ -659,13 +737,37 @@ router.put('/:id', requirePlaylistWrite, (req, res) => {
     updates.push('playback_order = ?');
     values.push(order);
   }
+  let rulesChanged = false;
+  if (req.body.smart_rules !== undefined) {
+    // A generated playlist (a slide deck's, a schedule's throwaway) is rebuilt by its owner; rules
+    // there would silently override what that owner publishes.
+    if (req.body.smart_rules !== null && req.playlist.is_auto_generated) {
+      return res.status(400).json({ error: 'Auto-generated playlists cannot become smart playlists' });
+    }
+    if (req.body.smart_rules !== null) {
+      let deck = null;
+      try { deck = db.prepare('SELECT 1 FROM slide_decks WHERE playlist_id = ? LIMIT 1').get(req.params.id); } catch (_) { deck = null; }
+      if (deck) return res.status(400).json({ error: 'A slide deck\'s playlist cannot become a smart playlist' });
+      // A smart playlist has no items of its own, so one that holds a nested playlist would drop it.
+      const kid = db.prepare('SELECT 1 FROM playlist_items WHERE playlist_id = ? AND child_playlist_id IS NOT NULL LIMIT 1').get(req.params.id);
+      if (kid) return res.status(400).json({ error: 'Remove the nested playlists first: a smart playlist cannot contain other playlists' });
+    }
+    // null turns a smart playlist back into an ordinary one (its hand-added items, if any, return).
+    const rules = smartPlaylist.normalizeRules(req.body.smart_rules);
+    if (rules === false) return res.status(400).json({ error: SMART_RULES_ERROR });
+    updates.push('smart_rules = ?');
+    values.push(rules ? JSON.stringify(rules) : null);
+    rulesChanged = true;
+  }
   if (updates.length > 0) {
     updates.push("updated_at = strftime('%s','now')");
     values.push(req.params.id);
     db.prepare(`UPDATE playlists SET ${updates.join(', ')} WHERE id = ?`).run(...values);
-    const summary = req.body.playback_order !== undefined ? 'Changed playback order' : 'Renamed';
+    const summary = rulesChanged ? 'Changed smart rules'
+      : req.body.playback_order !== undefined ? 'Changed playback order' : 'Renamed';
     require('../lib/revisions').recordCurrent(db, 'playlist', req.params.id, { actor: require('../lib/releases').actorOf(req), summary });
     if (req.body.playback_order !== undefined) markDraft(req.params.id, req, 'Changed playback order');
+    if (rulesChanged) markDraft(req.params.id, req, 'Changed smart rules');
   }
   res.json(db.prepare('SELECT * FROM playlists WHERE id = ?').get(req.params.id));
 });
@@ -747,14 +849,15 @@ router.post('/:id/discard', requirePlaylistWrite, (req, res) => {
     // Re-insert from snapshot, skipping items whose content/widget was deleted
     // muted rides along too: #129's per-item mute was dropped by the old restore, so discarding an
     // unrelated draft edit silently un-muted every item that had been muted before publish.
-    const insert = db.prepare('INSERT INTO playlist_items (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insert = db.prepare('INSERT INTO playlist_items (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const insSched = db.prepare('INSERT INTO playlist_item_schedules (id, playlist_item_id, active_days, start_time, end_time, start_date, end_date, sort_order) VALUES (?,?,?,?,?,?,?,?)');
     for (const item of publishedItems) {
       try {
         const r = insert.run(req.params.id, item.content_id || null, item.widget_id || null,
                    item.child_playlist_id || null, item.zone_id || null, item.sort_order, item.duration_sec,
                    item.muted ? 1 : 0, item.play_from || null, item.play_until || null,
-                   item.enabled === 0 ? 0 : 1, item.log_play === 0 ? 0 : 1, item.fit_mode || null, item.play_when ? (typeof item.play_when === 'string' ? item.play_when : JSON.stringify(item.play_when)) : null, item.weight || 1);
+                   item.enabled === 0 ? 0 : 1, item.log_play === 0 ? 0 : 1, item.fit_mode || null, item.play_when ? (typeof item.play_when === 'string' ? item.play_when : JSON.stringify(item.play_when)) : null, item.weight || 1,
+                   item.repeat_every_sec || null);
         // Restore per-item schedule blocks (DELETE above cascaded them away). Both the structure and
         // the snapshot carry them in the same {days,start,end,...} shape.
         const blocks = Array.isArray(item.schedules) ? item.schedules : [];
@@ -770,7 +873,8 @@ router.post('/:id/discard', requirePlaylistWrite, (req, res) => {
         throw e;
       }
     }
-    db.prepare("UPDATE playlists SET status = 'published', playback_order = COALESCE(published_playback_order, playback_order, 'sequential'), updated_at = strftime('%s','now') WHERE id = ?").run(req.params.id);
+    // A smart playlist's rules are part of what was published; discarding a rule edit restores them.
+    db.prepare("UPDATE playlists SET status = 'published', playback_order = COALESCE(published_playback_order, playback_order, 'sequential'), smart_rules = published_smart_rules, updated_at = strftime('%s','now') WHERE id = ?").run(req.params.id);
   });
   transaction();
   require('../lib/revisions').recordCurrent(db, 'playlist', req.params.id, { actor: require('../lib/releases').actorOf(req), summary: 'Draft discarded' });
@@ -927,6 +1031,9 @@ router.put('/:id/items/:itemId/schedules', requirePlaylistWrite, (req, res) => {
 //      playlist's workspace (or be a platform-template).
 router.post('/:id/items', requirePlaylistWrite, async (req, res) => {
   try {
+    if (req.playlist.smart_rules) {
+      return res.status(400).json({ error: 'This is a smart playlist: its items come from its rules. Change the rules, or tag the content so it matches.' });
+    }
     const { content_id, widget_id, child_playlist_id, sort_order, zone_id } = req.body;
     let { duration_sec } = req.body;
 
@@ -1119,6 +1226,14 @@ router.put('/:id/items/:itemId', requirePlaylistWrite, (req, res) => {
     if (w === false) return res.status(400).json({ error: 'weight must be an integer from 1 to 1000' });
     updates.push('weight = ?'); values.push(w);
   }
+  // "Play every N seconds" (lib/repeat-every.js). A nested playlist is a block of items, not one
+  // item, so it cannot be woven in on its own.
+  if (Object.prototype.hasOwnProperty.call(req.body, 'repeat_every_sec')) {
+    const every = normalizeRepeatEvery(req.body.repeat_every_sec);
+    if (every === false) return res.status(400).json({ error: 'repeat_every_sec must be a number of seconds from 10 to 86400, or empty' });
+    if (every && item.child_playlist_id) return res.status(400).json({ error: 'A nested playlist cannot repeat on its own interval; set it on the items inside it' });
+    updates.push('repeat_every_sec = ?'); values.push(every);
+  }
   /*
    * ⚠️ #129's per-item mute, which this route never read.
    *
@@ -1223,9 +1338,9 @@ router.post('/:id/items/:itemId/duplicate', requirePlaylistWrite, (req, res) => 
     // content_id, widget_id AND child_playlist_id all NULL — a ghost that renders as nothing. No
     // depth check is needed here, because the copy lands in the playlist that already holds it.
     const result = db.prepare(`
-      INSERT INTO playlist_items (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, play_from, play_until, muted, enabled, log_play, fit_mode, play_when, weight)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(req.params.id, item.content_id, item.widget_id, item.child_playlist_id, item.zone_id, order, item.duration_sec, item.play_from || null, item.play_until || null, item.muted ? 1 : 0, item.enabled === 0 ? 0 : 1, item.log_play === 0 ? 0 : 1, item.fit_mode || null, item.play_when || null, item.weight || 1);
+      INSERT INTO playlist_items (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, play_from, play_until, muted, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(req.params.id, item.content_id, item.widget_id, item.child_playlist_id, item.zone_id, order, item.duration_sec, item.play_from || null, item.play_until || null, item.muted ? 1 : 0, item.enabled === 0 ? 0 : 1, item.log_play === 0 ? 0 : 1, item.fit_mode || null, item.play_when || null, item.weight || 1, item.repeat_every_sec || null);
     const newId = result.lastInsertRowid;
     const scheds = db.prepare('SELECT active_days, start_time, end_time, start_date, end_date, sort_order FROM playlist_item_schedules WHERE playlist_item_id = ?').all(req.params.itemId);
     const insSched = db.prepare('INSERT INTO playlist_item_schedules (id, playlist_item_id, active_days, start_time, end_time, start_date, end_date, sort_order) VALUES (?,?,?,?,?,?,?,?)');
@@ -1278,6 +1393,7 @@ router.post('/:id/items/selection', requirePlaylistWrite, (req, res) => {
   if (!SELECTION_ACTIONS.has(action)) {
     return res.status(400).json({ error: 'action must be one of ' + [...SELECTION_ACTIONS].join(', ') });
   }
+  if (req.playlist.smart_rules) return res.status(400).json({ error: smartPlaylist.SMART_ADD_ERROR });
   const ws = req.playlist.workspace_id;
   try {
     if (action === 'paste') {
@@ -1291,8 +1407,8 @@ router.post('/:id/items/selection', requirePlaylistWrite, (req, res) => {
       const max = db.prepare('SELECT MAX(sort_order) as m FROM playlist_items WHERE playlist_id = ?').get(req.params.id);
       let order = (max && max.m) || 0;
       const ins = db.prepare(`INSERT INTO playlist_items
-        (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+        (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
       const insSched = db.prepare('INSERT INTO playlist_item_schedules (id, playlist_item_id, active_days, start_time, end_time, start_date, end_date, sort_order) VALUES (?,?,?,?,?,?,?,?)');
       // A pasted zone_id from another playlist may not exist in this workspace's layouts. Keep it
       // only if it resolves here; otherwise drop to the default zone so the item still renders
@@ -1340,7 +1456,7 @@ router.post('/:id/items/selection', requirePlaylistWrite, (req, res) => {
           const r = ins.run(req.params.id, it.content_id || null, it.widget_id || null, it.child_playlist_id || null,
             resolveZone(it.zone_id), ++order, it.duration_sec || 10, it.muted ? 1 : 0,
             it.play_from || null, it.play_until || null, it.enabled === 0 ? 0 : 1, it.log_play === 0 ? 0 : 1,
-            fit, when ? JSON.stringify(when) : null, it.weight || 1);
+            fit, when ? JSON.stringify(when) : null, it.weight || 1, normalizeRepeatEvery(it.repeat_every_sec) || null);
           added.push(r.lastInsertRowid);
           const blocks = Array.isArray(it.schedules) ? it.schedules : [];
           blocks.forEach((b, i) => {
@@ -1377,10 +1493,10 @@ router.post('/:id/items/selection', requirePlaylistWrite, (req, res) => {
           const max = db.prepare('SELECT MAX(sort_order) as m FROM playlist_items WHERE playlist_id = ?').get(req.params.id);
           const order = ((max && max.m) || 0) + 1;
           const result = db.prepare(`INSERT INTO playlist_items
-            (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, play_from, play_until, muted, enabled, log_play, fit_mode, play_when, weight)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+            (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, play_from, play_until, muted, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
             req.params.id, r.content_id, r.widget_id, r.child_playlist_id, r.zone_id, order, r.duration_sec,
-            r.play_from, r.play_until, r.muted ? 1 : 0, r.enabled === 0 ? 0 : 1, r.log_play === 0 ? 0 : 1, r.fit_mode, r.play_when, r.weight || 1);
+            r.play_from, r.play_until, r.muted ? 1 : 0, r.enabled === 0 ? 0 : 1, r.log_play === 0 ? 0 : 1, r.fit_mode, r.play_when, r.weight || 1, r.repeat_every_sec || null);
           const scheds = db.prepare('SELECT active_days, start_time, end_time, start_date, end_date, sort_order FROM playlist_item_schedules WHERE playlist_item_id = ?').all(r.id);
           const insSched = db.prepare('INSERT INTO playlist_item_schedules (id, playlist_item_id, active_days, start_time, end_time, start_date, end_date, sort_order) VALUES (?,?,?,?,?,?,?,?)');
           for (const s of scheds) insSched.run(uuidv4(), result.lastInsertRowid, s.active_days, s.start_time, s.end_time, s.start_date, s.end_date, s.sort_order);
@@ -1529,6 +1645,9 @@ const MAX_BULK_ITEMS = 500;
 
 router.post('/:id/items/bulk', requirePlaylistWrite, async (req, res) => {
   try {
+    if (req.playlist.smart_rules) {
+      return res.status(400).json({ error: 'This is a smart playlist: its items come from its rules. Change the rules, or tag the content so it matches.' });
+    }
     const { content_ids, zone_id } = req.body;
     if (!Array.isArray(content_ids) || content_ids.length === 0) {
       return res.status(400).json({ error: 'content_ids must be a non-empty array of content IDs' });

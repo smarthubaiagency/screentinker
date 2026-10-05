@@ -239,7 +239,7 @@ router.get('/export', (req, res) => {
   const layoutPlaceholders = layoutIds.map(() => '?').join(',') || "'__none__'";
   const layoutZones = layoutIds.length ? db.prepare(`SELECT * FROM layout_zones WHERE layout_id IN (${layoutPlaceholders})`).all(...layoutIds) : [];
 
-  const playlists = db.prepare('SELECT id, name, description, is_auto_generated, created_at, updated_at FROM playlists WHERE user_id = ?').all(userId);
+  const playlists = db.prepare('SELECT id, name, description, is_auto_generated, smart_rules, created_at, updated_at FROM playlists WHERE user_id = ?').all(userId);
   const playlistIds = playlists.map(p => p.id);
   const playlistPlaceholders = playlistIds.map(() => '?').join(',') || "'__none__'";
   const playlistItems = playlistIds.length ? db.prepare(`SELECT id, playlist_id, content_id, widget_id, child_playlist_id, sort_order, duration_sec FROM playlist_items WHERE playlist_id IN (${playlistPlaceholders})`).all(...playlistIds) : [];
@@ -585,7 +585,11 @@ router.post('/import', proxyImportIfCopied, importUpload.single('file'), async (
       for (const p of (data.playlists || [])) {
         const newId = uuid.v4();
         idMap.playlists[p.id] = newId;
-        db.prepare('INSERT INTO playlists (id, user_id, workspace_id, name, description, is_auto_generated, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(newId, userId, workspaceId, p.name, p.description || '', p.is_auto_generated || 0, p.created_at || Math.floor(Date.now() / 1000), p.updated_at || Math.floor(Date.now() / 1000));
+        // smart_rules is re-validated: an import is untrusted input, and a rule set this build cannot
+        // read must not reach a screen. Folder ids inside rules are the source workspace's and will
+        // not match here until the operator re-points them.
+        const smartRules = p.smart_rules ? require('../lib/smart-playlist').normalizeRules(p.smart_rules) : null;
+        db.prepare('INSERT INTO playlists (id, user_id, workspace_id, name, description, is_auto_generated, smart_rules, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(newId, userId, workspaceId, p.name, p.description || '', p.is_auto_generated || 0, smartRules ? JSON.stringify(smartRules) : null, p.created_at || Math.floor(Date.now() / 1000), p.updated_at || Math.floor(Date.now() / 1000));
         stats.playlists++;
       }
       for (const pi of (data.playlist_items || [])) {

@@ -53,6 +53,14 @@ function sweepExpiredContent(socketIo = io) {
     catch (e) { console.error(`[content-expiry] republish failed for playlist ${playlistId}`, e); }
   }
 
+  // Smart playlists select by rule, not by playlist_items, so the join above cannot see them.
+  // Re-resolve the published ones in each workspace that just lost content.
+  try {
+    const smart = require('../lib/smart-playlist');
+    const spaces = db.prepare(`SELECT DISTINCT workspace_id FROM content WHERE id IN (${ph})`).all(...expired);
+    for (const w of spaces) smart.refreshNow(db, (id, seen) => publishPlaylist(id, socketIo, seen), w.workspace_id);
+  } catch (e) { console.error('[content-expiry] smart playlist refresh failed', e); }
+
   console.log(`[content-expiry] deactivated ${expired.length} item(s), republished ${affected.length} playlist(s)`);
   return { expired, republished: affected };
 }

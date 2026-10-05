@@ -224,6 +224,25 @@ test('test_replica_cache_follows_a_primary_delete: the row goes, the file goes; 
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM mesh_content_cache WHERE edge_id = ?').get(EDGE).n, 0);
 });
 
+test('⚠️ a file a SMART playlist selects (no playlist_items row) is pinned like any on-screen slide', async () => {
+  setEdge(['serves-dashboard', 'caches-content']);
+  db.prepare('DELETE FROM mesh_content_cache').run();
+  const onScreen = contentRow(copiedWs, 's'.repeat(1200), { thumb: false });
+  const idle = contentRow(copiedWs, 'i'.repeat(1200), { thumb: false });
+  await cache.ensure(db, config, onScreen, { fetchImpl });
+  await cache.ensure(db, config, idle, { fetchImpl });
+  const pl = uid();
+  db.prepare("INSERT INTO playlists (id, user_id, workspace_id, name, smart_rules, status, published_snapshot) VALUES (?, ?, ?, 'smart', ?, 'published', ?)")
+    .run(pl, userId, copiedWs, '{"match":"all","rules":[{"field":"tag","op":"has","value":"x"}]}', JSON.stringify([{ content_id: onScreen.id, sort_order: 0 }]));
+  db.prepare('UPDATE mesh_content_cache SET last_read_at = 1 WHERE content_id = ?').run(onScreen.id);   // oldest by far
+  const third = contentRow(copiedWs, 't'.repeat(1200), { thumb: false });
+  await cache.ensure(db, config, third, { fetchImpl });   // 3 x 1200 > 3000: someone goes
+  assert.ok(fs.existsSync(local(onScreen.filepath)), 'the rule-selected slide on screen stays');
+  assert.ok(!fs.existsSync(local(idle.filepath)), 'the unreferenced one went instead');
+  db.prepare('DELETE FROM playlists WHERE id = ?').run(pl);
+  db.prepare('DELETE FROM mesh_content_cache').run();
+});
+
 test('quota: LRU eviction under REPLICA_CACHE_BYTES; a file larger than the cap is never stored; status reports it', async () => {
   setEdge(['serves-dashboard', 'caches-content']);
   db.prepare('DELETE FROM mesh_content_cache').run();

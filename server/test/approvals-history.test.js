@@ -573,3 +573,60 @@ test('slide decks: publish goes through the gate; the deck is the reviewed unit'
   assert.equal(approvals.getSubmission(db, sub.json.id).status, 'published');
   await call('PUT', '/api/approvals/settings', 'admin', { require_approval: false });
 });
+
+// ─── smart playlists under approval ─────────────────────────────────────────────────────────
+
+test('⚠️ smart playlist under approval: new matches never go live unreviewed, can be submitted, and the reviewer sees them', async () => {
+  const smart = require('../lib/smart-playlist');
+  const { publishPlaylist } = require('../routes/playlists');
+  const addTagged = (id, file) => db.prepare("INSERT INTO content (id,user_id,workspace_id,filename,filepath,mime_type,tags) VALUES (?,?,?,?,?,'image/png','[\"apprsmart\"]')")
+    .run(id, users.alice, WS, file, `appr-${id}.png`);
+  addTagged('sm-a', 'smart-a.png');
+  const on = await call('PUT', '/api/approvals/settings', 'admin', { reviewers: [users.bob], require_approval: true });
+  assert.equal(on.status, 200, JSON.stringify(on.json));
+
+  const pl = await call('POST', '/api/playlists', 'alice', { name: 'Smart under review', smart_rules: { rules: [{ field: 'tag', op: 'has', value: 'apprsmart' }] } });
+  assert.equal(pl.status, 201);
+  const id = pl.json.id;
+  const snap = () => JSON.parse(db.prepare('SELECT published_snapshot FROM playlists WHERE id = ?').get(id).published_snapshot || 'null');
+  const flow = async () => {
+    const sub = await call('POST', '/api/approvals/submit', 'alice', { resource_type: 'playlist', resource_id: id });
+    assert.equal(sub.status, 201, JSON.stringify(sub.json));
+    const detail = await call('GET', `/api/approvals/${sub.json.id}`, 'bob');
+    assert.equal((await call('POST', `/api/approvals/${sub.json.id}/approve`, 'bob', {})).status, 200);
+    return { sub, detail };
+  };
+
+  // First release: reviewed, approved, published.
+  await flow();
+  assert.equal((await call('POST', `/api/playlists/${id}/publish`, 'alice')).status, 200);
+  assert.deepEqual(snap().map((i) => i.content_id), ['sm-a']);
+
+  // New content matches. The automatic refresh must NOT put it live in a gated workspace...
+  addTagged('sm-b', 'smart-b.png');
+  smart.refreshNow(db, (pid, seen) => publishPlaylist(pid, null, seen), WS);
+  assert.deepEqual(snap().map((i) => i.content_id), ['sm-a'], 'unreviewed content stayed off screens');
+
+  // ...but it IS an unpublished change, so it can go to review, and the reviewer sees exactly it.
+  const hist = await call('GET', `/api/revisions/playlist/${id}`, 'alice');
+  assert.equal(hist.json.has_draft, true, 'the approval bar offers Submit');
+  const { detail } = await flow();
+  assert.deepEqual(detail.json.diff_from_live.items.added.map((a) => a.content_id), ['sm-b'], 'the review diff names the new file');
+
+  // Matches change AFTER approval: the approval no longer covers what would go live.
+  addTagged('sm-c', 'smart-c.png');
+  const stale = await call('POST', `/api/playlists/${id}/publish`, 'alice');
+  assert.equal(stale.status, 409, 'an approval of {a,b} cannot release {a,b,c}');
+  assert.deepEqual(snap().map((i) => i.content_id), ['sm-a']);
+
+  // Re-review the current set, then it goes live.
+  await flow();
+  assert.equal((await call('POST', `/api/playlists/${id}/publish`, 'alice')).status, 200);
+  assert.deepEqual(snap().map((i) => i.content_id), ['sm-a', 'sm-b', 'sm-c']);
+
+  // A REMOVAL goes live by itself, approval or not: content taken down must come off screens.
+  db.prepare("UPDATE content SET tags = '[]' WHERE id = 'sm-b'").run();
+  smart.refreshNow(db, (pid, seen) => publishPlaylist(pid, null, seen), WS);
+  assert.deepEqual(snap().map((i) => i.content_id), ['sm-a', 'sm-c']);
+  await call('PUT', '/api/approvals/settings', 'admin', { require_approval: false });
+});
