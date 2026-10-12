@@ -26,6 +26,15 @@ db.pragma('foreign_keys = ON');
 const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 db.exec(schema);
 
+/*
+ * ⚠️ The resolver views are DROPPED before any migration runs and recreated as the LAST step
+ * (applyResolverViews, below). SQLite refuses to drop or rename a table a view references, and the
+ * views now name eight tables — so a table-rebuilding migration (the tenant-cascade rebuild of
+ * playlists today, any rebuild tomorrow) must never run with them present. The SQL they had is
+ * kept so the per-boot verifier can prove the new definition changes no screen.
+ */
+const _previousResolverSql = require('../lib/playlist-resolver-sql').dropResolverViews(db);
+
 // Auto-apply Phase 1 multi-tenancy migration if not yet applied. Without this
 // a self-hoster who pulls latest and restarts hits a crash in
 // migrateFolderWorkspaceIds (queries workspaces table that doesn't exist).
@@ -115,6 +124,11 @@ const migrations = [
   'ALTER TABLE devices ADD COLUMN offline_reason TEXT',
   'ALTER TABLE devices ADD COLUMN offline_reason_at INTEGER',
   'ALTER TABLE devices ADD COLUMN offline_detail TEXT',
+  // Embedded (HTTP-polling) displays tell us when they will next call: every render answer carries
+  // X-ST-Expires-In, and the MCU deep-sleeps for exactly that long. This is "now + that", in epoch
+  // seconds, so the heartbeat sweep does not call a screen offline while it is asleep on our own
+  // instruction (overnight under a power schedule that is 8+ hours). NULL for socket players.
+  'ALTER TABLE devices ADD COLUMN heartbeat_expected_by INTEGER',
   // Offline-cause log: annotate each historical offline transition with WHY. `reason` = category
   // (transport_close / ping_timeout / heartbeat_timeout / network / crashed / clean_exit / silent);
   // `detail` = human specifics (e.g. "Wi-Fi link lost — SSID Office, -78dBm" or "LAN up, server
@@ -222,6 +236,10 @@ const migrations = [
   "ALTER TABLE video_wall_devices ADD COLUMN canvas_y REAL",
   "ALTER TABLE video_wall_devices ADD COLUMN canvas_width REAL",
   "ALTER TABLE video_wall_devices ADD COLUMN canvas_height REAL",
+  // Wall layouts: zones laid on the wall's player rect (percent of it, like any layout), so one
+  // zone can sit inside one panel, span several, or cover the whole wall. NULL = the wall plays its
+  // playlist across the whole player rect, exactly as before.
+  "ALTER TABLE video_walls ADD COLUMN layout_id TEXT REFERENCES layouts(id) ON DELETE SET NULL",
   // Phase 2.2c: content_folders gets workspace_id. Phase 1 missed this table.
   "ALTER TABLE content_folders ADD COLUMN workspace_id TEXT REFERENCES workspaces(id)",
   "CREATE INDEX IF NOT EXISTS idx_content_folders_workspace ON content_folders(workspace_id)",
@@ -393,14 +411,8 @@ const migrations = [
   // first may be pulled back to stable. Without it, publishing a beta would drag every existing
   // pre-release tester backwards, which is the harm the opt-in exists to prevent.
   "ALTER TABLE devices ADD COLUMN ota_channel_served TEXT",
-  // Repair for schedules orphaned by a group deletion before the conversion carried workspace_id.
-  // Such rows are invisible (list/calendar filter on workspace), undeletable (PUT/DELETE 403 on a
-  // null workspace) and still firing (the scheduler has no workspace filter) — so an operator
-  // cannot fix them from the dashboard at all. Recover the workspace from the device the schedule
-  // targets; anything still unresolvable is left alone rather than guessed at.
-  `UPDATE schedules SET workspace_id = (SELECT d.workspace_id FROM devices d WHERE d.id = schedules.device_id)
-     WHERE workspace_id IS NULL AND device_id IS NOT NULL
-       AND (SELECT d.workspace_id FROM devices d WHERE d.id = schedules.device_id) IS NOT NULL`,
+  // (The orphaned-schedule workspace repair and organizations.widget_sandbox_isolation_disabled
+  // used to be here; both need the multi-tenancy tables, so they run after it — see below.)
   // #161: privilege tier reported by the player (0 unprivileged / 1 device-admin / 2 owner-or-
   // delegated-install) + whether a foreign device owner (MDM) manages it. Drives dashboard gating
   // of Tier-2 controls (reboot/kiosk/time) — shown only for owned panels.
@@ -684,7 +696,6 @@ const migrations = [
   "ALTER TABLE users ADD COLUMN past_due_since INTEGER",
   "ALTER TABLE users ADD COLUMN payment_failed_email_sent_at INTEGER",
   "ALTER TABLE users ADD COLUMN subscription_lapsed_email_sent_at INTEGER",
-  "ALTER TABLE organizations ADD COLUMN widget_sandbox_isolation_disabled INTEGER NOT NULL DEFAULT 0",
   // AUTH-05: make break-glass recovery revocable, single-use and auditable.
   //
   // scripts/reset-admin.js mints a JWT carrying `recovery: true`, which middleware/auth.js
@@ -1796,6 +1807,17 @@ const migrations = [
    */
   'ALTER TABLE devices ADD COLUMN enrol_key TEXT',
   'CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_enrol_key ON devices(enrol_key) WHERE enrol_key IS NOT NULL',
+  /*
+   * View-only access (lib/view-access.js): watch a display from a browser without pairing one.
+   * OFF by default. The share token is a separate secret from device_token and enrol_key: stored as
+   * a sha256 for lookup and sealed (secretbox) so an admin can copy the link again. view_cidrs is a
+   * JSON array of networks that may open the display's token-less view address.
+   */
+  'ALTER TABLE devices ADD COLUMN view_enabled INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE devices ADD COLUMN view_token_hash TEXT',
+  'ALTER TABLE devices ADD COLUMN view_token_enc TEXT',
+  'ALTER TABLE devices ADD COLUMN view_cidrs TEXT',
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_view_token ON devices(view_token_hash) WHERE view_token_hash IS NOT NULL',
   // #299 offline proof-of-play: a player-minted id for plays replayed after an outage, so a
   // re-flush cannot double-count. Partial index — live plays leave it NULL and must not collide.
   'ALTER TABLE play_logs ADD COLUMN client_event_id TEXT',
@@ -1993,6 +2015,10 @@ const migrations = [
     updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
   )`,
   'ALTER TABLE templates_installed ADD COLUMN signer_key_id TEXT',
+  // The package's validated locales/<lang>.json translations (package.js validateLocales), kept
+  // beside the manifest so listing templates never has to re-parse every package. NULL = not yet
+  // read (an install from before this column): store.i18nOf fills it from the package once.
+  'ALTER TABLE templates_installed ADD COLUMN i18n_json TEXT',
   `CREATE TABLE IF NOT EXISTS template_catalogs (
     id             TEXT PRIMARY KEY,
     label          TEXT NOT NULL,
@@ -2029,6 +2055,17 @@ const migrations = [
   // activity" (MAX(activity_log.created_at) per user) is not a table scan on a big log.
   'ALTER TABLE users ADD COLUMN cleanup_warned_at INTEGER',
   'ALTER TABLE users ADD COLUMN cleanup_delete_after INTEGER',
+  /*
+   * A plan a platform admin granted by hand (POST /api/subscription/assign). While set, nothing
+   * automatic changes plan_id — not the Stripe webhooks, the nightly reconcile or the dunning
+   * lapse — because a comp is an agreement Stripe knows nothing about. Cleared by the customer's
+   * own completed checkout, or by an admin assigning Free.
+   */
+  'ALTER TABLE users ADD COLUMN plan_comped INTEGER NOT NULL DEFAULT 0',
+  // Comps made before the flag existed: a paid plan with no Stripe subscription and no trial can only
+  // have come from an admin. Re-running is stable (a checkout adds a subscription; assigning Free
+  // drops the plan), so it needs no one-shot marker.
+  "UPDATE users SET plan_comped = 1 WHERE plan_comped = 0 AND plan_id != 'free' AND stripe_subscription_id IS NULL AND trial_started IS NULL",
   'CREATE INDEX IF NOT EXISTS idx_activity_log_user_time ON activity_log(user_id, created_at)',
   `CREATE TABLE IF NOT EXISTS template_seen (
     user_id      TEXT NOT NULL,
@@ -2203,6 +2240,29 @@ const migrations = [
    */
   'DROP INDEX IF EXISTS idx_play_logs_content',
   /*
+   * ⚠️ …AND THE DROP ABOVE MISSED ONE READER: THE FOREIGN KEYS. play_logs.content_id and widget_id
+   * are `ON DELETE SET NULL`, so deleting one content or widget row makes SQLite find every play
+   * that references it. With no index on the column that is a full scan of play_logs, synchronous
+   * inside better-sqlite3, so the whole event loop waits for it.
+   *
+   * Prod 2026-10-12 (5.2M plays): content and widget DELETEs took a median 1.1 s and up to 34 s,
+   * matching the week's worst `[loop-lag] tick_gap` freezes one for one. The 34 s one dropped 11
+   * screens and 5 dashboards at once. Account deletion is worse: it removes a workspace's content
+   * in one statement, which is one full scan PER ROW.
+   *
+   * PARTIAL (`IS NOT NULL`), because each play references a content row or a widget, not both, so
+   * each index holds only its own plays. `col = ?` implies `col IS NOT NULL`, so the FK lookup can
+   * use it (verified: 3M rows, delete 180 ms → 10 ms). Different names from the dropped index, so
+   * the DROP above never undoes them. IF NOT EXISTS: a no-op on every boot after the first.
+   *
+   * Building them is one synchronous statement over the whole table; the loop below announces and
+   * times it. Do it at a restart, never as live SQL on a running server.
+   * play_logs.workspace_id has the same FK, but on a workspace delete only (rare), and an index
+   * there covers nearly every row, so it is not built.
+   */
+  'CREATE INDEX IF NOT EXISTS idx_play_logs_content_ref ON play_logs(content_id) WHERE content_id IS NOT NULL',
+  'CREATE INDEX IF NOT EXISTS idx_play_logs_widget_ref ON play_logs(widget_id) WHERE widget_id IS NOT NULL',
+  /*
    * #473 v2: one row per visitor session on an interactive web page (Reports > Interactive
    * sessions). client_id is the player's own record id, UNIQUE per device, so a batch the player
    * resends after a lost ack is ignored rather than counted twice. workspace_id is snapshotted at
@@ -2224,6 +2284,140 @@ const migrations = [
    )`,
   'CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_ws_time ON kiosk_sessions(workspace_id, started_at)',
   'CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_time ON kiosk_sessions(started_at)',
+  /*
+   * Hosted AI image credits (lib/ai-credits.js, docs/ai-credits.md). ORG-scoped: organizations are
+   * the billing container. Entirely separate from device_usage_daily / lib/billing.js, which it
+   * only ever READS to size the included allotment.
+   *
+   * ai_credit_ledger is APPEND-ONLY: balance = SUM(delta_credits) per bucket. `bucket` keeps
+   * included credits (expire at the end of `period`, a UTC YYYY-MM) apart from purchased ones
+   * (never expire). The unique index makes a month's included top-up and a Stripe fulfilment
+   * idempotent by `ref`; debits/refunds carry the reservation id and may repeat it (one row per
+   * bucket touched). No prompt text is stored here — prompts can carry customer content.
+   */
+  `CREATE TABLE IF NOT EXISTS ai_credit_ledger (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     org_id TEXT NOT NULL,
+     delta_credits INTEGER NOT NULL,
+     reason TEXT NOT NULL CHECK (reason IN ('grant_included','purchase','admin_adjust','image_debit','image_refund')),
+     bucket TEXT NOT NULL CHECK (bucket IN ('included','purchased')),
+     period TEXT,
+     provider TEXT, model TEXT, resolution TEXT, quality TEXT,
+     provider_cost_usd_micros INTEGER, charge_usd_micros INTEGER,
+     ref TEXT, user_id TEXT, workspace_id TEXT,
+     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')))`,
+  'CREATE INDEX IF NOT EXISTS idx_ai_credit_ledger_org ON ai_credit_ledger(org_id, bucket, period)',
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_credit_ledger_once ON ai_credit_ledger(org_id, reason, ref) WHERE reason IN ('grant_included','purchase') AND ref IS NOT NULL",
+  // Append-only in fact, not just in intent: a ledger row is never edited. (DELETE stays possible
+  // so an organization's deletion can still remove its own rows.)
+  `CREATE TRIGGER IF NOT EXISTS trg_ai_credit_ledger_no_update BEFORE UPDATE ON ai_credit_ledger
+     BEGIN SELECT RAISE(ABORT, 'ai_credit_ledger is append-only'); END`,
+  /*
+   * One row per hosted generation ATTEMPT, written in the same transaction as its debit, BEFORE the
+   * provider is called. So a crash can never leave a charge without an attempt record: a row stuck
+   * in 'pending' is a crashed attempt and the sweep refunds it. UNIQUE(org_id, idempotency_key) is
+   * what makes a retried request charge once.
+   */
+  `CREATE TABLE IF NOT EXISTS ai_credit_reservations (
+     id TEXT PRIMARY KEY,
+     org_id TEXT NOT NULL, workspace_id TEXT, user_id TEXT,
+     idempotency_key TEXT NOT NULL,
+     provider TEXT NOT NULL, model TEXT NOT NULL, resolution TEXT NOT NULL, quality TEXT NOT NULL,
+     credits INTEGER NOT NULL, from_included INTEGER NOT NULL, from_purchased INTEGER NOT NULL,
+     included_period TEXT,
+     provider_cost_usd_micros INTEGER NOT NULL, charge_usd_micros INTEGER NOT NULL,
+     status TEXT NOT NULL CHECK (status IN ('pending','committed','released')),
+     content_id TEXT, error TEXT, error_status INTEGER,
+     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER,
+     UNIQUE (org_id, idempotency_key))`,
+  "CREATE INDEX IF NOT EXISTS idx_ai_credit_reservations_pending ON ai_credit_reservations(status, created_at)",
+  /*
+   * Storage backends (lib/storage, docs/storage.md). ALL ADDITIVE: an old database boots with these
+   * tables empty and every content row keeps meaning "a file in contentDir", because absence of a
+   * content_locations row IS that meaning. Nothing is backfilled at boot — a million-row library
+   * must not gain a million location rows to say what it already said.
+   *
+   * storage_profiles: where bytes can live. org_id NULL is the instance default row (at most one —
+   * and env still wins over it, see lib/storage/index.js). credentials_enc is a secretbox blob;
+   * credentials_hint is the last 4 of the key id, the only part ever shown back.
+   * manage_scope is what ScreenTinker may WRITE or DELETE there: 'st' = only under the st/ prefix
+   * (a write profile), 'none' = nothing (a bucket attached for reference), 'all' = the operator
+   * confirmed a destructive import. Enforced in the backend wrapper, not just the UI.
+   */
+  `CREATE TABLE IF NOT EXISTS storage_profiles (
+     id TEXT PRIMARY KEY,
+     org_id TEXT,
+     name TEXT NOT NULL,
+     provider TEXT NOT NULL CHECK (provider IN ('local','s3','azure')),
+     bucket TEXT,
+     endpoint TEXT, public_endpoint TEXT, public_base_url TEXT,
+     region TEXT, prefix TEXT,
+     force_path_style INTEGER,
+     credentials_enc TEXT, credentials_hint TEXT,
+     mode TEXT NOT NULL DEFAULT 'rw' CHECK (mode IN ('rw','ro')),
+     manage_scope TEXT NOT NULL DEFAULT 'st' CHECK (manage_scope IN ('none','st','all')),
+     read_priority INTEGER NOT NULL DEFAULT 100,
+     presign INTEGER NOT NULL DEFAULT 1,
+     allow_private INTEGER NOT NULL DEFAULT 0,
+     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')))`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_profiles_name ON storage_profiles(COALESCE(org_id, ''), name)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_profiles_instance ON storage_profiles(COALESCE(org_id, '')) WHERE org_id IS NULL",
+  /*
+   * Every copy of a content row's bytes. role: primary (preferred read, and where it was written),
+   * replica (a verified extra copy), draining (do not write here; still READ here). kind separates
+   * the asset from its thumbnail, subtitle and retained revision copies, which travel with it.
+   * owned = 1 when ScreenTinker wrote the object; a reference import is 0 and is never deleted.
+   * storage_profile_id NULL = local contentDir, and then object_key is the basename.
+   * ref is set on kind = 'history' only: the revisions.file_ref / thumb_ref that names this copy.
+   */
+  `CREATE TABLE IF NOT EXISTS content_locations (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     content_id TEXT NOT NULL,
+     kind TEXT NOT NULL DEFAULT 'asset' CHECK (kind IN ('asset','thumb','subtitle','history')),
+     storage_profile_id TEXT,
+     object_key TEXT,
+     role TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','replica','draining')),
+     state TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('pending','ready','error')),
+     owned INTEGER NOT NULL DEFAULT 1,
+     byte_digest TEXT, size INTEGER,
+     verified_at INTEGER, last_error TEXT, last_error_at INTEGER,
+     ref TEXT,
+     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')))`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_content_locations_unique ON content_locations(content_id, COALESCE(storage_profile_id, ''), COALESCE(object_key, ''))",
+  'CREATE INDEX IF NOT EXISTS idx_content_locations_object ON content_locations(storage_profile_id, object_key)',
+  'CREATE INDEX IF NOT EXISTS idx_content_locations_digest ON content_locations(storage_profile_id, byte_digest)',
+  // A denormalized pointer at the current primary, for old queries. content_locations is the truth.
+  'ALTER TABLE content ADD COLUMN storage_profile_id TEXT',
+  'ALTER TABLE content ADD COLUMN object_key TEXT',
+  // The /uploads/content/<name> miss path looks a row up by its basename; without these that is a scan per request.
+  'CREATE INDEX IF NOT EXISTS idx_content_filepath ON content(filepath)',
+  'CREATE INDEX IF NOT EXISTS idx_content_thumbnail_path ON content(thumbnail_path)',
+  // May screens fetch presigned bucket URLs directly? NULL = default (yes, when a public endpoint
+  // exists). The workspace and organization columns are added after the multitenancy phase below.
+  'ALTER TABLE devices ADD COLUMN storage_direct_fetch INTEGER',
+  /*
+   * A live migration's progress, in SQLite so a restart resumes from `cursor` instead of starting
+   * over — and so a restart can never flip a primary or delete a source by itself: only commit and
+   * drain do that, and both are operator actions. One active (copying / ready_to_commit) per org.
+   */
+  `CREATE TABLE IF NOT EXISTS storage_migrations (
+     id TEXT PRIMARY KEY,
+     org_id TEXT NOT NULL,
+     target_profile_id TEXT,
+     previous_profile_id TEXT,
+     state TEXT NOT NULL CHECK (state IN ('copying','ready_to_commit','committed','draining','done','aborted')),
+     cursor TEXT,
+     total INTEGER NOT NULL DEFAULT 0,
+     copied INTEGER NOT NULL DEFAULT 0,
+     verified INTEGER NOT NULL DEFAULT 0,
+     failed INTEGER NOT NULL DEFAULT 0,
+     skipped INTEGER NOT NULL DEFAULT 0,
+     last_error TEXT,
+     started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+     committed_at INTEGER)`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_migrations_active ON storage_migrations(org_id) WHERE state IN ('copying','ready_to_commit')",
 ];
 // Apply each ALTER idempotently. A "duplicate column name" / "already exists"
 // error means the column is already present (expected on a migrated DB) - benign.
@@ -2640,6 +2834,89 @@ migrateGroupSchedules();
 ensureMultitenancyMigration();
 
 /*
+ * Wall schedules: schedules.wall_id, and the CHECK widened from "a device XOR a group" to "exactly
+ * one of a device, a group, a wall". SQLite cannot alter a CHECK, so the table is rebuilt — from
+ * its OWN current CREATE text, so every column added since phase 4 (workspace_id, …) survives
+ * untouched, and its indexes and triggers are put back (the mesh replication triggers are also
+ * re-created at boot by ensureTriggers). A table whose CHECK is not the one we know is left alone
+ * and logged: wall schedules are refused there rather than risk a boot on a guessed rewrite.
+ */
+function migrateWallSchedules(conn = db) {
+  const db = conn;   // a parameter so a test can run it against an old-shaped database
+  const cols = db.prepare('PRAGMA table_info(schedules)').all();
+  if (!cols.length) return;
+  // ⚠️ The index lives HERE, not in schema.sql: schema.sql runs on every boot before this, and on an
+  // existing database an index on a column that does not exist yet would fail the whole boot.
+  if (cols.some((c) => c.name === 'wall_id')) { db.exec('CREATE INDEX IF NOT EXISTS idx_schedules_wall ON schedules(wall_id, enabled)'); return; }
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schedules'").get();
+  const OLD_CHECK = /CHECK\s*\(\s*\(device_id IS NOT NULL AND group_id IS NULL\)\s*OR\s*\(device_id IS NULL AND group_id IS NOT NULL\)\s*\)/;
+  if (!row || !OLD_CHECK.test(row.sql) || !/^CREATE TABLE\s+"?schedules"?\s*\(/.test(row.sql)) {
+    console.error('[migrate] wall schedules: the schedules table is not the shape expected — left as is, wall schedules unavailable');
+    return;
+  }
+  const createSql = row.sql
+    .replace(/^CREATE TABLE\s+"?schedules"?/, 'CREATE TABLE schedules_wall_new')
+    .replace(OLD_CHECK, "wall_id TEXT REFERENCES video_walls(id) ON DELETE CASCADE,\n    CHECK ((device_id IS NOT NULL) + (group_id IS NOT NULL) + (wall_id IS NOT NULL) = 1)");
+  const keep = db.prepare("SELECT sql FROM sqlite_master WHERE tbl_name = 'schedules' AND type IN ('index', 'trigger') AND sql IS NOT NULL").all().map((r) => r.sql);
+  const names = cols.map((c) => `"${c.name}"`).join(', ');
+  db.transaction(() => {
+    db.exec(createSql);
+    db.exec(`INSERT INTO schedules_wall_new (${names}) SELECT ${names} FROM schedules`);
+    db.exec('DROP TABLE schedules');
+    db.exec('ALTER TABLE schedules_wall_new RENAME TO schedules');
+    for (const sql of keep) db.exec(sql);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_schedules_wall ON schedules(wall_id, enabled)');
+  })();
+  console.log(`[migrate] wall schedules: schedules table rebuilt with wall_id (${cols.length} columns kept)`);
+}
+migrateWallSchedules();
+
+/*
+ * Audience buckets: `segment` and `observed_ms` (docs/audience-counting.md, lib/audience.js).
+ * A player restarting its counter inside a minute sends a second, partial bucket for that minute
+ * under a new segment number, so the uniqueness key gains `segment` — and SQLite cannot alter a
+ * table's UNIQUE constraint, so the table is rebuilt from its OWN current CREATE text with only
+ * that clause changed (the same way as migrateWallSchedules above), its indexes put back. A row
+ * from before the change is segment 0 and was observed for its whole bucket. Called where the
+ * table is created, below; a parameter so a test can run it on an old-shaped database.
+ */
+function migrateAudienceSegments(conn = db) {
+  const db = conn;
+  const cols = db.prepare('PRAGMA table_info(audience_buckets)').all().map((c) => c.name);
+  if (!cols.length) return;
+  if (!cols.includes('segment')) db.exec('ALTER TABLE audience_buckets ADD COLUMN segment INTEGER NOT NULL DEFAULT 0');
+  // ⚠️ ONE transaction: the column's DEFAULT is 60000, so a crash between the ALTER and the
+  // back-fill would leave 30-second buckets claiming a full minute for good — the next boot sees
+  // the column and never back-fills. SQLite DDL is transactional, so both land or neither does.
+  if (!cols.includes('observed_ms')) {
+    db.transaction(() => {
+      db.exec('ALTER TABLE audience_buckets ADD COLUMN observed_ms INTEGER NOT NULL DEFAULT 60000');
+      db.exec('UPDATE audience_buckets SET observed_ms = bucket_sec * 1000');
+    })();
+  }
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audience_buckets'").get();
+  const OLD_UNIQUE = /UNIQUE\s*\(\s*device_id\s*,\s*bucket_start\s*,\s*item_kind\s*,\s*item_id\s*\)/;
+  if (!row || !OLD_UNIQUE.test(row.sql)) return;   // already keyed on segment (or a fresh install)
+  if (!/^CREATE TABLE\s+"?audience_buckets"?\s*\(/.test(row.sql)) {
+    console.error('[migrate] audience segments: audience_buckets is not the shape expected — left as is');
+    return;
+  }
+  const createSql = row.sql
+    .replace(/^CREATE TABLE\s+"?audience_buckets"?/, 'CREATE TABLE audience_buckets_seg_new')
+    .replace(OLD_UNIQUE, 'UNIQUE (device_id, bucket_start, item_kind, item_id, segment)');
+  const keep = db.prepare("SELECT sql FROM sqlite_master WHERE tbl_name = 'audience_buckets' AND type IN ('index', 'trigger') AND sql IS NOT NULL").all().map((r) => r.sql);
+  const names = db.prepare('PRAGMA table_info(audience_buckets)').all().map((c) => `"${c.name}"`).join(', ');
+  db.transaction(() => {
+    db.exec(createSql);
+    db.exec(`INSERT INTO audience_buckets_seg_new (${names}) SELECT ${names} FROM audience_buckets`);
+    db.exec('DROP TABLE audience_buckets');
+    db.exec('ALTER TABLE audience_buckets_seg_new RENAME TO audience_buckets');
+    for (const sql of keep) db.exec(sql);
+  })();
+  console.log('[migrate] audience segments: audience_buckets rebuilt, unique on (device, minute, item, segment)');
+}
+
+/*
  * `organizations.sso_only` — added HERE, not in the migrations array above.
  *
  * That array runs BEFORE ensureMultitenancyMigration(), which is what creates the organizations
@@ -2658,6 +2935,44 @@ try {
   }
 } catch (e) {
   console.error('[migrate] could not add organizations.sso_only:', e.message);
+}
+
+/*
+ * Two more that once sat in the migrations array and hit the same wall on a fresh install: they
+ * need what the multi-tenancy phase creates (organizations; devices.workspace_id), so each printed
+ * a `[migrate] FAILED` line on first boot. Both are guarded on what they touch rather than on
+ * error text, so neither a fresh nor an upgraded install logs anything when there is nothing to do.
+ *
+ * organizations.widget_sandbox_isolation_disabled: a fresh install already has it (the
+ * multi-tenancy script's CREATE TABLE carries it); an organizations table from before it gains it.
+ */
+try {
+  const orgCols = db.prepare('PRAGMA table_info(organizations)').all().map((c) => c.name);
+  if (orgCols.length && !orgCols.includes('widget_sandbox_isolation_disabled')) {
+    db.exec('ALTER TABLE organizations ADD COLUMN widget_sandbox_isolation_disabled INTEGER NOT NULL DEFAULT 0');
+    console.log('[migrate] added organizations.widget_sandbox_isolation_disabled');
+  }
+} catch (e) {
+  console.error('[migrate] could not add organizations.widget_sandbox_isolation_disabled:', e.message);
+}
+
+/*
+ * Repair for schedules orphaned by a group deletion before the conversion carried workspace_id.
+ * Such rows are invisible (list/calendar filter on workspace), undeletable (PUT/DELETE 403 on a
+ * null workspace) and still firing (the scheduler has no workspace filter) — so an operator
+ * cannot fix them from the dashboard at all. Recover the workspace from the device the schedule
+ * targets; anything still unresolvable is left alone rather than guessed at. Runs every boot; a
+ * healthy database matches no rows.
+ */
+try {
+  const hasCol = (t, c) => db.prepare(`PRAGMA table_info(${t})`).all().some((r) => r.name === c);
+  if (hasCol('schedules', 'workspace_id') && hasCol('devices', 'workspace_id')) {
+    db.exec(`UPDATE schedules SET workspace_id = (SELECT d.workspace_id FROM devices d WHERE d.id = schedules.device_id)
+       WHERE workspace_id IS NULL AND device_id IS NOT NULL
+         AND (SELECT d.workspace_id FROM devices d WHERE d.id = schedules.device_id) IS NOT NULL`);
+  }
+} catch (e) {
+  console.error('[migrate] orphaned-schedule workspace repair failed:', e.message);
 }
 
 // Phase 2.2c migration: backfill content_folders.workspace_id from owner's
@@ -3023,22 +3338,18 @@ function pruneScreenshots(deviceId) {
   `).run(deviceId, deviceId);
 }
 
-// De-duplicate built-in template zones. A prior layout-editor save regenerated
-// every zone id on save; schema.sql's INSERT OR IGNORE then re-seeded the
-// canonical zone on the next boot, so template layouts accumulated positional
-// duplicates (e.g. a 2-zone split template grew to 4+). For each position in a
-// template, keep ONE zone, preferring the canonical seeded id (the built-in
-// template zones use 'z-...' ids; bug copies are uuids) so schema.sql's re-seed
-// stays an idempotent no-op; tiebreak by earliest rowid. One-time; the atomic
-// id-preserving save prevents recurrence.
-try {
-  /*
-   * Version history baseline. Every existing content row, playlist, layout, slide deck and
-   * widget gets revision #1 from its CURRENT state, stamped with the row's own updated_at and no
-   * author: the upgrade did not save anything, so it invents neither a person nor a moment.
-   * Later saves build on this so "what changed since" has an answer from day one. One-shot, so a
-   * baseline is never re-taken over real history.
-   */
+/*
+ * The schema added by the later feature PRs, one NAMED step per feature. Each step is independent:
+ * a statement that throws is logged under its own feature's name and skips only the rest of that
+ * feature, never every table and column after it. (These all used to share one try whose catch
+ * said "template-zone dedupe failed", so one bad statement silently dropped a dozen features and
+ * blamed the wrong one.) Every step is idempotent and runs on every boot.
+ */
+function migrationStep(name, fn) {
+  try { fn(); } catch (e) { console.error(`[migrate] ${name} failed:`, e.message); }
+}
+
+migrationStep('workspace and organization settings', () => {
   // workspaces is created by the multitenancy phase, after the migrations array above has run,
   // so its column is added here where the table exists. Idempotent: a duplicate column throws.
   try { db.prepare('ALTER TABLE workspaces ADD COLUMN require_approval INTEGER NOT NULL DEFAULT 0').run(); console.log('[migrate] workspaces.require_approval added (default off)'); } catch (_) { /* present */ }
@@ -3059,12 +3370,636 @@ try {
   // #talk/#go2rtc: optional per-org ICE (STUN/TURN) override as a JSON array [{urls,username?,credential?}].
   // NULL -> use the global go2rtc ice_servers. Lets an org bring its own TURN.
   try { db.prepare('ALTER TABLE organizations ADD COLUMN ice_servers TEXT').run(); console.log('[migrate] organizations.ice_servers added'); } catch (_) { /* present */ }
+  // Storage backends (lib/storage): where NEW uploads in this org go (NULL = instance default;
+  // changing it never re-homes existing rows), and whether a workspace's screens may fetch
+  // presigned bucket URLs directly (NULL = yes, when a reachable endpoint exists).
+  try { db.prepare('ALTER TABLE organizations ADD COLUMN storage_profile_id TEXT').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE workspaces ADD COLUMN storage_direct_fetch INTEGER').run(); } catch (_) { /* present */ }
+  // Per-workspace storage: the workspace's own override for new uploads (NULL = follows its
+  // organization), a profile owned by one workspace (visible to it alone), whether the org lets
+  // workspace admins choose (default off: where a tenant's bytes live is the organization's call),
+  // and the scope of a migration (NULL = org-wide, skipping workspaces that have an override).
+  try { db.prepare('ALTER TABLE workspaces ADD COLUMN storage_profile_id TEXT').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE storage_profiles ADD COLUMN workspace_id TEXT').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE organizations ADD COLUMN storage_workspace_choice INTEGER NOT NULL DEFAULT 0').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE storage_migrations ADD COLUMN workspace_id TEXT').run(); } catch (_) { /* present */ }
+});
+
+migrationStep('smart playlists', () => {
   // Smart playlists (lib/smart-playlist.js): JSON rule set; NULL = an ordinary hand-built playlist.
   try { db.prepare('ALTER TABLE playlists ADD COLUMN smart_rules TEXT').run(); console.log('[migrate] playlists.smart_rules added'); } catch (_) { /* present */ }
   try { db.prepare('ALTER TABLE playlists ADD COLUMN published_smart_rules TEXT').run(); } catch (_) { /* present */ }
   // "Play every N seconds" (lib/repeat-every.js): NULL = plays once per loop, as before.
   try { db.prepare('ALTER TABLE playlist_items ADD COLUMN repeat_every_sec INTEGER').run(); console.log('[migrate] playlist_items.repeat_every_sec added'); } catch (_) { /* present */ }
+});
 
+migrationStep('SAML', () => {
+  // SAML 2.0 org providers (lib/saml.js). A SAML row keeps the IdP's entityID in `issuer` and an empty
+  // client_id (both NOT NULL in the original table), so no rebuild is needed.
+  try { db.prepare("ALTER TABLE org_sso_providers ADD COLUMN kind TEXT NOT NULL DEFAULT 'oidc'").run(); console.log('[migrate] org_sso_providers.kind added'); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE org_sso_providers ADD COLUMN saml_sso_url TEXT').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE org_sso_providers ADD COLUMN saml_cert TEXT').run(); } catch (_) { /* present */ }
+  // Outstanding SAML AuthnRequest ids (lib/saml.js): the ACS accepts only a response to one of these,
+  // once. In the database, not memory, so a scaled-out node can complete a login another began.
+  db.exec('CREATE TABLE IF NOT EXISTS saml_requests (id TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL)');
+  // Assertion ids already consumed (lib/saml.js): a unique insert makes a replayed response fail even when two copies race.
+  db.exec('CREATE TABLE IF NOT EXISTS saml_used_assertions (id TEXT PRIMARY KEY, used_at INTEGER NOT NULL)');
+});
+
+migrationStep('Microsoft 365 and cloud folders', () => {
+  /*
+   * Microsoft 365 (lib/m365.js): an organization's own Entra app, for reading SharePoint/OneDrive.
+   * The client secret is secretbox-encrypted and never returned by the API.
+   */
+  db.exec(`CREATE TABLE IF NOT EXISTS org_m365_apps (
+    organization_id   TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+    tenant_id         TEXT NOT NULL,
+    client_id         TEXT NOT NULL,
+    client_secret_enc TEXT,
+    last_test_at      INTEGER,
+    last_test_ok      INTEGER,
+    last_error        TEXT,
+    created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+  )`);
+  // SharePoint/OneDrive folder syncs (lib/cloud-folders.js): one folder into one workspace's library.
+  db.exec(`CREATE TABLE IF NOT EXISTS cloud_folders (
+    id                   TEXT PRIMARY KEY,
+    workspace_id         TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    organization_id      TEXT NOT NULL,
+    user_id              TEXT,
+    provider             TEXT NOT NULL DEFAULT 'm365',
+    name                 TEXT NOT NULL,
+    share_url            TEXT NOT NULL,
+    drive_id             TEXT NOT NULL,
+    item_id              TEXT NOT NULL,
+    web_url              TEXT,
+    playlist_id          TEXT,
+    auto_playlist        INTEGER NOT NULL DEFAULT 1,
+    interval_min         INTEGER NOT NULL DEFAULT 15,
+    default_duration_sec INTEGER NOT NULL DEFAULT 10,
+    enabled              INTEGER NOT NULL DEFAULT 1,
+    last_sync_at         INTEGER,
+    last_status          TEXT,
+    last_error           TEXT,
+    last_summary         TEXT,
+    sync_lease_until     INTEGER,
+    created_at           INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at           INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cloud_folders_ws ON cloud_folders(workspace_id)');
+  db.exec(`CREATE TABLE IF NOT EXISTS cloud_folder_items (
+    folder_id  TEXT NOT NULL REFERENCES cloud_folders(id) ON DELETE CASCADE,
+    remote_id  TEXT NOT NULL,
+    content_id TEXT NOT NULL,
+    name       TEXT NOT NULL DEFAULT '',
+    tag        TEXT NOT NULL DEFAULT '',
+    size       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (folder_id, remote_id)
+  )`);
+  // Content a sync created whose file has since left the folder, until it is out of the playlist and retired.
+  db.exec(`CREATE TABLE IF NOT EXISTS cloud_folder_removed (
+    folder_id  TEXT NOT NULL,
+    content_id TEXT NOT NULL,
+    PRIMARY KEY (folder_id, content_id)
+  )`);
+});
+
+migrationStep('OTA rollouts', () => {
+  // Health-checked player rollouts (lib/ota-rollout.js): waves, automatic halt, rollback package.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ota_rollouts (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      family           TEXT NOT NULL,
+      version          TEXT NOT NULL,
+      status           TEXT NOT NULL DEFAULT 'rolling',
+      wave             INTEGER NOT NULL DEFAULT 0,
+      started_at       INTEGER NOT NULL,
+      wave_started_at  INTEGER NOT NULL,
+      completed_at     INTEGER,
+      halted_at        INTEGER,
+      halted_reason    TEXT,
+      halted_by        TEXT,
+      prev_version     TEXT,
+      archive_path     TEXT,
+      archive_filename TEXT,
+      archive_sha256   TEXT,
+      archive_size     INTEGER,
+      UNIQUE (family, version)
+    );
+  `);
+});
+
+migrationStep('QR links', () => {
+  // Tracked QR links (lib/qr-links.js): a short /q/<code> redirect that counts scans. A scan keeps a
+  // time and a coarse platform only — no IP, no user agent.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS qr_links (
+      id           TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      user_id      TEXT,
+      code         TEXT NOT NULL UNIQUE,
+      name         TEXT NOT NULL,
+      target_url   TEXT NOT NULL,
+      enabled      INTEGER NOT NULL DEFAULT 1,
+      created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_qr_links_ws ON qr_links(workspace_id);
+    CREATE TABLE IF NOT EXISTS qr_scans (
+      link_id  TEXT NOT NULL REFERENCES qr_links(id) ON DELETE CASCADE,
+      at       INTEGER NOT NULL,
+      platform TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_qr_scans_link_at ON qr_scans(link_id, at);
+  `);
+});
+
+migrationStep('local conditions', () => {
+  // Where a screen is (lib/local-conditions.js): its local weather and area conditions.
+  try { db.prepare('ALTER TABLE devices ADD COLUMN latitude REAL').run(); console.log('[migrate] devices.latitude added'); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE devices ADD COLUMN longitude REAL').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE devices ADD COLUMN location_label TEXT').run(); } catch (_) { /* present */ }
+  db.exec('CREATE TABLE IF NOT EXISTS weather_cells (cell TEXT PRIMARY KEY, data TEXT NOT NULL, at INTEGER NOT NULL)');
+});
+
+migrationStep('alert channels', () => {
+  // Alert channels (lib/alert-channels.js): Slack / Teams / PagerDuty / webhook / email per workspace.
+  // Workspace-owned and FK-cascaded; alert_deliveries is the once-per-outage ledger.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS alert_channels (
+      id              TEXT PRIMARY KEY,
+      workspace_id    TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      user_id         TEXT,
+      kind            TEXT NOT NULL,
+      name            TEXT NOT NULL,
+      config          TEXT NOT NULL DEFAULT '{}',
+      events          TEXT NOT NULL DEFAULT '["device_offline","device_online"]',
+      offline_minutes INTEGER NOT NULL DEFAULT 5,
+      enabled         INTEGER NOT NULL DEFAULT 1,
+      last_sent_at    INTEGER,
+      last_error      TEXT,
+      created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_alert_channels_ws ON alert_channels(workspace_id);
+    CREATE TABLE IF NOT EXISTS alert_channel_scopes (
+      channel_id TEXT NOT NULL REFERENCES alert_channels(id) ON DELETE CASCADE,
+      scope_kind TEXT NOT NULL,
+      scope_id   TEXT NOT NULL,
+      PRIMARY KEY (channel_id, scope_kind, scope_id)
+    );
+    CREATE TABLE IF NOT EXISTS alert_deliveries (
+      channel_id      TEXT NOT NULL REFERENCES alert_channels(id) ON DELETE CASCADE,
+      device_id       TEXT NOT NULL,
+      outage          INTEGER NOT NULL,
+      offline_sent_at INTEGER,
+      online_sent_at  INTEGER,
+      attempts        INTEGER NOT NULL DEFAULT 0,
+      online_attempts INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (channel_id, device_id, outage)
+    );
+  `);
+});
+
+migrationStep('Canva', () => {
+  // Canva (lib/canva.js). An organization may bring its own Canva integration (else the instance's
+  // CANVA_CLIENT_ID applies); each person connects their own Canva account to it. Secrets and
+  // tokens are secretbox-encrypted. A link ties a library item to the Canva design page(s) it was
+  // exported from, so it can be refreshed when the design changes. foreign_keys is OFF in
+  // production, so content deletion clears links explicitly (routes/content.js purgeContentRow).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS canva_integrations (
+      organization_id   TEXT PRIMARY KEY,
+      client_id         TEXT NOT NULL,
+      client_secret_enc TEXT,
+      updated_by        TEXT,
+      updated_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE TABLE IF NOT EXISTS canva_connections (
+      user_id         TEXT NOT NULL,
+      integration_key TEXT NOT NULL,
+      canva_user_id   TEXT,
+      display_name    TEXT,
+      access_enc      TEXT NOT NULL,
+      refresh_enc     TEXT,
+      expires_at      INTEGER NOT NULL DEFAULT 0,
+      scopes          TEXT,
+      created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      PRIMARY KEY (user_id, integration_key)
+    );
+    CREATE TABLE IF NOT EXISTS canva_links (
+      content_id        TEXT PRIMARY KEY,
+      workspace_id      TEXT NOT NULL,
+      user_id           TEXT NOT NULL,
+      integration_key   TEXT NOT NULL,
+      design_id         TEXT NOT NULL,
+      design_title      TEXT,
+      pages             TEXT NOT NULL,
+      format            TEXT NOT NULL,
+      design_updated_at INTEGER,
+      last_synced_at    INTEGER,
+      last_checked_at   INTEGER,
+      last_error        TEXT,
+      created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_canva_links_ws ON canva_links(workspace_id);
+    CREATE INDEX IF NOT EXISTS idx_canva_links_design ON canva_links(design_id);
+    CREATE TABLE IF NOT EXISTS canva_jobs (
+      id           TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      user_id      TEXT NOT NULL,
+      kind         TEXT NOT NULL,
+      status       TEXT NOT NULL,
+      error        TEXT,
+      result       TEXT,
+      created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+  `);
+});
+
+migrationStep('BI connections', () => {
+  // BI connections (lib/bi/connections.js): an organization's Grafana / Power BI / Tableau
+  // credentials for the bi-dashboard widget. The secret is secretbox-encrypted and never returned.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS bi_connections (
+      id              TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      created_by      TEXT,
+      kind            TEXT NOT NULL,
+      name            TEXT NOT NULL,
+      config          TEXT NOT NULL DEFAULT '{}',
+      secret_enc      TEXT,
+      allow_private   INTEGER NOT NULL DEFAULT 0,
+      created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_bi_connections_org ON bi_connections(organization_id);
+  `);
+});
+
+migrationStep('social walls', () => {
+  // Social walls (lib/social/*): an organization's API credentials (Instagram, Facebook, YouTube, X),
+  // a workspace's feeds (sources + moderation), the posts fetched for them, and their cached images.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS social_connections (
+      id               TEXT PRIMARY KEY,
+      organization_id  TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      created_by       TEXT,
+      kind             TEXT NOT NULL,
+      name             TEXT NOT NULL,
+      config           TEXT NOT NULL DEFAULT '{}',
+      secret_enc       TEXT,
+      token_expires_at INTEGER,
+      token_refreshed_at INTEGER,
+      last_error       TEXT,
+      created_at       INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_social_connections_org ON social_connections(organization_id);
+    CREATE TABLE IF NOT EXISTS social_feeds (
+      id            TEXT PRIMARY KEY,
+      workspace_id  TEXT NOT NULL,
+      created_by    TEXT,
+      name          TEXT NOT NULL,
+      sources       TEXT NOT NULL DEFAULT '[]',
+      moderation    TEXT NOT NULL DEFAULT 'auto',
+      blocklist     TEXT NOT NULL DEFAULT '[]',
+      require_media INTEGER NOT NULL DEFAULT 0,
+      max_age_days  INTEGER NOT NULL DEFAULT 0,
+      max_posts     INTEGER NOT NULL DEFAULT 20,
+      refresh_min   INTEGER NOT NULL DEFAULT 10,
+      enabled       INTEGER NOT NULL DEFAULT 1,
+      next_fetch_at INTEGER NOT NULL DEFAULT 0,
+      fail_count    INTEGER NOT NULL DEFAULT 0,
+      last_fetch_at INTEGER,
+      last_error    TEXT,
+      created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_social_feeds_ws ON social_feeds(workspace_id);
+    CREATE TABLE IF NOT EXISTS social_posts (
+      feed_id       TEXT NOT NULL,
+      network       TEXT NOT NULL,
+      post_id       TEXT NOT NULL,
+      source_key    TEXT NOT NULL,
+      status        TEXT NOT NULL,
+      hidden_reason TEXT,
+      author_name   TEXT,
+      author_handle TEXT,
+      author_avatar TEXT,
+      text          TEXT,
+      media         TEXT,
+      is_video      INTEGER NOT NULL DEFAULT 0,
+      permalink     TEXT,
+      posted_at     INTEGER NOT NULL,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at  INTEGER NOT NULL,
+      PRIMARY KEY (feed_id, network, post_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_social_posts_feed ON social_posts(feed_id, status, posted_at);
+    CREATE TABLE IF NOT EXISTS social_media (
+      hash         TEXT PRIMARY KEY,
+      url          TEXT NOT NULL,
+      mime         TEXT NOT NULL,
+      bytes        INTEGER NOT NULL,
+      created_at   INTEGER NOT NULL
+    );
+  `);
+  // A hash of what a post shows (lib/social/feeds.js contentHash): an edit at the source sends an
+  // approved post back to review on an 'approve' feed. NULL on older rows = not known yet.
+  try { db.prepare('ALTER TABLE social_posts ADD COLUMN content_hash TEXT').run(); } catch (_) { /* present */ }
+});
+
+migrationStep('audience counting', () => {
+  /*
+   * Audience counting (lib/audience.js, docs/audience-counting.md). Off unless the org allows it AND
+   * a screen or one of its groups has it enabled. audience_buckets holds INTEGERS ONLY — counts per
+   * screen per minute per item on screen — and no column could hold an image, a face or an identifier.
+   */
+  try { db.prepare('ALTER TABLE devices ADD COLUMN audience_enabled INTEGER NOT NULL DEFAULT 0').run(); console.log('[migrate] devices.audience_enabled added'); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE device_groups ADD COLUMN audience_enabled INTEGER NOT NULL DEFAULT 0').run(); } catch (_) { /* present */ }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS audience_org_settings (
+      organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+      allowed         INTEGER NOT NULL DEFAULT 0,
+      show_indicator  INTEGER NOT NULL DEFAULT 1,
+      fps             INTEGER NOT NULL DEFAULT 2,
+      min_dwell_ms    INTEGER NOT NULL DEFAULT 1000,
+      retention_days  INTEGER NOT NULL DEFAULT 90,
+      updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE TABLE IF NOT EXISTS audience_buckets (
+      device_id        TEXT NOT NULL,
+      workspace_id     TEXT,
+      bucket_start     INTEGER NOT NULL,
+      bucket_sec       INTEGER NOT NULL,
+      item_kind        TEXT NOT NULL,
+      item_id          TEXT NOT NULL DEFAULT '',
+      playlist_id      TEXT,
+      present_max      INTEGER NOT NULL,
+      present_avg_x100 INTEGER NOT NULL,
+      arrivals         INTEGER NOT NULL,
+      impressions      INTEGER NOT NULL,
+      d0 INTEGER NOT NULL, d1 INTEGER NOT NULL, d2 INTEGER NOT NULL,
+      d3 INTEGER NOT NULL, d4 INTEGER NOT NULL, d5 INTEGER NOT NULL,
+      received_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      segment          INTEGER NOT NULL DEFAULT 0,
+      observed_ms      INTEGER NOT NULL DEFAULT 60000,
+      UNIQUE (device_id, bucket_start, item_kind, item_id, segment)
+    );
+    CREATE INDEX IF NOT EXISTS idx_audience_ws_time ON audience_buckets(workspace_id, bucket_start);
+    CREATE INDEX IF NOT EXISTS idx_audience_time ON audience_buckets(bucket_start);
+    -- Which client bucket ids are already stored, so a resend is idempotent even where two ids
+    -- MERGE into one row (lib/audience.js ingest). A 48-bit hash of the id, never the id itself:
+    -- integers only, like the buckets.
+    CREATE TABLE IF NOT EXISTS audience_ingested (
+      device_id    TEXT NOT NULL,
+      bucket_start INTEGER NOT NULL,
+      id_hash      INTEGER NOT NULL,
+      PRIMARY KEY (device_id, bucket_start, id_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_audience_ingested_time ON audience_ingested(bucket_start);
+  `);
+  migrateAudienceSegments(db);
+});
+
+migrationStep('device tags and dynamic groups', () => {
+  // Device tags (JSON array, lib/content-tags normalizer) and dynamic group rules
+  // (lib/device-group-rules.js): NULL rules = a hand-built group, as before.
+  try { db.prepare('ALTER TABLE devices ADD COLUMN tags TEXT').run(); console.log('[migrate] devices.tags added'); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE device_groups ADD COLUMN rules TEXT').run(); console.log('[migrate] device_groups.rules added'); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE device_settings ADD COLUMN tags TEXT').run(); } catch (_) { /* present */ }
+});
+
+migrationStep('device power source', () => {
+  // NULL = not reported. Only embedded panels send X-ST-Power-Source, and a 'battery' default would
+  // stamp every Android, Pi and Windows row with a power source nobody measured.
+  try { db.prepare('ALTER TABLE devices ADD COLUMN power_source TEXT').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE device_telemetry ADD COLUMN power_source TEXT').run(); } catch (_) { /* present */ }
+});
+
+migrationStep('CAP feeds', () => {
+  // CAP emergency feeds (lib/cap/feeds.js). Workspace-owned and FK-cascaded, so deleting a
+  // workspace takes its feeds, scopes and seen alerts with it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cap_feeds (
+      id             TEXT PRIMARY KEY,
+      workspace_id   TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      user_id        TEXT,
+      name           TEXT NOT NULL,
+      url            TEXT NOT NULL,
+      enabled        INTEGER NOT NULL DEFAULT 1,
+      poll_sec       INTEGER NOT NULL DEFAULT 120,
+      min_severity   TEXT NOT NULL DEFAULT 'Severe',
+      events         TEXT,
+      area_match     TEXT,
+      language       TEXT NOT NULL DEFAULT 'en',
+      playlist_id    TEXT REFERENCES playlists(id) ON DELETE SET NULL,
+      widget_id      TEXT,
+      last_polled_at INTEGER,
+      last_ok_at     INTEGER,
+      last_error     TEXT,
+      created_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_cap_feeds_ws ON cap_feeds(workspace_id);
+    CREATE TABLE IF NOT EXISTS cap_feed_scopes (
+      feed_id    TEXT NOT NULL REFERENCES cap_feeds(id) ON DELETE CASCADE,
+      scope_kind TEXT NOT NULL,
+      scope_id   TEXT NOT NULL,
+      PRIMARY KEY (feed_id, scope_kind, scope_id)
+    );
+    CREATE TABLE IF NOT EXISTS cap_alerts (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      feed_id     TEXT NOT NULL REFERENCES cap_feeds(id) ON DELETE CASCADE,
+      akey        TEXT NOT NULL,
+      data        TEXT NOT NULL,
+      in_feed     INTEGER NOT NULL DEFAULT 1,
+      ended       INTEGER NOT NULL DEFAULT 0,
+      first_seen  INTEGER NOT NULL,
+      last_seen   INTEGER NOT NULL,
+      UNIQUE (feed_id, akey)
+    );
+  `);
+});
+
+migrationStep('meeting rooms', () => {
+  /*
+   * Meeting-room displays (lib/rooms). A CONNECTION is an organization's own Microsoft 365 app or
+   * Google service account (secret encrypted with lib/secretbox, never returned); a ROOM belongs to
+   * a workspace and reads one calendar through a connection or an ICS URL. room_bookings remembers
+   * the meetings a panel created (they may be ended from the panel), room_checkins the meetings
+   * checked in to or released. Org settings for both are on organizations.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS room_connections (
+      id               TEXT PRIMARY KEY,
+      organization_id  TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      kind             TEXT NOT NULL,
+      name             TEXT NOT NULL,
+      tenant_id        TEXT,
+      client_id        TEXT,
+      secret_enc       TEXT,
+      subject          TEXT,
+      read_only        INTEGER NOT NULL DEFAULT 0,
+      created_at       INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_room_connections_org ON room_connections(organization_id);
+    CREATE TABLE IF NOT EXISTS rooms (
+      id             TEXT PRIMARY KEY,
+      workspace_id   TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      name           TEXT NOT NULL,
+      source         TEXT NOT NULL,
+      connection_id  TEXT,
+      calendar_id    TEXT,
+      ics_url_enc    TEXT,
+      timezone       TEXT NOT NULL DEFAULT 'UTC',
+      details        TEXT NOT NULL DEFAULT 'private_hidden',
+      allow_booking  INTEGER NOT NULL DEFAULT 1,
+      cache_json     TEXT,
+      cache_at       INTEGER,
+      last_error     TEXT,
+      error_count    INTEGER NOT NULL DEFAULT 0,
+      next_poll_at   INTEGER,
+      created_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_rooms_ws ON rooms(workspace_id);
+    CREATE TABLE IF NOT EXISTS room_bookings (
+      id          TEXT PRIMARY KEY,
+      room_id     TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      event_id    TEXT NOT NULL,
+      device_id   TEXT,
+      start_ms    INTEGER NOT NULL,
+      end_ms      INTEGER NOT NULL,
+      created_at  INTEGER NOT NULL,
+      ended_at    INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_room_bookings_room ON room_bookings(room_id, event_id);
+    CREATE TABLE IF NOT EXISTS room_checkins (
+      room_id    TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      event_id   TEXT NOT NULL,
+      kind       TEXT NOT NULL,
+      device_id  TEXT,
+      at         INTEGER NOT NULL,
+      PRIMARY KEY (room_id, event_id)
+    );
+    /* Which screen last showed a room with working buttons (POST /api/room-panel/:widget/seen). The
+     * no-show release only acts while one did, a moment ago (lib/rooms/service.js sweepReleases). */
+    CREATE TABLE IF NOT EXISTS room_panel_presence (
+      room_id    TEXT NOT NULL,
+      widget_id  TEXT NOT NULL,
+      device_id  TEXT NOT NULL,
+      seen_at    INTEGER NOT NULL,
+      PRIMARY KEY (room_id, widget_id, device_id)
+    );
+  `);
+  // End any meeting from a panel (not only ones booked there), and release-if-nobody-checks-in.
+  try { db.prepare('ALTER TABLE organizations ADD COLUMN room_end_any INTEGER NOT NULL DEFAULT 0').run(); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE organizations ADD COLUMN room_release_min INTEGER NOT NULL DEFAULT 0').run(); } catch (_) { /* present */ }
+});
+
+migrationStep('automation', () => {
+  /*
+   * Automation (lib/automation): inbound hooks (a secret URL that raises an emergency alert, fires a
+   * trigger, writes a table data source or switches screens to a playlist for a while), Zapier-style
+   * REST-hook subscriptions, and the event log both read.
+   *   - automation_hooks.secret_hash is sha256 of the URL secret; the secret itself is shown once.
+   *   - hmac_secret_enc is optional request signing (lib/secretbox), never returned.
+   *   - feed_id: the hidden push-mode CAP feed an emergency / mass-notification hook raises alerts on
+   *     (cap_feeds.source = 'hook'), so the card, scopes, expiry and override are CAP's own.
+   */
+  try { db.prepare("ALTER TABLE cap_feeds ADD COLUMN source TEXT NOT NULL DEFAULT 'poll'").run(); } catch (_) { /* present */ }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS automation_hooks (
+      id              TEXT PRIMARY KEY,
+      workspace_id    TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      name            TEXT NOT NULL,
+      kind            TEXT NOT NULL,
+      config          TEXT NOT NULL DEFAULT '{}',
+      secret_hash     TEXT NOT NULL,
+      hmac_secret_enc TEXT,
+      feed_id         TEXT,
+      enabled         INTEGER NOT NULL DEFAULT 1,
+      created_by      TEXT,
+      last_called_at  INTEGER,
+      call_count      INTEGER NOT NULL DEFAULT 0,
+      created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_automation_hooks_ws ON automation_hooks(workspace_id);
+    CREATE TABLE IF NOT EXISTS automation_hook_calls (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      hook_id    TEXT NOT NULL,
+      at         INTEGER NOT NULL,
+      status     INTEGER NOT NULL,
+      outcome    TEXT,
+      test       INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_automation_hook_calls ON automation_hook_calls(hook_id, at);
+    CREATE TABLE IF NOT EXISTS automation_overrides (
+      id           TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      hook_id      TEXT,
+      scope_kind   TEXT NOT NULL,
+      scope_id     TEXT NOT NULL,
+      playlist_id  TEXT NOT NULL,
+      starts_at    INTEGER NOT NULL,
+      ends_at      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_automation_overrides_ws ON automation_overrides(workspace_id, ends_at);
+    CREATE TABLE IF NOT EXISTS automation_events (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      workspace_id TEXT NOT NULL,
+      type         TEXT NOT NULL,
+      data         TEXT NOT NULL,
+      created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_automation_events_ws ON automation_events(workspace_id, type, id);
+    CREATE TABLE IF NOT EXISTS automation_subscriptions (
+      id           TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      token_id     TEXT,
+      user_id      TEXT,
+      event        TEXT NOT NULL,
+      target_url   TEXT NOT NULL,
+      secret_enc   TEXT,
+      last_ok_at   INTEGER,
+      last_error   TEXT,
+      created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_automation_subs_ws ON automation_subscriptions(workspace_id, event);
+    CREATE TABLE IF NOT EXISTS automation_deliveries (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      subscription_id TEXT NOT NULL,
+      event_id        INTEGER NOT NULL,
+      attempts        INTEGER NOT NULL DEFAULT 0,
+      next_at         INTEGER NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      last_error      TEXT,
+      created_at      INTEGER NOT NULL,
+      UNIQUE (subscription_id, event_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_automation_deliveries_due ON automation_deliveries(status, next_at);
+    CREATE TABLE IF NOT EXISTS automation_device_state (
+      device_id TEXT PRIMARY KEY,
+      status    TEXT NOT NULL
+    );
+  `);
+});
+
+/*
+ * Version history baseline. Every existing content row, playlist, layout, slide deck and
+ * widget gets revision #1 from its CURRENT state, stamped with the row's own updated_at and no
+ * author: the upgrade did not save anything, so it invents neither a person nor a moment.
+ * Later saves build on this so "what changed since" has an answer from day one. One-shot, so a
+ * baseline is never re-taken over real history.
+ */
+migrationStep('version history baseline', () => {
   const BASELINE_ID = 'revisions_baseline_v1';
   if (!db.prepare('SELECT 1 FROM schema_migrations WHERE id = ?').get(BASELINE_ID)) {
     try {
@@ -3075,7 +4010,17 @@ try {
     }
     db.prepare('INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)').run(BASELINE_ID);
   }
+});
 
+// De-duplicate built-in template zones. A prior layout-editor save regenerated
+// every zone id on save; schema.sql's INSERT OR IGNORE then re-seeded the
+// canonical zone on the next boot, so template layouts accumulated positional
+// duplicates (e.g. a 2-zone split template grew to 4+). For each position in a
+// template, keep ONE zone, preferring the canonical seeded id (the built-in
+// template zones use 'z-...' ids; bug copies are uuids) so schema.sql's re-seed
+// stays an idempotent no-op; tiebreak by earliest rowid. One-time; the atomic
+// id-preserving save prevents recurrence.
+migrationStep('template-zone dedupe', () => {
   const DEDUPE_ID = 'dedupe_template_zones_v1';
   if (!db.prepare('SELECT 1 FROM schema_migrations WHERE id = ?').get(DEDUPE_ID)) {
     const removed = db.prepare(`
@@ -3099,7 +4044,16 @@ try {
     if (removed > 0) console.log(`[migrate] removed ${removed} duplicate template zone(s)`);
     db.prepare('INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)').run(DEDUPE_ID);
   }
-} catch (e) { console.error('[migrate] template-zone dedupe failed:', e.message); }
+});
+
+/*
+ * Corporate (head office) playlists: every table and column of the feature, applied here because
+ * organizations only exists once the multi-tenancy phase above has run. Idempotent; see
+ * lib/corporate/schema-sql.js.
+ */
+try {
+  require('../lib/corporate/schema-sql').applyCorporateSchema(db);
+} catch (e) { console.error('[migrate] corporate schema failed:', e.message); }
 
 // #37: fail fast (loud) if migrations left the DB missing schema the code needs.
 const { verifyAndRepairSchema } = require('../lib/schema-check');
@@ -3119,7 +4073,20 @@ verifyAndRepairSchema(db);
  * schema applies the SAME definition rather than a copy of it.
  */
 const { applyResolverViews } = require('../lib/playlist-resolver-sql');
-applyResolverViews(db);
+/*
+ * verify: when the definition changed since the last boot, prove no device changes what it plays
+ * (only devices a head office mandate now covers may differ) before keeping it; otherwise keep the
+ * previous views and switch corporate playlists off (lib/corporate/runtime.js). Never exits.
+ */
+applyResolverViews(db, { verify: true, previousSql: _previousResolverSql });
+/*
+ * The corporate backstop: per-connection TEMP triggers that make a write to head office's content
+ * by anyone who may not author it fail closed, whichever writer forgot the JS guard. TEMP, so it
+ * exists only on this process's connection and never in the file. See lib/corporate/backstop.js.
+ */
+try {
+  require('../lib/corporate/backstop').applyCorporateGuards(db);
+} catch (e) { console.error('[corporate] backstop not installed:', e.message); }
 
 /*
  * Playlist inheritance: classify every existing devices.playlist_id as chosen or copied.
@@ -3248,4 +4215,5 @@ const PLAY_LOGS_WORKSPACE_BACKFILL_ID = 'play_logs_workspace_backfill';
 // Read once by services/heartbeat to arm the 2.0.1 player defer (lib/boot-defer.js). The loop
 // that sets it runs at require time, well above this line, so the value is already final here.
 module.exports = { db, pruneTelemetry, pruneTelemetryRetention, pruneScreenshots, pruneStatusLog, getMaintenanceStats,
-                   playsMigrationTouched: _playsMigrationTouched };
+                   playsMigrationTouched: _playsMigrationTouched, _migrateWallSchedules: migrateWallSchedules,
+                   _migrateAudienceSegments: migrateAudienceSegments };

@@ -54,6 +54,15 @@ object PlayerCapabilities {
                 // server's strip keeps rtsp items off screens that cannot open rtsp://.
                 "playback.rtsp",
                 "playback.zones", "playback.transitions", "playback.pip",
+                // HOLD items (application/x-st-hold, hold://blank | hold://freeze): fullscreen
+                // (MediaPlayerManager.holdFreeze/holdBlank on the item's timer, or the group/wall
+                // tick), normal zones (ZoneManager) and wall zones. In no server baseline: an older
+                // APK would skip one as an unknown type, so only this declaration lets them through.
+                "playback.hold",
+                // Zones on a VIDEO WALL (WallZoneRenderer): the wall's layout in percent of the
+                // player rect, drawn in the wall-transformed stage, every zone on the shared clock
+                // with the group scheduler's slot rule; no leader relay while active.
+                "playback.wall_zones",
                 // Mounting a server-flattened HTML bundle is the widget WebView with a different
                 // URL, so this build can always do it. It says nothing about offline: nothing here
                 // unpacks an archive, so a bundle needs the server even on a panel that caches media.
@@ -112,12 +121,29 @@ object PlayerCapabilities {
                 "sync.clock",
                 // Content is cached to local storage and survives a server outage.
                 "offline.cache",
+                // A meeting-room display's buttons work here: PlaylistController passes the page its
+                // #panel capability. The server's no-show release waits for a screen with this.
+                "room.panel",
                 // App-UID `sh -c`. Deliberately NOT gated on device owner: it runs at any tier and
                 // is the diagnostic path the dashboard already relies on. Gated server-side instead.
                 "system.shell"
             )
 
             // ---- conditional on runtime state -------------------------------------------------------
+
+            // The screen's own HDMI input as an item (LiveInput). Only when the system actually lists
+            // an HDMI passthrough input this app can tune — a Fire TV Cube or an Android TV box with
+            // HDMI in. A Fire TV Stick, a phone or a tablet has none, and the server's strip then
+            // keeps live-input items off it rather than sending something it would only skip.
+            try {
+                if (com.remotedisplay.player.player.LiveInputPlayer.deviceHasInput(context)) caps += "playback.hdmi_in"
+            } catch (_: Throwable) {}
+
+            // Audience counting: a camera this player could count with. A statement of ability only;
+            // whether it counts is the organization's switch, sent in the payload.
+            try {
+                if (com.remotedisplay.player.audience.AudienceController.deviceHasCamera(context)) caps += "audience.camera"
+            } catch (_: Throwable) {}
 
             // Display power is asymmetric and only honest when BOTH halves exist. screen_off needs
             // owner, device-admin FORCE_LOCK, or accessibility; screen_on now works anywhere via a

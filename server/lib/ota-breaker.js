@@ -124,7 +124,12 @@ function decide(clientVersion, latestVersion, deviceId = null, now = Date.now(),
   // installs, and auto-offering floods the check endpoint). The escape hatches are deliberate:
   // opt the display into the beta channel (below), or FORCE an update (handled above) — a human
   // aiming at one panel. A -patchN release is NOT a prerelease (isReleased), so it still gets offered.
-  if (!betaChannel && !isReleased(pc) && coreCmp(pc, pl) < 0) {                                    // GENUINE superseded old-core prerelease (e.g. 1.9.1-beta4) — a -patchN release is NOT one, so it still gets offered
+  // ⚠️ NOT for a display WE served the beta channel (wasOnBeta) and that has since been switched
+  // off it. That is no phantom — it is a real screen on a build we handed it, and unticking the beta
+  // box must move it forward onto the release. Without this, a screen left on an old beta was
+  // stranded both ways: ticked, it was "up to date" with the stale beta; unticked, it was offered
+  // nothing (reported on a healthy device-owner Android 15 screen stuck on 2.1.5-beta1).
+  if (!betaChannel && !wasOnBeta && !isReleased(pc) && coreCmp(pc, pl) < 0) {                                    // GENUINE superseded old-core prerelease (e.g. 1.9.1-beta4) — a -patchN release is NOT one, so it still gets offered
     return { update_available: false, reason: 'superseded-prerelease', log: logOnce(clientVersion, `[ota] superseded prerelease '${clientVersion}' (older core than latest=${latestVersion}) — no offer`) };
   }
 
@@ -230,10 +235,24 @@ function reset() { state.clear(); loggedBad.clear(); Object.assign(rateBackoffCt
 //
 // This cannot be used to evade the breaker's real job: a device stuck in an OTA loop is
 // re-registering legitimately, and clearing its rate state on each genuine reconnect is exactly
-// what a healthy device looks like — the loop protection is the DOWNLOAD guard, not this.
+// what a healthy device looks like. The loop protection for a SLOW loop is the #341 progress
+// counter, which is why that counter survives a forgive (below).
+//
+// ⚠️ AUDIT F17: forgive clears the RATE fields only (hits, blockedUntil, level) — NOT the #341
+// no-progress counter (offerFrom/offerTo/offers) that shares this bucket. It used to delete the
+// whole bucket, and deviceSocket calls this on EVERY authenticated register: a display stuck in
+// the reinstall loop restarts after each install, reconnects, and was forgiven back to offers=0
+// before its next check, so NO_PROGRESS_LIMIT could never be reached and 'no-progress' never
+// fired — the exact loop #341 exists to stop. The counter needs no forgiving: decide() already
+// resets it the moment the reported version or the advertised target actually moves. (An
+// attacker poking ?device_id= can only advance it by the offers they trigger, and it is cleared
+// by the device's own first real progress.)
 function forgiveDevice(deviceId) {
   if (!deviceId) return false;
-  return state.delete('d:' + deviceId);
+  const b = state.get('d:' + deviceId);
+  if (!b) return false;
+  b.hits = []; b.blockedUntil = 0; b.level = 0;
+  return true;
 }
 function _size() { return state.size; }
 // #146 observability — how many update checks the breaker is rate-backing-off (total +

@@ -95,6 +95,37 @@ const LOCAL_API_COMMANDS = Object.freeze([
 ]);
 
 /*
+ * ⚠️ WHAT A `write` TOKEN MAY SEND. Everything else on the command routes still needs `full`.
+ *
+ * The command routes required `full` for every type, so an MCP agent holding a `write` token was
+ * shown send_command, told by the guide it could refresh a screen, and refused with a 403 on every
+ * call. The fix is not to drop the routes to `write`: `reboot`, `shell`, `install_apk` and
+ * `set_server_url` are fleet-affecting and stay where they were. These five are the ones an
+ * operator undoes by sending the opposite (or simply waiting), the same reasoning as the LAN door
+ * above minus set_system_brightness, which reaches past the player into the panel's own settings.
+ *
+ * A JWT session is untouched: requireScope passes sessions straight through, as before.
+ */
+const WRITE_SCOPE_COMMANDS = Object.freeze([
+  'refresh', 'screen_on', 'screen_off', 'set_volume', 'set_brightness',
+]);
+
+/* The scope a token needs to send `type`. Unknown types answer 'full', so a typo never widens. */
+function commandScope(type) {
+  return WRITE_SCOPE_COMMANDS.includes(type) ? 'write' : 'full';
+}
+
+/*
+ * Route guard for POST /devices/:id/command and /groups/:id/command — ONE helper for both, so the
+ * two routes cannot disagree about what a `write` token can do. Reads req.body.type, which the
+ * global JSON parser has already populated by the time a router runs.
+ */
+function requireCommandScope(req, res, next) {
+  const { requireScope } = require('../middleware/apiToken');
+  return requireScope(commandScope(req.body && req.body.type))(req, res, next);
+}
+
+/*
  * ⚠️ WHAT ANOTHER SERVER MAY SEND — A SUBSET, AND THE CONSENT TEXT IS WHY.
  *
  * The device-command grant says, in the words the customer reads before ticking it: "Reboot,
@@ -160,11 +191,25 @@ function isMeshCommand(type) {
  * long enough to be rendering controls the panel no longer declares. A command delivered and
  * silently ignored is the failure the capability mechanism exists to end.
  *
- * @returns {{status:'sent'|'relayed'|'queued'|'offline'|'unsupported', capability?:string, via?:string}}
+ * @returns {{status:'sent'|'relayed'|'queued'|'offline'|'unsupported'|'refused', capability?:string, via?:string, code?:string}}
  */
-function deliverCommand(deviceNs, device, type, payload) {
+function deliverCommand(deviceNs, device, type, payload, opts = {}) {
   const verdict = playerCapabilities.commandAllowed(device, type);
   if (!verdict.ok) return { status: 'unsupported', capability: verdict.capability };
+
+  /*
+   * ⚠️ CORPORATE (D13): on a screen head office's playlist plays on, the commands that blank,
+   * cover or detach it (screen_off, shutdown, set_server_url, shell, install_apk, launch,
+   * kiosk_unlock, ...) are for the organization's admins only; brightness is floored at 20% and a
+   * power schedule can only be the server-resolved one. Checked HERE, the single delivery path, so
+   * the REST route, group and workspace fan-outs, the mesh re-entry and the dashboard socket are
+   * all covered. `opts.actor` is explicit for callers outside an HTTP request (the dashboard
+   * socket); otherwise the request's actor (AsyncLocalStorage). System callers have none.
+   */
+  const corpActor = opts.actor !== undefined ? opts.actor : require('./corporate/actor').current();
+  const corp = require('./corporate/guard').assertDeviceControl(corpActor, device, type, payload);
+  if (!corp.ok) return { status: 'refused', code: corp.code, error: corp.error, corporate: corp.corporate };
+  payload = corp.payload;
 
   // #312/#313: a web player (browser tab) has origin-scoped storage, so it cannot follow a server
   // move without carrying its identity in the URL. On an operator's set_server_url — and ONLY then,
@@ -228,7 +273,8 @@ function deliverCommand(deviceNs, device, type, payload) {
    */
   let queued = false;
   try {
-    queued = require('./command-queue').queueCommand(device.id, type, outPayload);
+    const queue = require('./command-queue');
+    queued = queue.queueCommand(device.id, type, outPayload, { ttlMs: queue.ttlForDevice(device) });
   } catch (e) { /* queue module absent — the command is simply lost, and says so */ }
   const out = { status: queued ? 'queued' : 'offline' };
   if (requestId) out.id = requestId;
@@ -297,4 +343,4 @@ function validateCommand(type, payload) {
   return { ok: true };
 }
 
-module.exports = { ALLOWED_COMMANDS, MESH_COMMANDS, LOCAL_API_COMMANDS, HTTP_METHODS, isMeshCommand, deliverCommand, validateCommand };
+module.exports = { ALLOWED_COMMANDS, MESH_COMMANDS, LOCAL_API_COMMANDS, WRITE_SCOPE_COMMANDS, commandScope, requireCommandScope, HTTP_METHODS, isMeshCommand, deliverCommand, validateCommand };

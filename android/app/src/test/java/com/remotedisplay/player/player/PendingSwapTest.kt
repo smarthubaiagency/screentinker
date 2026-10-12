@@ -62,6 +62,29 @@ class PendingSwapTest {
         assertFalse(defer(newIds = listOf("other-a"), wallFollower = true))
     }
 
+    @Test fun THE_GAP_a_one_item_playlist_replaced_by_many_swaps_now() {
+        // The single item never "finishes" into a next item (it replays itself, or a live stream
+        // never ends), so deferring only held the replaced content up to DEADLINE_MS. Web/Tizen
+        // parity: `outgoingNeverAdvances = oldPlaylist.length <= 1`.
+        assertFalse(PendingSwap.shouldDefer(true, false, true, LIVE, listOf("other-a", "other-b"), outgoingCount = 1))
+        assertFalse(PendingSwap.shouldDefer(true, false, true, LIVE, listOf("other-a"), outgoingCount = 1))
+    }
+
+    @Test fun many_items_replaced_by_one_still_defers_the_rule_reads_the_OUTGOING_list() {
+        // Tizen's bug before #549 was measuring the incoming list: this must still let the live item
+        // finish its turn, exactly like any multi-item rotation.
+        assertTrue(PendingSwap.shouldDefer(true, false, true, LIVE, listOf("other-a"), outgoingCount = 3))
+        assertTrue(PendingSwap.shouldDefer(true, false, true, LIVE, listOf("other-a"), outgoingCount = 2))
+    }
+
+    @Test fun the_one_item_exemption_does_not_change_the_other_guards() {
+        // An interrupt change and a wall follower still never defer, whatever the outgoing size.
+        assertFalse(PendingSwap.shouldDefer(true, false, true, LIVE, listOf("other-a"), interruptChanged = true, outgoingCount = 3))
+        assertFalse(PendingSwap.shouldDefer(true, true, true, LIVE, listOf("other-a"), outgoingCount = 3))
+        // And a one-item list that still contains the live item is unchanged (no deferral needed).
+        assertFalse(PendingSwap.shouldDefer(true, false, true, LIVE, listOf(LIVE, "other-a"), outgoingCount = 1))
+    }
+
     @Test fun the_deferral_deadline_is_long_enough_for_a_normal_item_and_short_enough_to_notice() {
         // The deadline is the backstop for "no advance ever arrives". It must clear a typical dwell
         // comfortably (or it would cut ordinary items short) while still resolving fast enough that
@@ -69,6 +92,60 @@ class PendingSwapTest {
         val deadline = PendingSwap.DEADLINE_MS
         assertTrue("deadline must exceed a common 30s dwell", deadline > 30_000L)
         assertTrue("an operator should not wait minutes", deadline <= 120_000L)
+    }
+}
+
+/**
+ * QA: an emergency alert's card appeared only after the current item finished — up to
+ * PendingSwap.DEADLINE_MS later — because raising an alert replaces the playlist with the card,
+ * which removes the live item, which is exactly #157's deferral case. The server now marks the card
+ * `interrupt: true`; a change to the SET of those is applied at once, and nothing else changes.
+ */
+class InterruptTest {
+
+    private fun item(contentId: String = "", widgetId: String? = null, interrupt: Boolean = false) = PlaylistItem(
+        assignmentId = 0, contentId = contentId, filename = "f", mimeType = if (widgetId != null) "text/html" else "image/png",
+        filepath = "", durationSec = 10, fileSize = 0, sortOrder = 0, widgetId = widgetId, interrupt = interrupt,
+    )
+
+    private val ordinary = listOf(item("a"), item("b"))
+    private val card = item(widgetId = "w-cap", interrupt = true)
+
+    private fun changed(old: List<PlaylistItem>, new: List<PlaylistItem>) =
+        Interrupt.changed(Interrupt.keys(old), Interrupt.keys(new))
+
+    @Test fun THE_BUG_raising_an_alert_is_not_deferred() {
+        assertTrue(changed(ordinary, listOf(card)))
+        // The live item "a" is gone from the new list: without the flag this deferred.
+        assertTrue(PendingSwap.shouldDefer(true, false, true, "a|", listOf(card.itemKey)))
+        assertFalse(PendingSwap.shouldDefer(true, false, true, "a|", listOf(card.itemKey), interruptChanged = true))
+    }
+
+    @Test fun clearing_an_alert_is_not_deferred_either() {
+        // The card is on screen and the ordinary loop comes back: the all-clear must land at once too.
+        assertTrue(changed(listOf(card), ordinary))
+        assertFalse(PendingSwap.shouldDefer(true, false, true, card.itemKey, ordinary.map { it.itemKey }, interruptChanged = true))
+    }
+
+    @Test fun a_second_feed_taking_over_is_a_change() {
+        assertTrue(changed(listOf(card), listOf(item(widgetId = "w-other", interrupt = true))))
+    }
+
+    @Test fun an_ordinary_edit_keeps_the_157_deferral() {
+        val edited = listOf(item("b"), item("c"))
+        assertFalse(changed(ordinary, edited))
+        assertTrue(PendingSwap.shouldDefer(true, false, true, "a|", edited.map { it.itemKey }, interruptChanged = false))
+    }
+
+    @Test fun the_same_alert_republished_is_not_a_change() {
+        // Every payload during an alert carries the card again; that must not restart it.
+        assertFalse(changed(listOf(card), listOf(card.copy(durationSec = 60))))
+    }
+
+    @Test fun only_flagged_items_count_the_widget_type_alone_does_not() {
+        // The flag is the contract, not the widget id: an unflagged widget is an ordinary item.
+        assertFalse(changed(ordinary, listOf(item(widgetId = "w-cap"))))
+        assertEquals(setOf("|w-cap"), Interrupt.keys(listOf(card, item("a"))))
     }
 }
 

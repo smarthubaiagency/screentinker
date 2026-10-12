@@ -7,6 +7,8 @@ import { t, tn } from '../i18n.js';
 import { frameDeviceOutput, displayAspectRatio } from '../lib/device-frame.js';
 import { renderApprovalBar } from '../components/approval-actions.js';
 import { openSmartRulesModal, rulesSummary, loadFolders, DEFAULT_RULES } from '../components/smart-rules.js';
+import * as cui from '../components/corporate-ui.js';
+import { openSlotDialog } from '../components/corporate-slot-dialog.js';
 
 function formatDate(ts) {
   if (!ts) return '--';
@@ -63,6 +65,14 @@ let currentPlaybackOrder = 'sequential';
 // #319: the items exactly as last rendered. Sorting needs the list the operator is looking at, and
 // every path that changes it already funnels through renderItems, so that is where it is kept.
 let currentPlaylistItems = [];
+/*
+ * Head office (corporate) editor state, or null for an ordinary playlist (docs/corporate-playlists.md):
+ *   { mode: 'corporate', playlistId, slots: Map<slotId, slotView>, canAuthor, screens }
+ *   { mode: 'fill', playlistId, slot (slotView), fill (fill view), limits, preview }
+ * 'corporate' is head office's own playlist: slot rows render as slots, only authors edit it.
+ * 'fill' is a store's content for one local slot: limits, meters, no nesting / repeat / order.
+ */
+let corpEditor = null;
 let selectedItemIds = new Set();
 let selectAnchorId = null;
 const CLIP_KEY = 'st.playlistClipboard';
@@ -81,6 +91,7 @@ export function render(container) {
 
 export function cleanup() {
   currentPlaylistId = null;
+  corpEditor = null;
 }
 
 // Deliberately default-ON (commit aca1558): per-device "<Device> playlist" rows and every
@@ -196,6 +207,8 @@ function renderPlaylistGrid(playlists) {
                   BrightSign's pattern; the one thing Appspace conspicuously lacks. */ ''}
             ${p.used_by_count ? `<span title="${esc(tn('playlist.used_by_tip', p.used_by_count))}" style="font-size:10px;padding:2px 6px;border-radius:4px;background:#1e3a2f;color:#6ee7b7">🔒 ${esc(tn('playlist.used_by', p.used_by_count))}</span>` : ''}
             ${p.has_children ? `<span title="${esc(t('playlist.contains_tip'))}" style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--bg-input);color:var(--text-muted)">☰ ${t('playlist.tag_nested')}</span>` : ''}
+            ${p.corporate ? cui.chip(t('corp.badge.corporate'), 'hq', t('corp.tip.corporate'), { lock: true }) : ''}
+            ${p.corporate_slot ? cui.chip(t('corp.badge.your_slot'), 'slot', t('corp.tip.your_slot', { slot: p.corporate_slot.slot_name || '', playlist: p.corporate_slot.playlist_name || '' })) : ''}
           </div>
           <div style="font-size:12px;color:var(--text-muted);white-space:nowrap;margin-left:12px">${p.smart_rules ? t('smart.by_rules') : tn('playlist.item_count', p.item_count)}</div>
         </div>
@@ -203,6 +216,9 @@ function renderPlaylistGrid(playlists) {
         <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted)">
           <span>${t('playlist.created_at', { date: formatDate(p.created_at) })}</span>
           ${p.display_count ? `<span>${tn('playlist.display_count', p.display_count)}</span>` : ''}
+          ${/* ⚠️ "Paused", not "Not used": head office's playlist plays where this one would, and the
+                store must not delete it thinking nothing needs it (critique R13). */ ''}
+          ${!p.display_count && p.paused_count ? `<span title="${esc(t('corp.tip.paused'))}" style="color:var(--warning)">${esc(tn('corp.badge.paused', p.paused_count))}</span>` : ''}
         </div>
       </a>
     `).join('');
@@ -466,6 +482,11 @@ function renderDetailContent(container, playlist) {
   const isDraft = playlist.status === 'draft';
   const hasPublished = !!playlist.published_snapshot;
   currentPlaybackOrder = playlist.playback_order || 'sequential';
+  // Head office: keep what the last render learnt about this playlist's slots, so a re-render after
+  // every edit does not flash slot rows back to their bare form while the details reload.
+  const corpMode = playlist.corporate ? 'corporate' : playlist.corporate_slot ? 'fill' : null;
+  const prev = corpEditor && corpEditor.playlistId === playlist.id ? corpEditor : null;
+  corpEditor = corpMode ? { ...(prev || {}), mode: corpMode, playlistId: playlist.id, slots: (prev && prev.slots) || new Map() } : null;
 
   container.innerHTML = `
     ${isDraft ? `
@@ -474,7 +495,7 @@ function renderDetailContent(container, playlist) {
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
         <div>
           <div style="font-weight:600;font-size:14px">${t('playlist.draft.banner_title')}</div>
-          <div style="font-size:12px;color:#fcd34d;opacity:0.85">${hasPublished ? t('playlist.draft.devices_showing_published') : t('playlist.draft.never_published')}</div>
+          <div style="font-size:12px;color:#fcd34d;opacity:0.85">${hasPublished ? t('playlist.draft.devices_showing_published') : corpMode === 'fill' ? t('corp.fill.never_published') : t('playlist.draft.never_published')}</div>
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-shrink:0">
@@ -493,15 +514,21 @@ function renderDetailContent(container, playlist) {
           ${playlist.display_count ? `<div style="font-size:12px;color:var(--text-muted);margin-top:4px">${tn('playlist.assigned_to', playlist.display_count)}</div>` : ''}
         </div>
       </div>
-      <div style="display:flex;gap:8px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <!-- Delete FIRST, away from the far right. Publish sits at the right end of the draft banner
+             above; publishing removes the banner and this row moves up into its place, so whatever
+             is rightmost here ends up under the cursor that just clicked Publish. A quick double
+             click used to land on Delete. Keep the destructive button at the other end. -->
+        <button class="btn btn-secondary" id="deletePlaylistBtn" style="color:var(--danger);margin-right:8px">${t('playlist.delete_playlist')}</button>
         <button class="btn btn-secondary" id="previewPlaylistBtn">${t('widget.preview')}</button>
         ${playlist.smart_rules
           ? `<button class="btn btn-primary" id="editRulesBtn">${t('smart.edit_rules')}</button>`
-          : `<button class="btn btn-primary" id="addItemBtn">${t('playlist.add_content')}</button>`}
-        <button class="btn btn-secondary" id="deletePlaylistBtn" style="color:var(--danger)">${t('playlist.delete_playlist')}</button>
+          : `<button class="btn btn-secondary" id="addHoldBtn">${esc(t('playlist.add_hold'))}</button><button class="btn btn-primary" id="addItemBtn">${t('playlist.add_content')}</button>`}
+        ${corpMode === 'corporate' ? `<button class="btn btn-secondary" id="addSlotBtn" style="display:none">+ ${esc(t('corp.hq.add_slot'))}</button>` : ''}
       </div>
     </div>
     <div id="playlistApprovalBar" style="margin:-8px 0 12px"></div>
+    ${corpMode ? '<div id="corpEditorBar"></div>' : ''}
 
     <!-- Step 3 sends you here by creating a playlist, and this is where you fill it. Losing the
          checklist at exactly this hop is what made the flow feel like it ended. -->
@@ -524,8 +551,9 @@ function renderDetailContent(container, playlist) {
       </select>
       <button class="btn btn-secondary btn-sm" id="playlistSortApply">${t('playlist.sort_apply')}</button>
       <span style="width:12px"></span>
-      <span style="font-size:13px;color:var(--text-muted)">${t('playlist.order_label')}</span>
-      <select id="playlistOrder" class="input" style="width:auto;background:var(--bg-input)">
+      ${/* A slot's own order is ignored: head office's playback order applies to the whole loop. */ ''}
+      <span style="font-size:13px;color:var(--text-muted);${corpMode === 'fill' ? 'display:none' : ''}">${t('playlist.order_label')}</span>
+      <select id="playlistOrder" class="input" style="width:auto;background:var(--bg-input);${corpMode === 'fill' ? 'display:none' : ''}">
         <option value="sequential" ${playlist.playback_order === 'sequential' || !playlist.playback_order ? 'selected' : ''}>${t('playlist.order.sequential')}</option>
         <option value="shuffle" ${playlist.playback_order === 'shuffle' ? 'selected' : ''}>${t('playlist.order.shuffle')}</option>
         <option value="weighted" ${playlist.playback_order === 'weighted' ? 'selected' : ''}>${t('playlist.order.weighted')}</option>
@@ -540,6 +568,7 @@ function renderDetailContent(container, playlist) {
 
   if (playlist.smart_rules) renderSmart(playlist);
   else renderItems(playlist.items || []);
+  if (corpMode) mountCorporateEditor(container, playlist);
 
   renderApprovalBar(document.getElementById('playlistApprovalBar'), {
     type: 'playlist', id: playlist.id, name: playlist.name,
@@ -553,8 +582,9 @@ function renderDetailContent(container, playlist) {
         publishBtn.textContent = t('playlist.draft.publishing');
         const updated = await api.publishPlaylist(playlist.id);
         showToast(t('playlist.toast.published'));
-        // Only GET /:id resolves a smart playlist's matches; the publish response is the bare row.
-        renderDetailContent(container, updated.smart_rules ? await api.getPlaylist(playlist.id) : updated);
+        // Only GET /:id resolves a smart playlist's matches, and decorates head office's playlist and a
+        // slot's content (corporate_slot); the publish response is the bare row.
+        renderDetailContent(container, updated.smart_rules || playlist.corporate || playlist.corporate_slot ? await api.getPlaylist(playlist.id) : updated);
       } catch (err) {
         publishBtn.disabled = false;
         publishBtn.textContent = t('playlist.draft.publish');
@@ -572,7 +602,7 @@ function renderDetailContent(container, playlist) {
       try {
         const updated = await api.discardPlaylistDraft(playlist.id);
         showToast(t('playlist.toast.draft_discarded'));
-        renderDetailContent(container, updated.smart_rules ? await api.getPlaylist(playlist.id) : updated);
+        renderDetailContent(container, updated.smart_rules || playlist.corporate || playlist.corporate_slot ? await api.getPlaylist(playlist.id) : updated);
       } catch (err) {
         showToast(err.message, 'error');
       }
@@ -583,6 +613,7 @@ function renderDetailContent(container, playlist) {
   document.getElementById('playlistDesc').addEventListener('click', () => inlineEdit(playlist, 'description'));
 
   document.getElementById('addItemBtn')?.addEventListener('click', () => showAddItemModal(playlist.id));
+  document.getElementById('addHoldBtn')?.addEventListener('click', (e) => showAddHoldModal(playlist.id, e.currentTarget));
   document.getElementById('editRulesBtn')?.addEventListener('click', () => {
     openSmartRulesModal({
       title: t('smart.title_edit', { name: playlist.name }),
@@ -682,6 +713,27 @@ function renderDetailContent(container, playlist) {
     ctaFor: { playlist: t('gs.playlist.cta_here') },
   }).catch(() => {});
 
+  // A slot's content: "delete" means "this level goes back to the next level's content or head
+  // office's fallback" — say so, with the screens it changes, as the head office page does.
+  if (playlist.corporate_slot) {
+    const delBtn = document.getElementById('deletePlaylistBtn');
+    delBtn.textContent = t('corp.slot.remove_level');
+    delBtn.addEventListener('click', async () => {
+      const cs = playlist.corporate_slot;
+      const f = (corpEditor && corpEditor.mode === 'fill' && corpEditor.fill) || {};
+      const ok = await cui.ask({
+        title: t('corp.slot.remove_level'), confirmLabel: t('corp.slot.remove_level'), danger: true,
+        text: tn('corp.slot.remove_level_confirm', f.screens || 0, { level: cui.levelLabel(f.scope_kind || cs.scope_kind, f.scope_name) }),
+      });
+      if (!ok) return;
+      try {
+        await api.deleteFill(cs.fill_id);
+        showToast(t('corp.slot.level_removed'), 'success');
+        window.location.hash = '#/corporate';
+      } catch (err) { showToast(err.message, 'error'); }
+    });
+    return;
+  }
   document.getElementById('deletePlaylistBtn').addEventListener('click', async () => {
     if (!confirm(t('playlist.confirm_delete', { name: playlist.name }))) return;
     try {
@@ -773,19 +825,47 @@ async function editConditionModal(ids, parsed) {
         <option value="ds" ${curType === 'ds' || !parsed ? 'selected' : ''}>${esc(t('playlist.condition.type_ds'))}</option>
         <option value="tag" ${curType === 'tag' ? 'selected' : ''}>${esc(t('playlist.condition.type_tag'))}</option>
         <option value="meta" ${curType === 'meta' ? 'selected' : ''}>${esc(t('playlist.condition.type_meta'))}</option>
+        <option value="weather" ${curType === 'weather' ? 'selected' : ''}>${esc(t('playlist.condition.type_weather'))}</option>
+        <option value="geo" ${curType === 'geo' ? 'selected' : ''}>${esc(t('playlist.condition.type_geo'))}</option>
       </select>
+      <div id="condWeatherWrap" hidden>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">${esc(t('playlist.condition.weather_hint'))}</p>
+        <select id="condWxField" class="input" style="width:100%;margin:4px 0 12px">
+          <option value="condition" ${!parsed || parsed.field !== 'temperature' ? 'selected' : ''}>${esc(t('playlist.condition.wx_condition'))}</option>
+          <option value="temperature" ${parsed && parsed.field === 'temperature' ? 'selected' : ''}>${esc(t('playlist.condition.wx_temperature'))}</option>
+        </select>
+        <div id="condWxCondWrap" style="display:flex;gap:8px">
+          <select id="condWxCondOp" class="input" style="flex:1"><option value="eq" ${!parsed || parsed.op !== 'neq' ? 'selected' : ''}>${esc(t('playlist.condition.wx_is'))}</option><option value="neq" ${parsed && parsed.op === 'neq' ? 'selected' : ''}>${esc(t('playlist.condition.wx_is_not'))}</option></select>
+          <select id="condWxCondValue" class="input" style="flex:2">${['clear', 'cloudy', 'rain', 'snow', 'storm', 'fog'].map((g) => `<option value="${g}" ${parsed && parsed.type === 'weather' && parsed.value === g ? 'selected' : ''}>${esc(t(`playlist.condition.wx.${g}`))}</option>`).join('')}</select>
+        </div>
+        <div id="condWxTempWrap" style="display:flex;gap:8px" hidden>
+          <select id="condWxTempOp" class="input" style="flex:1">${[['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤']].map(([v, l]) => `<option value="${v}" ${parsed && parsed.type === 'weather' && parsed.op === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+          <input id="condWxTempValue" type="number" class="input" style="flex:1" value="${esc(parsed && parsed.type === 'weather' && parsed.field === 'temperature' ? String(parsed.value) : '20')}">
+          <select id="condWxUnits" class="input" style="flex:1"><option value="c" ${!parsed || parsed.units !== 'f' ? 'selected' : ''}>°C</option><option value="f" ${parsed && parsed.units === 'f' ? 'selected' : ''}>°F</option></select>
+        </div>
+      </div>
+      <div id="condGeoWrap" hidden>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">${esc(t('playlist.condition.geo_hint'))}</p>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <select id="condGeoOp" class="input" style="flex:1"><option value="within" ${!parsed || parsed.op !== 'outside' ? 'selected' : ''}>${esc(t('playlist.condition.geo_within'))}</option><option value="outside" ${parsed && parsed.op === 'outside' ? 'selected' : ''}>${esc(t('playlist.condition.geo_outside'))}</option></select>
+          <input id="condGeoRadius" type="number" min="1" class="input" style="width:90px" value="${esc(parsed && parsed.type === 'geo' ? String(parsed.radius_km) : '25')}"> <span style="align-self:center;font-size:13px">km</span>
+        </div>
+        <input id="condGeoSearch" class="input" style="width:100%;margin-bottom:6px" placeholder="${esc(t('playlist.condition.geo_search'))}" value="${esc(parsed && parsed.type === 'geo' ? (parsed.label || '') : '')}">
+        <div id="condGeoResults" style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px"></div>
+        <div id="condGeoPoint" style="font-size:12px;color:var(--text-muted);margin-bottom:12px">${parsed && parsed.type === 'geo' ? esc(`${parsed.lat}, ${parsed.lon}`) : ''}</div>
+      </div>
       <div id="condDsWrap">
         ${sources.length ? '' : `<p style="color:#fbbf24;font-size:13px;margin-bottom:12px">${esc(t('playlist.condition.no_sources'))}</p>`}
         <label style="font-size:12px;color:var(--text-muted)">${esc(t('playlist.condition.slug'))}</label>
         <select id="condSlug" class="input" style="width:100%;margin:4px 0 12px">${opts}</select>
         <label style="font-size:12px;color:var(--text-muted)">${esc(t('playlist.condition.path'))}</label>
-        <input id="condPath" class="input" list="condFields" placeholder="e.g. status or now.title" value="${esc(parsed && parsed.type !== 'tag' && parsed.type !== 'meta' ? (parsed.path || '') : '')}" style="width:100%;margin:4px 0 12px">
+        <input id="condPath" class="input" list="condFields" placeholder="e.g. status or now.title" value="${esc(parsed && !['tag', 'meta', 'weather', 'geo'].includes(parsed.type) ? (parsed.path || '') : '')}" style="width:100%;margin:4px 0 12px">
         <datalist id="condFields"></datalist>
         <label style="font-size:12px;color:var(--text-muted)">${esc(t('playlist.condition.op'))}</label>
         <select id="condOp" class="input" style="width:100%;margin:4px 0 12px">${opOpts}</select>
         <div id="condValueWrap">
           <label style="font-size:12px;color:var(--text-muted)">${esc(t('playlist.condition.value'))}</label>
-          <input id="condValue" class="input" value="${esc(parsed && parsed.type !== 'tag' && parsed.type !== 'meta' && parsed.value != null ? String(parsed.value) : '')}" style="width:100%;margin:4px 0 12px">
+          <input id="condValue" class="input" value="${esc(parsed && !['tag', 'meta', 'weather', 'geo'].includes(parsed.type) && parsed.value != null ? String(parsed.value) : '')}" style="width:100%;margin:4px 0 12px">
         </div>
       </div>
       <div id="condTagWrap" hidden>
@@ -821,12 +901,41 @@ async function editConditionModal(ids, parsed) {
   const dsWrap = modal.querySelector('#condDsWrap');
   const tagWrap = modal.querySelector('#condTagWrap');
   const metaWrap = modal.querySelector('#condMetaWrap');
+  const wxWrap = modal.querySelector('#condWeatherWrap');
+  const geoWrap = modal.querySelector('#condGeoWrap');
   const showType = () => {
     const ty = typeSel.value;
     dsWrap.hidden = ty !== 'ds';
     tagWrap.hidden = ty !== 'tag';
     metaWrap.hidden = ty !== 'meta';
+    wxWrap.hidden = ty !== 'weather';
+    geoWrap.hidden = ty !== 'geo';
   };
+  const wxField = modal.querySelector('#condWxField');
+  const showWx = () => { modal.querySelector('#condWxCondWrap').hidden = wxField.value !== 'condition'; modal.querySelector('#condWxTempWrap').hidden = wxField.value !== 'temperature'; };
+  wxField.addEventListener('change', showWx); showWx();
+  // Area: search a place and take its coordinates as the centre.
+  let geoPoint = parsed && parsed.type === 'geo' ? { lat: parsed.lat, lon: parsed.lon, label: parsed.label || '' } : null;
+  const geoSearch = modal.querySelector('#condGeoSearch');
+  const geoResults = modal.querySelector('#condGeoResults');
+  let geoTimer = null;
+  geoSearch.addEventListener('input', () => {
+    clearTimeout(geoTimer);
+    geoTimer = setTimeout(async () => {
+      const q = geoSearch.value.trim();
+      if (q.length < 2) { geoResults.innerHTML = ''; return; }
+      try {
+        const rows = await api.get(`/devices/geocode?q=${encodeURIComponent(q)}`);
+        geoResults.innerHTML = rows.map((r, i) => `<button type="button" class="btn btn-secondary btn-sm" data-geo-i="${i}" style="text-align:left">${esc([r.name, r.region, r.country].filter(Boolean).join(', '))}</button>`).join('');
+        geoResults.querySelectorAll('[data-geo-i]').forEach((b) => b.addEventListener('click', () => {
+          const r = rows[Number(b.dataset.geoI)];
+          geoPoint = { lat: r.latitude, lon: r.longitude, label: [r.name, r.region, r.country].filter(Boolean).join(', ') };
+          geoSearch.value = geoPoint.label; geoResults.innerHTML = '';
+          modal.querySelector('#condGeoPoint').textContent = `${r.latitude}, ${r.longitude}`;
+        }));
+      } catch (e) { geoResults.innerHTML = `<span style="font-size:12px;color:var(--danger)">${esc(e.message)}</span>`; }
+    }, 300);
+  });
   typeSel.addEventListener('change', showType);
   showType();
 
@@ -862,6 +971,13 @@ async function editConditionModal(ids, parsed) {
       const value = modal.querySelector('#condTagValue').value.trim().toLowerCase();
       if (!value) { modal.querySelector('#condTagValue').focus(); return; }
       play_when = { type: 'tag', op: modal.querySelector('#condTagOp').value, value };
+    } else if (ty === 'weather') {
+      play_when = wxField.value === 'temperature'
+        ? { type: 'weather', field: 'temperature', op: modal.querySelector('#condWxTempOp').value, value: Number(modal.querySelector('#condWxTempValue').value), units: modal.querySelector('#condWxUnits').value }
+        : { type: 'weather', field: 'condition', op: modal.querySelector('#condWxCondOp').value, value: modal.querySelector('#condWxCondValue').value };
+    } else if (ty === 'geo') {
+      if (!geoPoint) { geoSearch.focus(); return; }
+      play_when = { type: 'geo', op: modal.querySelector('#condGeoOp').value, lat: geoPoint.lat, lon: geoPoint.lon, radius_km: Number(modal.querySelector('#condGeoRadius').value) || 25, label: geoPoint.label };
     } else if (ty === 'meta') {
       const path = modal.querySelector('#condMetaPath').value.trim();
       const op = metaOp.value;
@@ -885,7 +1001,7 @@ function paintSelectBar() {
   const bar = document.getElementById('playlistSelectBar');
   if (!bar) return;
   const n = selectedItemIds.size;
-  bar.style.display = currentPlaylistItems.length ? 'flex' : 'none';
+  bar.style.display = currentPlaylistItems.length && !corpIsReadOnly() ? 'flex' : 'none';
   const clip = getClip();
   bar.innerHTML = `
     <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted);margin:0">
@@ -1182,7 +1298,9 @@ function renderItems(items) {
   const present = new Set(currentPlaylistItems.map((it) => String(it.id)));
   selectedItemIds = new Set([...selectedItemIds].filter((id) => present.has(id)));
   const sortBar = document.getElementById('playlistSortBar');
-  if (sortBar) sortBar.style.display = items.length ? 'flex' : 'none';
+  // Head office's playlist, for someone who can't change it: no sort/order/selection tools (§7.9).
+  const corpReadOnly = corpIsReadOnly();
+  if (sortBar) sortBar.style.display = items.length && !corpReadOnly ? 'flex' : 'none';
   paintSelectBar();
 
   if (!items.length) {
@@ -1195,7 +1313,8 @@ function renderItems(items) {
     return;
   }
 
-  itemsEl.innerHTML = items.map((item, i) => `
+  const fillMode = !!(corpEditor && corpEditor.mode === 'fill');
+  itemsEl.innerHTML = items.map((item, i) => item.slot_id ? slotRowHtml(item, i, items.length) : `
     <div class="playlist-item" data-item-id="${item.id}" data-index="${i}" draggable="true" style="background:var(--bg-card);border:1px solid ${selectedItemIds.has(String(item.id)) ? 'var(--accent, #3B82F6)' : 'var(--border)'};border-radius:var(--radius);padding:12px 16px;display:flex;align-items:center;gap:12px;cursor:grab;transition:border-color 0.15s;${item.enabled === 0 ? 'opacity:0.55' : ''}">
       <input type="checkbox" class="item-select" data-item-id="${item.id}" data-index="${i}" ${selectedItemIds.has(String(item.id)) ? 'checked' : ''} style="flex-shrink:0" onclick="event.stopPropagation()">
       <div style="color:var(--text-muted);font-size:12px;min-width:24px;text-align:center;user-select:none">${i + 1}</div>
@@ -1211,6 +1330,8 @@ function renderItems(items) {
         <div style="font-size:14px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(item.child_playlist_name || item.filename || item.widget_name || t('common.unknown'))}</div>
         <div style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:8px;min-width:0">
           <span style="white-space:nowrap">${item.child_playlist_id ? t('playlist.item_nested') : item.widget_id ? t('playlist.item_widget') : esc(item.mime_type || t('playlist.unknown_type'))}</span>
+          ${/* In a slot a video counts at its full length (it always plays to the end), so say so. */ ''}
+          ${fillMode && item.content_duration && /^(video|audio)\//.test(item.mime_type || '') ? `<span style="font-size:11px;white-space:nowrap;color:var(--warning)">${esc(t('corp.slot.video_len', { len: cui.formatSec(item.content_duration) }))}</span>` : ''}
           ${item.play_from || item.play_until ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#1a2e1a;color:#86efac;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(windowSummary(item))}">${esc(windowSummary(item))}</span>` : ''}
           ${item.schedules && item.schedules.length ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0c2a3f;color:#7dd3fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(scheduleSummary(item.schedules))}">🕐 ${esc(scheduleSummary(item.schedules))}</span>` : ''}
           ${Array.isArray(item.tags) && item.tags.length ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:var(--bg-input);color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${item.tags.map((tg) => '#' + esc(tg)).join(' ')}</span>` : ''}
@@ -1219,7 +1340,7 @@ function renderItems(items) {
       <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
         ${item.child_playlist_id
           ? `<span style="font-size:12px;color:var(--text-muted)" title="${esc(t('playlist.nested_duration_hint'))}">${esc(t('playlist.plays_through'))}</span>`
-          : (item.mime_type === 'video/hls' || item.mime_type === 'video/rtsp')
+          : (item.mime_type === 'video/hls' || item.mime_type === 'video/rtsp' || item.mime_type === 'video/hdmi-in')
           // A live stream's duration is DWELL (how long to stay on the channel), not clip length.
           // 0 = stay until the item is skipped (window / enabled / play_when / the playlist advances).
           ? `<label style="font-size:12px;color:var(--text-muted)" title="${esc(t('playlist.dwell_hint'))}">${t('playlist.dwell')}</label>
@@ -1230,7 +1351,7 @@ function renderItems(items) {
         <span style="font-size:12px;color:var(--text-muted)">${t('playlist.sec')}</span>`}
         ${currentPlaybackOrder === 'weighted' && !item.child_playlist_id ? `<label style="font-size:12px;color:var(--text-muted)">${t('playlist.weight')}</label>
         <input type="number" class="input item-weight" data-item-id="${item.id}" value="${item.weight || 1}" min="1" max="1000" style="width:56px;padding:4px 8px;font-size:13px;text-align:center">` : ''}
-        ${currentPlaybackOrder === 'sequential' && !item.child_playlist_id ? repeatSelect(item) : ''}
+        ${currentPlaybackOrder === 'sequential' && !item.child_playlist_id && !fillMode ? repeatSelect(item) : ''}
         <label style="font-size:12px;color:var(--text-muted)" title="${esc(t('playlist.play_window_hint'))}">${t('playlist.play_from')}</label>
         <input type="datetime-local" class="input item-play-from" data-item-id="${item.id}" value="${esc(item.play_from || '')}" style="width:168px;padding:4px 6px;font-size:12px">
         <label style="font-size:12px;color:var(--text-muted)">${t('playlist.play_until')}</label>
@@ -1260,6 +1381,8 @@ function renderItems(items) {
   `).join('');
   hydrateAuthImages(itemsEl);
   bindSelection(itemsEl, items);
+  bindSlotRows(itemsEl);
+  if (corpReadOnly) lockCorporateRows(itemsEl);
 
   itemsEl.querySelectorAll('.item-duration').forEach(input => {
     input.addEventListener('change', async (e) => {
@@ -1401,6 +1524,219 @@ function renderItems(items) {
   setupDragReorder(itemsEl);
 }
 
+/* ── Head office (corporate) editor ──────────────────────────────────────────────────────────── */
+
+/*
+ * A LOCAL SLOT row of head office's playlist: the space each store fills (spec §7.3). Drawn as a
+ * dashed card with its limits and what plays when a store leaves it empty, and only the controls a
+ * slot has — settings, remove, move, preview. Duration, repeat, dayparts, mute and swap belong to
+ * the stores' items inside the slot, not the slot.
+ */
+function slotRowHtml(item, i, total) {
+  const view = (corpEditor && corpEditor.slots && corpEditor.slots.get(item.slot_id)) || null;
+  const raw = item.slot || {};
+  const name = (view && view.name) || raw.name || t('corp.hq.slot_unnamed');
+  const limits = (view && view.limits) || { max_items: raw.max_items ?? null, max_total_sec: raw.max_total_sec ?? null };
+  const fb = view && view.fallback;
+  const empty = fb ? t('corp.hq.slot_empty_fallback', { name: fb.name || '' }) : (raw.fallback_content_id || raw.fallback_widget_id) && !view ? '' : t('corp.hq.slot_empty_skip');
+  const author = !!(corpEditor && corpEditor.canAuthor);
+  const btn = (cls, label, extra = '') => `<button class="btn btn-secondary btn-sm ${cls}" data-slot-id="${esc(item.slot_id)}" ${extra}>${esc(label)}</button>`;
+  return `
+    <div class="playlist-item corp-slot-row" data-item-id="${item.id}" data-index="${i}" draggable="${author ? 'true' : 'false'}" style="background:var(--bg-card);border:1px dashed;border-radius:var(--radius);padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div style="color:var(--text-muted);font-size:12px;min-width:24px;text-align:center;user-select:none">${i + 1}</div>
+      <div style="flex:1;min-width:220px">
+        <div style="font-size:14px;color:var(--text-primary)">${cui.chip(t('corp.badge.local_slot'), 'slot')} ${esc(t('corp.hq.slot_row', { name, limits: cui.limitsText(limits) }))}</div>
+        <div class="corp-help">${esc(empty)}${view && view.fills ? ' · ' + esc(tn('corp.hq.slot_levels', view.fills)) : ''}${view && !view.live ? ' · ' + esc(t('corp.hq.slot_not_live')) : ''}</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${author ? btn('slot-settings', t('corp.hq.slot_settings')) + btn('slot-remove', t('corp.hq.remove_slot')) : ''}
+        ${btn('slot-preview', t('corp.hq.preview'))}
+        ${author ? `<button class="btn-icon item-move" data-item-id="${item.id}" data-dir="up" title="${t('playlist.move_up')}" aria-label="${t('playlist.move_up')}" ${i === 0 ? 'disabled' : ''} style="color:var(--text-muted);background:none;border:none;cursor:pointer;padding:4px;${i === 0 ? 'opacity:0.3;cursor:not-allowed' : ''}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg></button>
+        <button class="btn-icon item-move" data-item-id="${item.id}" data-dir="down" title="${t('playlist.move_down')}" aria-label="${t('playlist.move_down')}" ${i === total - 1 ? 'disabled' : ''} style="color:var(--text-muted);background:none;border:none;cursor:pointer;padding:4px;${i === total - 1 ? 'opacity:0.3;cursor:not-allowed' : ''}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></button>` : ''}
+      </div>
+    </div>`;
+}
+
+function bindSlotRows(itemsEl) {
+  const slotOf = (b) => (corpEditor && corpEditor.slots.get(b.dataset.slotId)) || null;
+  itemsEl.querySelectorAll('.slot-settings').forEach((b) => b.addEventListener('click', async () => {
+    const pl = await api.getPlaylist(currentPlaylistId).catch(() => null);
+    openSlotDialog(pl || { id: currentPlaylistId }, slotOf(b), () => refreshAfterMutation());
+  }));
+  itemsEl.querySelectorAll('.slot-remove').forEach((b) => b.addEventListener('click', async () => {
+    const sl = slotOf(b);
+    const ok = await cui.ask({
+      title: t('corp.hq.remove_slot'), danger: true, confirmLabel: t('corp.hq.remove_slot'),
+      text: tn('corp.hq.remove_slot_confirm', sl ? sl.fills || 0 : 0, { name: sl ? sl.name : '' }),
+    });
+    if (!ok) return;
+    try { await api.deleteSlot(b.dataset.slotId); showToast(t('corp.hq.slot_removed'), 'success'); refreshAfterMutation(); }
+    catch (e) { showToast(e.message, 'error'); }
+  }));
+  itemsEl.querySelectorAll('.slot-preview').forEach((b) => b.addEventListener('click', () => {
+    cui.openScreenPreview({ playlistId: currentPlaylistId, canDraft: !!(corpEditor && corpEditor.canAuthor) });
+  }));
+}
+
+/** The corporate / slot editor additions, loaded after the ordinary editor has rendered. */
+/*
+ * Head office's playlist opened by someone who can't author it (a head office editor when only org
+ * admins author). Until the settings answer, it counts as read-only: an author sees the controls a
+ * moment later, a non-author never sees a control that would only fail.
+ */
+function corpIsReadOnly() {
+  return !!(corpEditor && corpEditor.mode === 'corporate' && corpEditor.canAuthor !== true);
+}
+
+/**
+ * Lock every head office item row: inputs read-only, no drag, no selection, and a click on any of
+ * them explains (corporate-ui.js: never a silently disabled control). Slot rows have their own.
+ */
+function lockCorporateRows(itemsEl) {
+  itemsEl.querySelectorAll('.playlist-item').forEach((row) => {
+    row.draggable = false;
+    row.style.cursor = 'default';
+    row.querySelectorAll('.item-select').forEach((cb) => { cb.style.display = 'none'; });
+    row.querySelectorAll('input, select, button').forEach((el) => {
+      if (el.classList.contains('item-select')) return;
+      el.dataset.corpLocked = 'hq';
+      el.title = t('corp.locked.title');
+      if (el.tagName === 'INPUT') el.readOnly = true;
+    });
+  });
+  if (itemsEl._corpLockBound) return;
+  itemsEl._corpLockBound = true;
+  const handler = (e) => {
+    if (!corpIsReadOnly()) return;
+    const el = e.target && e.target.closest && e.target.closest('[data-corp-locked="hq"]');
+    if (!el) return;
+    // A change that got through anyway (typed into a select) never reaches the row's own handler.
+    if (e.type === 'change') { e.stopImmediatePropagation(); refreshAfterMutation(); return; }
+    if (e.type === 'keydown' && !['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    // One explanation per gesture: a select opens on mousedown, everything else explains on click.
+    const isSelect = el.tagName === 'SELECT';
+    if (e.type === 'mousedown' && !isSelect) return;
+    if (e.type === 'click' && isSelect) return;
+    cui.explainLocked({ text: t('corp.hq.read_only') });
+  };
+  ['click', 'mousedown', 'keydown', 'change'].forEach((ev) => itemsEl.addEventListener(ev, handler, true));
+}
+
+async function mountCorporateEditor(container, playlist) {
+  const bar = document.getElementById('corpEditorBar');
+  if (!bar || !corpEditor) return;
+  const ed = corpEditor;
+  const s = await cui.corporateSettings();
+  if (ed.mode === 'corporate') {
+    let detail;
+    try { detail = await api.getCorporatePlaylist(playlist.id); }
+    catch (e) { bar.innerHTML = `<div class="corp-notice corp-notice-danger">${esc(e.message)}</div>`; return; }
+    if (corpEditor !== ed || currentPlaylistId !== playlist.id) return;
+    ed.slots = new Map((detail.slots || []).map((sl) => [sl.id, sl]));
+    ed.screens = detail.screens || 0;
+    ed.canAuthor = !!(s && s.can_author);
+    bar.innerHTML = `
+      <div class="corp-notice">
+        ${cui.chip(t('corp.badge.corporate'), 'hq', '', { lock: true })}
+        ${esc(tn('corp.hq.banner', ed.screens || 0))}
+        <a class="btn btn-secondary btn-sm" href="#/corporate/where">${esc(t('corp.where.title'))}</a>
+        <button class="btn btn-secondary btn-sm" id="corpPvBtn">${esc(t('corp.hq.preview'))}</button>
+        ${ed.canAuthor ? '' : `<div class="corp-help" style="margin-top:6px">${esc(t('corp.hq.read_only'))}</div>`}
+      </div>`;
+    bar.querySelector('#corpPvBtn').addEventListener('click', () => cui.openScreenPreview({ playlistId: playlist.id, canDraft: ed.canAuthor }));
+    const publishBtn = document.getElementById('publishBtn');
+    if (publishBtn && ed.canAuthor && ed.screens) publishBtn.textContent = tn('corp.hq.publish_n', ed.screens);
+    if (!ed.canAuthor) {
+      // Approve-but-not-publish (R11): a reviewer here can approve; only an admin can publish.
+      if (publishBtn) publishBtn.replaceWith(Object.assign(document.createElement('span'), { className: 'corp-help', textContent: t('corp.hq.waiting_admin') }));
+      ['addItemBtn', 'addHoldBtn', 'deletePlaylistBtn', 'discardDraftBtn'].forEach((id) => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
+      // The name and description are head office's too: a click explains instead of opening an edit.
+      ['playlistTitle', 'playlistDesc'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const copy = el.cloneNode(true);
+        copy.title = t('corp.locked.title');
+        copy.style.cursor = 'default';
+        copy.addEventListener('click', () => cui.explainLocked({ text: t('corp.hq.read_only') }));
+        el.replaceWith(copy);
+      });
+    }
+    const addSlot = document.getElementById('addSlotBtn');
+    if (addSlot && ed.canAuthor) {
+      addSlot.style.display = '';
+      addSlot.onclick = () => openSlotDialog(playlist, null, () => refreshAfterMutation());
+    }
+    renderItems(currentPlaylistItems);
+    return;
+  }
+
+  // ── fill mode: the store's content for one local slot (§7.8)
+  const cs = playlist.corporate_slot;
+  let slotsResp = null;
+  let pv = null;
+  try {
+    [slotsResp, pv] = await Promise.all([api.getSlotFills(cs.slot_id), api.previewFill(cs.fill_id).catch(() => null)]);
+  } catch (e) { bar.innerHTML = `<div class="corp-notice corp-notice-danger">${esc(e.message)}</div>`; return; }
+  if (corpEditor !== ed || currentPlaylistId !== playlist.id) return;
+  const slot = slotsResp.slot || {};
+  const fill = (slotsResp.fills || []).find((f) => f.id === cs.fill_id) || {};
+  const limits = slot.live_limits || slot.limits || {};
+  const totals = (pv && pv.draft_totals) || { items: 0, seconds: 0 };
+  ed.slot = slot; ed.fill = fill; ed.limits = limits; ed.preview = pv;
+  const overItems = limits.max_items != null && totals.items > limits.max_items;
+  const overSec = limits.max_total_sec != null && totals.seconds > limits.max_total_sec;
+  const level = cui.levelLabel(fill.scope_kind || cs.scope_kind, fill.scope_name);
+  bar.innerHTML = `
+    <div class="corp-card corp-slot-card">
+      <div class="corp-card-head">
+        <strong class="corp-card-title">${esc(t('corp.fill.title', { slot: cs.slot_name || '', playlist: cs.playlist_name || '' }))}</strong>
+        ${cui.chip(level, 'slot')}
+        <span class="corp-help">${esc(tn('corp.fill.plays_on', fill.screens || 0))}</span>
+      </div>
+      ${slot.help_text ? `<div class="corp-hq-note">${esc(t('corp.store.hq_says'))} ${esc(slot.help_text)}</div>` : ''}
+      <div class="corp-meter">
+        ${limits.max_items != null ? `<span class="${overItems ? 'over' : ''}">${esc(tn('corp.slot.meter_items', limits.max_items, { used: totals.items }))}</span>` : `<span>${esc(tn('corp.n_items', totals.items))}</span>`}
+        ${limits.max_total_sec != null ? `<span class="${overSec ? 'over' : ''}">${esc(t('corp.slot.meter_sec', { s: totals.seconds, max: limits.max_total_sec }))}</span>` : `<span>${esc(t('corp.slot.loop_sec', { s: totals.seconds }))}</span>`}
+      </div>
+      <div class="corp-help">${esc(t('corp.slot.meter_note'))}${limits.allow_video === 0 || limits.allow_video === false ? ' ' + esc(t('corp.slot.no_video')) : ''}${limits.allow_widgets === 0 || limits.allow_widgets === false ? ' ' + esc(t('corp.slot.no_widgets')) : ''}</div>
+      ${pv && pv.violation ? `<div class="corp-notice corp-notice-danger" style="margin-top:8px">${esc(pv.violation.error)}</div>` : ''}
+      ${fill.fill_state === 'over_limit' ? `<div class="corp-notice corp-notice-danger" style="margin-top:8px">${esc(t('corp.slot.over_limit'))}</div>` : ''}
+      <div class="corp-card-actions">
+        <button class="btn btn-secondary btn-sm" id="corpFillPreview">${esc(t('corp.fill.preview'))}</button>
+        <a class="btn btn-secondary btn-sm" href="#/corporate">${esc(t('nav.head_office'))}</a>
+      </div>
+    </div>`;
+  bar.querySelector('#corpFillPreview').addEventListener('click', () => openFillPreview(cs.fill_id));
+  const publishBtn = document.getElementById('publishBtn');
+  if (publishBtn) {
+    if (pv && pv.violation) {
+      // Refused at publish anyway (FILL_LIMIT); the reason is on the page, not only on click.
+      publishBtn.disabled = true;
+      publishBtn.title = pv.violation.error;
+      publishBtn.style.opacity = '0.55';
+    } else if (fill.screens) publishBtn.textContent = tn('corp.hq.publish_n', fill.screens);
+  }
+}
+
+/** In a slot's editor, the picker offers only what the slot can hold (content-picker.js slotMode). */
+function fillSlotMode() {
+  if (!corpEditor || corpEditor.mode !== 'fill') return null;
+  const l = corpEditor.limits || {};
+  return { allowVideo: !(l.allow_video === 0 || l.allow_video === false), allowWidgets: !(l.allow_widgets === 0 || l.allow_widgets === false) };
+}
+
+/** Head office's loop with this slot's DRAFT spliced in, for a screen that plays it (critique U3). */
+async function openFillPreview(fillId) {
+  const m = cui.openModal({ title: t('corp.fill.preview'), wide: true, body: `<div id="corpFpOut">${esc(t('common.loading'))}</div>` });
+  try {
+    const r = await api.previewFill(fillId);
+    m.q('#corpFpOut').innerHTML = `${r.device_id ? '' : `<div class="corp-help">${esc(t('corp.fill.preview_no_screen'))}</div>`}${cui.previewHtml({ ...r, mandate: null, total_sec: r.total_sec != null ? r.total_sec : (r.items || []).reduce((a, i) => a + (i.seconds || 0), 0) })}`;
+    hydrateAuthImages(m.overlay);
+  } catch (e) { m.q('#corpFpOut').innerHTML = `<div class="corp-notice corp-notice-danger">${esc(e.message)}</div>`; }
+}
+
 function setupDragReorder(container) {
   let dragEl = null;
 
@@ -1533,6 +1869,7 @@ function showAddItemModal(playlistId, opts = {}) {
   return openContentPicker({
     targetPlaylistId: playlistId,
     replaceItemId,
+    slotMode: opts.slotMode || fillSlotMode(),
     add: (item) => api.addPlaylistItem(playlistId, toData(item)),
     addBulk: (ids) => api.addPlaylistItemsBulk(playlistId, ids),
     // #105: PUT swaps content/widget in place; the server nulls the opposite FK and keeps
@@ -1544,6 +1881,58 @@ function showAddItemModal(playlistId, opts = {}) {
       showToast(t('playlist.toast.item_replaced'));
     },
     onChanged: () => refreshAfterMutation(),
+  });
+}
+
+/*
+ * A hold screen is a playlist STEP (lib/hold-item.js): for its duration the screen shows nothing new —
+ * the last frame frozen, or blank — which is how screens take turns. Added here, where it belongs,
+ * rather than from the Content Library. A hold is a content row with no bytes; one per mode is
+ * reused, so adding holds does not fill the library with copies.
+ */
+async function showAddHoldModal(playlistId, trigger) {
+  const { openDialog } = await import('../components/library/dialog.js');
+  const d = openDialog({
+    title: t('playlist.hold.title'),
+    returnFocus: trigger,
+    html: `<p class="lib-field-help" style="margin:0">${esc(t('content.hold_desc'))}</p>
+      <fieldset class="lib-choice"><legend class="lib-visually-hidden">${esc(t('playlist.hold.mode'))}</legend>
+        <label class="lib-choice-opt"><input type="radio" name="holdMode" value="freeze" checked><span><strong>${esc(t('content.hold_freeze'))}</strong><span class="lib-field-help">${esc(t('playlist.hold.freeze_desc'))}</span></span></label>
+        <label class="lib-choice-opt"><input type="radio" name="holdMode" value="blank"><span><strong>${esc(t('content.hold_blank'))}</strong><span class="lib-field-help">${esc(t('playlist.hold.blank_desc'))}</span></span></label>
+      </fieldset>
+      <div class="lib-field"><label for="holdSeconds">${esc(t('playlist.hold.seconds'))}</label>
+        <input id="holdSeconds" class="input" type="number" min="1" max="86400" step="1" value="10" inputmode="numeric" aria-describedby="holdSeconds-err">
+        <div class="lib-field-err" id="holdSeconds-err" role="alert"></div></div>
+      <p class="lib-field-help" style="margin:0">${esc(t('playlist.hold.players'))}</p>
+      <div class="lib-dialog-actions"><span class="lib-form-error" role="alert" data-err></span>
+        <button type="button" class="btn btn-secondary" data-cancel>${esc(t('common.cancel'))}</button>
+        <button type="button" class="btn btn-primary" data-ok>${esc(t('playlist.hold.add'))}</button></div>`,
+  });
+  d.root.querySelector('[data-cancel]').addEventListener('click', () => d.close());
+  d.root.querySelector('[data-ok]').addEventListener('click', async (e) => {
+    const mode = d.root.querySelector('input[name="holdMode"]:checked').value;
+    const secs = Math.round(Number(d.root.querySelector('#holdSeconds').value));
+    if (!Number.isFinite(secs) || secs < 1 || secs > 86400) {
+      d.root.querySelector('#holdSeconds-err').textContent = t('playlist.hold.err_seconds');
+      d.root.querySelector('#holdSeconds').focus();
+      return;
+    }
+    e.currentTarget.disabled = true;
+    try {
+      const page = await api.getLibraryPage({ type: 'hold', limit: 100 });
+      const rows = Array.isArray(page) ? page : (page.items || []);
+      let hold = rows.find((c) => c.remote_url === `hold://${mode}`);
+      if (!hold) hold = await api.addHoldContent(mode);
+      await api.addPlaylistItem(playlistId, { content_id: hold.id, duration_sec: secs });
+      d.close();
+      showToast(t('content.toast.hold_added'), 'success');
+      // The editor re-renders; put focus back on the button the dialog was opened from.
+      await refreshAfterMutation();
+      document.getElementById('addHoldBtn')?.focus();
+    } catch (err) {
+      d.root.querySelector('[data-err]').textContent = err.message;
+      e.currentTarget.disabled = false;
+    }
   });
 }
 

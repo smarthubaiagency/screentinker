@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const { db } = require('../db/database');
-const { accessContext } = require('../lib/tenancy');
+const { resourceAccess } = require('../lib/tenancy');
 const deckLib = require('../lib/slide-deck');
 const slideRender = require('../lib/slide-render');
 
@@ -26,7 +26,7 @@ function checkDeckAccess(req, res, requireWrite) {
   const deck = db.prepare('SELECT * FROM slide_decks WHERE id = ?').get(req.params.id);
   if (!deck) { res.status(404).json({ error: 'Deck not found' }); return null; }
   const ws = deck.workspace_id ? db.prepare('SELECT * FROM workspaces WHERE id = ?').get(deck.workspace_id) : null;
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   // A read-only member may VIEW a deck but not author, publish, or delete it — the same rule
   // playlists (loadPlaylistAccess) and schedules already enforce, and which was missing here. Publish
@@ -34,6 +34,15 @@ function checkDeckAccess(req, res, requireWrite) {
   // keeps a workspace_viewer off live signage.
   if (requireWrite && !ctx.actingAs && ctx.workspaceRole === 'workspace_viewer') {
     res.status(403).json({ error: 'Read-only access' }); return null;
+  }
+  // CORPORATE: a deck whose playlist head office plays (inside a corporate playlist) is authored by
+  // head office's corporate authors only — save, publish and delete alike.
+  if (requireWrite) {
+    const corpGuard = require('../lib/corporate/guard');
+    try { corpGuard.assertMediaWritable(req, 'slide_deck', deck.id); } catch (e) {
+      if (corpGuard.send(res, e, req)) return null;
+      throw e;
+    }
   }
   return deck;
 }
@@ -220,6 +229,7 @@ router.post('/:id/publish', (req, res) => {
     out = require('../lib/releases').releaseSlideDeck(db, deck.id, req, { actor: require('../lib/releases').actorOf(req) });
   } catch (e) {
     if (e && e.name === 'ReleaseError') return res.status(e.status || 409).json({ error: e.message, code: e.code });
+    if (require('../lib/corporate/guard').send(res, e, req)) return;
     console.error('[slide-deck] publish failed:', e && e.message);
     return res.status(500).json({ error: 'Could not publish this deck.' });
   }

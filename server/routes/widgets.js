@@ -8,7 +8,7 @@ const { devicesPlayingWidget } = require('../lib/devices-playing');
 const slideRender = require('../lib/slide-render');
 const appConfig = require('../config');
 const { PLATFORM_ROLES, ELEVATED_ROLES } = require('../middleware/auth');
-const { accessContext, denyReadOnly } = require('../lib/tenancy');
+const { denyReadOnly, resourceAccess } = require('../lib/tenancy');
 const { isRealTimezone } = require('../lib/device-timezone');
 const { escapeHtml, safeUrl, safeCss, safeNumber } = require('../lib/widget-sanitize');
 const pluginRegistry = require('../lib/plugins/registry');
@@ -144,6 +144,16 @@ function validateTimezone(config) {
        + 'America/New_York or UTC — a country name or a GMT offset will not work.';
 }
 
+// A room display may only show a room of its OWN workspace: the id comes from a config blob a user
+// typed, and the panel would otherwise read — and book — another tenant's room.
+function validateRoomDisplay(type, config, workspaceId) {
+  if (type !== 'room-display') return null;
+  const id = config && config.room_id;
+  if (!id) return null;   // an unconfigured display says so on screen
+  const ok = workspaceId && db.prepare('SELECT 1 FROM rooms WHERE id = ? AND workspace_id = ?').get(String(id), workspaceId);
+  return ok ? null : 'That room is not in this workspace.';
+}
+
 // Validate ISO date string format
 function safeDateString(d) {
   if (!d) return '';
@@ -159,7 +169,8 @@ function safeDateString(d) {
 router.get('/', (req, res) => {
   if (!req.workspaceId) return res.json([]);
   const widgets = db.prepare(
-    'SELECT * FROM widgets WHERE (workspace_id = ? OR workspace_id IS NULL) ORDER BY created_at DESC'
+    // 'cap_alert' rows are the hidden cards of emergency feeds (lib/cap/feeds.js), not library widgets.
+    "SELECT * FROM widgets WHERE (workspace_id = ? OR workspace_id IS NULL) AND widget_type != 'cap_alert' ORDER BY created_at DESC"
   ).all(req.workspaceId);
   res.json(widgets.map(redactWidgetRow));
 });
@@ -180,10 +191,28 @@ router.post('/', (req, res) => {
   }
   const tzErr = validateTimezone(config);
   if (tzErr) return res.status(400).json({ error: tzErr });
+  let storedConfig = config;
+  if (widget_type === 'cloud-doc') {
+    const cd = cloudDocConfig(config);
+    if (cd.error) return res.status(400).json({ error: cd.error });
+    storedConfig = cd.config;
+  }
+  if (widget_type === 'bi-dashboard') {
+    const bi = biConfigOrError(req.workspaceId, config);
+    if (bi.error) return res.status(400).json({ error: bi.error });
+    storedConfig = bi.config;
+  }
+  if (widget_type === 'social') {
+    const sw = socialConfigOrError(req.workspaceId, config);
+    if (sw.error) return res.status(400).json({ error: sw.error });
+    storedConfig = sw.config;
+  }
+  const roomErr = validateRoomDisplay(widget_type, config, req.workspaceId);
+  if (roomErr) return res.status(400).json({ error: roomErr });
 
   const id = uuidv4();
   db.prepare('INSERT INTO widgets (id, user_id, workspace_id, widget_type, name, config) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(id, req.user.id, req.workspaceId, widget_type, name, JSON.stringify(config || {}));
+    .run(id, req.user.id, req.workspaceId, widget_type, name, JSON.stringify(storedConfig || {}));
 
   require('../lib/revisions').recordCurrent(db, 'widget', id, { actor: require('../lib/releases').actorOf(req), summary: 'Created' });
   res.status(201).json(redactWidgetRow(db.prepare('SELECT * FROM widgets WHERE id = ?').get(id)));
@@ -221,9 +250,19 @@ function checkWidgetRead(req, res) {
   if (!widget) { res.status(404).json({ error: 'Widget not found' }); return null; }
   if (!widget.workspace_id) return widget;
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(widget.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   return widget;
+}
+
+// CORPORATE: a widget head office's playlist plays may be changed or deleted only by a corporate
+// author (duplicating one is a read, and stays open). Returns true when refused.
+function corpMediaRefused(req, res, widget) {
+  const corpGuard = require('../lib/corporate/guard');
+  try { corpGuard.assertMediaWritable(req, 'widget', widget.id); return false; } catch (e) {
+    if (corpGuard.send(res, e, req)) return true;
+    throw e;
+  }
 }
 
 function checkWidgetWrite(req, res) {
@@ -236,10 +275,14 @@ function checkWidgetWrite(req, res) {
     return widget;
   }
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(widget.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   if (!ctx.actingAs && ctx.workspaceRole === 'workspace_viewer') {
     res.status(403).json({ error: 'Read-only access' }); return null;
+  }
+  // An emergency feed's card belongs to the feed: edit or delete the feed instead.
+  if (widget.widget_type === 'cap_alert') {
+    res.status(409).json({ error: 'This is an emergency feed\'s alert card. Change it from Emergency feeds.', code: 'CAP_CARD' }); return null;
   }
   return widget;
 }
@@ -297,6 +340,7 @@ router.get('/:id', (req, res) => {
 router.put('/:id', (req, res) => {
   const widget = checkWidgetWrite(req, res);
   if (!widget) return;
+  if (corpMediaRefused(req, res, widget)) return;
 
   const { name } = req.body;
   let { config } = req.body;
@@ -318,6 +362,23 @@ router.put('/:id', (req, res) => {
   }
   const tzErr = validateTimezone(config);
   if (tzErr) return res.status(400).json({ error: tzErr });
+  if (widget.widget_type === 'cloud-doc' && config) {
+    const cd = cloudDocConfig(config);
+    if (cd.error) return res.status(400).json({ error: cd.error });
+    config = cd.config;
+  }
+  if (widget.widget_type === 'bi-dashboard' && config) {
+    const bi = biConfigOrError(widget.workspace_id, config);
+    if (bi.error) return res.status(400).json({ error: bi.error });
+    config = bi.config;
+  }
+  if (widget.widget_type === 'social' && config) {
+    const sw = socialConfigOrError(widget.workspace_id, config);
+    if (sw.error) return res.status(400).json({ error: sw.error });
+    config = sw.config;
+  }
+  const roomErr = config ? validateRoomDisplay(widget.widget_type, config, widget.workspace_id) : null;
+  if (roomErr) return res.status(400).json({ error: roomErr });
 
   /*
    * Approval on: the edit becomes a DRAFT. Players keep rendering `config` (their rev is
@@ -365,15 +426,261 @@ router.put('/:id', (req, res) => {
   res.json(redactWidgetRow(db.prepare('SELECT * FROM widgets WHERE id = ?').get(req.params.id)));
 });
 
+/*
+ * Mark a menu-board item sold out (or back on) without opening the editor: the button a manager
+ * taps on a phone, or a till system calling the API when an item runs out.
+ *
+ * ⚠️ OPERATIONAL, SO IT GOES LIVE EVEN WHEN APPROVAL IS ON. "We are out of salmon" cannot wait for
+ * a review, and it changes availability, not content. It is applied to the live config AND to a
+ * pending draft (so publishing the draft later cannot undo it), recorded in history, and pushed to
+ * the screens showing the menu. Items from a data source are changed in the sheet, not here.
+ */
+router.patch('/:id/menu-items/:itemId', (req, res) => {
+  const widget = checkWidgetWrite(req, res);
+  if (!widget) return;
+  if (widget.widget_type !== 'menu-board') return res.status(400).json({ error: 'Not a menu board' });
+  if (typeof (req.body || {}).sold_out !== 'boolean') return res.status(400).json({ error: 'sold_out must be true or false' });
+  const menu = require('../lib/menu-board');
+  // The LIVE config, not storedWidgetConfig (which prefers a pending draft): writing a draft's
+  // config back as live would publish an unreviewed edit along with the sold-out flag.
+  let config;
+  try { config = JSON.parse(widget.config || '{}'); } catch { config = {}; }
+  if (config.source && config.source.slug) {
+    return res.status(409).json({ error: 'This menu comes from a data source. Change the item there.', code: 'MENU_FROM_DATA_SOURCE' });
+  }
+  const item = menu.findItem(config, req.params.itemId);
+  if (!item) return res.status(404).json({ error: 'Item not found' });
+  item.sold_out = req.body.sold_out;
+  db.transaction(() => {
+    db.prepare("UPDATE widgets SET config = ?, updated_at = MAX(updated_at + 1, strftime('%s','now')) WHERE id = ?")
+      .run(JSON.stringify(config), widget.id);
+    if (widget.draft_config) {
+      try {
+        const draft = JSON.parse(widget.draft_config);
+        const dItem = draft && menu.findItem(draft.config, req.params.itemId);
+        if (dItem) { dItem.sold_out = req.body.sold_out; db.prepare('UPDATE widgets SET draft_config = ? WHERE id = ?').run(JSON.stringify(draft), widget.id); }
+      } catch (_) { /* a draft we cannot read is left as it is */ }
+    }
+  })();
+  require('../lib/revisions').recordCurrent(db, 'widget', widget.id, {
+    actor: require('../lib/releases').actorOf(req),
+    summary: `${req.body.sold_out ? 'Sold out' : 'Back on'}: ${String(item.name || '').slice(0, 80)}`,
+  });
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      const { buildPlaylistPayload } = require('../ws/deviceSocket');
+      const commandQueue = require('../lib/command-queue');
+      for (const id of devicesPlayingWidget(widget.id)) commandQueue.queueOrEmitPlaylistUpdate(io.of('/device'), id, buildPlaylistPayload);
+    }
+  } catch (_) { /* best effort */ }
+  res.json({ success: true, item: { id: item.id, name: item.name, sold_out: item.sold_out } });
+});
+
+/*
+ * bi-dashboard config, validated as a whole at save time (lib/bi/widget.js). The connection must
+ * belong to the widget's own organization — the id is a value an editor typed.
+ */
+function biConfigOrError(workspaceId, config) {
+  try {
+    const orgId = require('../lib/bi/connections').orgOfWorkspace(db, workspaceId);
+    return { config: require('../lib/bi/widget').normaliseConfig(db, orgId, config) };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+/*
+ * social wall config (lib/social/widget.js): the feed must be one of the widget's own workspace's.
+ */
+function socialConfigOrError(workspaceId, config) {
+  try { return { config: require('../lib/social/widget').normaliseConfig(db, workspaceId, config) }; }
+  catch (e) { return { error: e.message }; }
+}
+
+/*
+ * ⚠️ PUBLIC, LIKE /render: a wall's page is a null-origin frame and cannot carry a session. What
+ * they hand out is what the wall shows anyway — its visible posts, and the images those posts use.
+ *
+ * Bounded per CALLER and, much more generously, per widget. A single per-widget budget was a budget
+ * for the whole fleet: past ~120 screens on one wall, polls got 429 and screens kept stale posts.
+ * The per-caller cap is per address, and so per SITE behind a NAT (signage egresses through one
+ * address), which is why it is sized for a large venue rather than one screen. The answer itself
+ * comes from a short server-side cache (lib/social/widget.js cachedPayload), so a big fleet costs
+ * one feed query per interval whatever these allow.
+ */
+const socialLimiter = require('../lib/bounded-snapshot-store').createStore({ max: 20000, ttlMs: 60_000 });
+const SOCIAL_LIMITS = {
+  data: { caller: 600, widget: 30000 },   // a screen polls every 2 minutes: 600/min is ~1200 screens behind one address
+  media: { caller: 3000, widget: 120000 }, // a wall's first load is up to ~50 images per screen
+};
+function socialRateLimited(req, kind, widgetId) {
+  const hit = (key, max) => {
+    const win = socialLimiter.get(key) || { receivedAt: Date.now(), n: 0 };
+    win.n += 1;
+    socialLimiter.set(key, win);
+    return win.n > max;
+  };
+  const lim = SOCIAL_LIMITS[kind];
+  const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+  // The caller's own budget first: one noisy address must not spend the wall's.
+  if (hit(`${kind}:${widgetId}:${ip}`, lim.caller)) return true;
+  return hit(`${kind}:${widgetId}`, lim.widget);
+}
+
+function liveSocialWidget(req, res) {
+  const widget = db.prepare('SELECT * FROM widgets WHERE id = ?').get(req.params.id);
+  res.removeHeader('X-Frame-Options');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (!widget || widget.widget_type !== 'social') { res.status(404).json({ error: 'Not a social wall' }); return null; }
+  let config = {};
+  try { config = JSON.parse(widget.config || '{}'); } catch { config = {}; }
+  return { widget, config };
+}
+
+router.get('/:id/social.json', (req, res) => {
+  const got = liveSocialWidget(req, res);
+  if (!got) return;
+  res.setHeader('Cache-Control', 'no-store');
+  if (socialRateLimited(req, 'data', got.widget.id)) return res.status(429).json({ error: 'Too many requests' });
+  res.json(require('../lib/social/widget').cachedPayload(db, got.widget, got.config));
+});
+
+router.get('/:id/social-media/:hash', (req, res) => {
+  const got = liveSocialWidget(req, res);
+  if (!got) return;
+  const media = require('../lib/social/media');
+  const hash = String(req.params.hash || '');
+  if (!media.HASH_RE.test(hash)) return res.status(404).end();
+  if (socialRateLimited(req, 'media', got.widget.id)) return res.status(429).end();
+  // Only an image one of THIS wall's visible posts uses: this is not a general file server.
+  const feedId = String(got.config.feed_id || '');
+  const used = db.prepare(`SELECT 1 FROM social_posts p JOIN social_feeds f ON f.id = p.feed_id
+      WHERE p.feed_id = ? AND f.workspace_id = ? AND p.status = 'approved' AND (p.author_avatar = ? OR p.media LIKE ?) LIMIT 1`)
+    .get(feedId, got.widget.workspace_id, hash, `%"${hash}"%`);
+  const m = used ? media.lookup(db, hash) : null;
+  if (!m) return res.status(404).end();
+  res.setHeader('Content-Type', m.mime);
+  // Content-addressed by source URL; loaded by an opaque-origin page, so CORP must allow it.
+  res.setHeader('Cache-Control', 'public, max-age=604800');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.sendFile(m.file);
+});
+
+function liveBiWidget(req, res) {
+  const widget = db.prepare('SELECT * FROM widgets WHERE id = ?').get(req.params.id);
+  res.removeHeader('X-Frame-Options');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (!widget || widget.widget_type !== 'bi-dashboard') { res.status(404).json({ error: 'Not a dashboard widget' }); return null; }
+  let config = {};
+  try { config = JSON.parse(widget.config || '{}'); } catch { config = {}; }
+  return { widget, config };
+}
+
+/*
+ * ⚠️ PUBLIC, LIKE /render (a screen's widget page is a null-origin frame and cannot carry a session),
+ * so both of these are bounded: an address that leaks lets someone view the dashboard — as the screen
+ * does — but not make this server hammer Grafana or mint tokens without limit.
+ *
+ * ⚠️ WHAT IS COUNTED IS WORK, NOT VIEWS. A cached image or embed token is served without counting:
+ * a per-widget limit on every request meant a big fleet on one dashboard got 429s, and anyone with
+ * a widget id could spend that budget and blank every screen showing it. Only a call that would
+ * reach Grafana / Power BI (or mint a Tableau JWT) is counted, twice: per caller — the page holds no
+ * identity, so that is the address it came from — and, more generously, per widget, which is the cap
+ * on what one dashboard can cost upstream.
+ */
+const biLimiter = require('../lib/bounded-snapshot-store').createStore({ max: 20000, ttlMs: 60_000 });
+function biRateLimited(key, max) {
+  // A fixed one-minute window: the store expires an entry 60s after its receivedAt.
+  const win = biLimiter.get(key) || { receivedAt: Date.now(), n: 0 };
+  win.n += 1;
+  biLimiter.set(key, win);
+  return win.n > max;
+}
+const BI_LIMITS = {
+  img: { caller: 30, widget: 120 },   // Grafana renders (cache misses only)
+  pbi: { caller: 10, widget: 30 },    // Power BI GenerateToken (cache misses only; ~1/hour normally)
+  tab: { caller: 60, widget: 1200 },  // Tableau JWTs: every call, but signing one is local and cheap
+};
+function biUpstreamAllowed(kind, req, widgetId) {
+  const l = BI_LIMITS[kind];
+  if (biRateLimited(`${kind}:${widgetId}:${req.ip || ''}`, l.caller)) return false;
+  return !biRateLimited(`${kind}:${widgetId}`, l.widget);
+}
+
+// The latest Grafana render for a dashboard widget. The token never leaves this server.
+router.get('/:id/bi-image.png', async (req, res) => {
+  const got = liveBiWidget(req, res);
+  if (!got) return;
+  const { widget, config } = got;
+  if (config.provider !== 'grafana' || config.mode === 'public') return res.status(404).json({ error: 'Not a Grafana image dashboard' });
+  const conn = require('../lib/bi/connections').forWidget(db, widget, config);
+  if (!conn || conn.kind !== 'grafana') return res.status(404).json({ error: 'No connection' });
+  try {
+    const grafana = require('../lib/bi/grafana');
+    const img = await grafana.imageFor(widget.id, conn, grafana.normaliseWidgetConfig(config),
+      { width: req.query.w, height: req.query.h },
+      { refreshSec: config.refresh_sec, beforeFetch: () => biUpstreamAllowed('img', req, widget.id) });
+    res.setHeader('Content-Type', img.type);
+    res.setHeader('Cache-Control', 'private, max-age=30');
+    // Loaded by the widget page, a sandboxed (opaque-origin) document: same-origin CORP blocks it.
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    if (img.stale) res.setHeader('X-Dashboard-Stale', '1');
+    res.send(img.buf);
+  } catch (e) {
+    res.setHeader('Cache-Control', 'no-store');
+    if (e.status === 429) return res.status(429).json({ error: 'Too many requests' });
+    console.warn(`[bi] grafana render for widget ${widget.id}: ${e.message}`);
+    res.status(502).json({ error: 'The dashboard could not be rendered' });
+  }
+});
+
+// A fresh Power BI embed token / Tableau JWT for a dashboard widget's page. Never a secret.
+router.get('/:id/bi-token', async (req, res) => {
+  const got = liveBiWidget(req, res);
+  if (!got) return;
+  const { widget, config } = got;
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const kind = config.provider === 'tableau' ? 'tab' : 'pbi';
+    res.json(await require('../lib/bi/widget').tokenFor(db, widget, config, { beforeFetch: () => biUpstreamAllowed(kind, req, widget.id) }));
+  } catch (e) {
+    if (e.status === 404) return res.status(404).json({ error: e.message });
+    if (e.status === 429) return res.status(429).json({ error: 'Too many requests' });
+    console.warn(`[bi] token for widget ${widget.id}: ${e.message}`);
+    res.status(502).json({ error: 'The dashboard service did not issue a token' });
+  }
+});
+
 // Delete widget
 router.delete('/:id', (req, res) => {
   const widget = checkWidgetWrite(req, res);
   if (!widget) return;
+  if (corpMediaRefused(req, res, widget)) return;
   db.prepare('DELETE FROM widgets WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
 const KNOWN_WIDGET_TYPES = new Set(BUILTIN_WIDGET_TYPES);
+
+/*
+ * A cloud-doc's config is REBUILT from the pasted link (lib/cloud-docs.js), never stored as sent: the
+ * stored URL is the one players frame with allow-same-origin, so it must be one we constructed on an
+ * allowlisted provider host. Returns { config } or { error }.
+ */
+function cloudDocConfig(config) {
+  const c = config && typeof config === 'object' ? config : {};
+  try {
+    const n = require('../lib/cloud-docs').normaliseCloudDoc(c.url, { delaySec: c.delay_sec, refreshMin: c.refresh_min });
+    const zoom = Math.min(Math.max(Number(c.zoom) || 100, 25), 400);
+    const background = /^#[0-9a-f]{3,8}$/i.test(c.background || '') ? c.background : '#000000';
+    return { config: { ...n, zoom, background } };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
 function renderWidgetHtml(type, config, opts = {}) {
   const iframeSandbox = opts.iframeSandbox || 'allow-scripts';
   config = config || {};
@@ -383,10 +690,21 @@ function renderWidgetHtml(type, config, opts = {}) {
     case 'rss': return renderRSS(config);
     case 'text': return renderText(config, iframeSandbox);
     case 'webpage': return renderWebpage(config, iframeSandbox, opts.origin);
-    case 'social': return renderSocial(config);
+    // The embedded renderer passes the workspace and gets a self-contained snapshot; otherwise this is
+    // the editor's Preview (a saved wall's /render is handled above).
+    case 'social': return opts.workspaceId && config && config.feed_id
+      ? require('../lib/social/widget').renderSnapshot(require('../db/database').db, opts.workspaceId, config)
+      : require('../lib/social/widget').previewHtml(config);
     case 'directory-board': return renderDirectoryBoard(config);
+    case 'menu-board': return require('../lib/menu-board').renderMenuBoard(config, {
+      dataMap: config && config.source && config.source.slug && opts.workspaceId
+        ? require('../lib/data-sources/service').getWorkspaceDataMapSync(opts.workspaceId) : null,
+    });
     case 'directory-search': return renderDirectorySearch(config);
+    case 'cloud-doc': return require('../lib/cloud-docs').renderCloudDoc(config);
     case 'diag-smoothness': return renderDiagSmoothness(config);
+    // Only reached by the editor's Preview: a saved widget's /render is handled above.
+    case 'bi-dashboard': return require('../lib/bi/widget').previewHtml(config);
     /*
      * ⚠️ THE ONLY WIDGET WHOSE CONTENT IS NOT BAKED INTO ITS CONFIG. A slide keeps its layout in
      * `config.template` and its words in `config.fields`, and they are joined here — which is what
@@ -486,6 +804,78 @@ router.get('/:id/render', (req, res) => {
    * link). Without it an html template's code would run as this server's origin — the origin
    * whose localStorage holds the dashboard session. See lib/templates/render.js.
    */
+  /*
+   * An emergency feed's alert card: the feed's live alerts, rendered from text a third party wrote,
+   * so it gets the same opaque-origin sandbox a template does (lib/cap/card.js escapes it all).
+   */
+  if (widget.widget_type === 'cap_alert') {
+    const feeds = require('../lib/cap/feeds');
+    const feed = config.feed_id ? db.prepare('SELECT * FROM cap_feeds WHERE id = ? AND workspace_id = ?').get(config.feed_id, widget.workspace_id) : null;
+    const alerts = feed ? feeds.liveAlerts(db, feed) : [];
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; sandbox allow-scripts");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    // Rev-pinned like every widget, but private: a shared cache must not keep a cleared alert.
+    if (req.query.rev) res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    return res.send(require('../lib/cap/card').renderCard(alerts, { title: feed ? feed.name : 'Emergency alert' }));
+  }
+  /*
+   * A cloud document runs NO script (lib/cloud-docs.js): that is what lets players frame it with
+   * allow-same-origin, which Google's embed needs. The CSP is the guarantee, not a convention.
+   */
+  if (widget.widget_type === 'cloud-doc') {
+    const cd = require('../lib/cloud-docs');
+    res.setHeader('Content-Security-Policy', cd.RENDER_CSP);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    return res.send(cd.renderCloudDoc(config));
+  }
+  /*
+   * A Grafana / Power BI / Tableau dashboard (lib/bi/widget.js). Its page carries no token — those
+   * come from /bi-image.png and /bi-token at run time — and sets its own CSP naming the one host it
+   * may load from.
+   */
+  /*
+   * A social wall (lib/social/widget.js). Posts travel as JSON and are drawn with textContent; the
+   * CSP keeps images and data to this server, so a screen never talks to a social network.
+   */
+  if (widget.widget_type === 'social') {
+    // A rev-pinned page is cached for a year: it must carry no posts (lib/social/widget.js header).
+    const out = require('../lib/social/widget').render(db, widget, config, { origin: `${req.protocol}://${req.get('host')}`, seed: !req.query.rev });
+    res.setHeader('Content-Security-Policy', out.csp);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    if (req.query.rev) res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    return res.send(out.html);
+  }
+  if (widget.widget_type === 'bi-dashboard') {
+    const out = require('../lib/bi/widget').render(db, widget, config, {
+      origin: `${req.protocol}://${req.get('host')}`, iframeSandbox,
+    });
+    res.setHeader('Content-Security-Policy', out.csp);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    if (req.query.rev) res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    return res.send(out.html);
+  }
+  /*
+   * A meeting-room display (lib/rooms/render.js): meeting titles typed by anyone who can send an
+   * invitation, so the same opaque-origin sandbox as the alert card, plus the one connection the page
+   * needs — back to this server for its room's state. Rendered with the current state so the first
+   * paint is right; the page then keeps itself current.
+   */
+  if (widget.widget_type === 'room-display') {
+    const origin = `${req.protocol}://${req.get('host')}`;
+    res.setHeader('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src ${origin}; sandbox allow-scripts`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    if (req.query.rev) res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    const room = config.room_id ? db.prepare('SELECT * FROM rooms WHERE id = ? AND workspace_id = ?').get(String(config.room_id), widget.workspace_id) : null;
+    const rooms = require('../lib/rooms/service');
+    const { renderRoomDisplay } = require('../lib/rooms/render');
+    return (room ? rooms.panelState(room) : Promise.resolve(null))
+      .catch(() => null)
+      .then((initial) => res.send(renderRoomDisplay({ widgetId: widget.id, origin, config, initial })));
+  }
   if (widget.widget_type === 'template') {
     const out = require('../lib/templates/widget').renderTemplateWidget(widget, {
       origin: `${req.protocol}://${req.get('host')}`,
@@ -633,6 +1023,13 @@ router.get('/:id/telemetry', (req, res) => {
   res.json(rec || null);
 });
 
+// What a pasted cloud document link resolves to, for the editor (no side effects; the save re-checks).
+router.post('/cloud-doc/check', (req, res) => {
+  const cd = cloudDocConfig(req.body || {});
+  if (cd.error) return res.status(400).json({ error: cd.error });
+  res.json(cd.config);
+});
+
 // Preview unsaved widget from config (used by editor Preview button)
 router.post('/preview', (req, res) => {
   const { widget_type, config } = req.body || {};
@@ -692,6 +1089,8 @@ router.get('/preview-session/:id', (req, res) => {
   res.removeHeader('X-Frame-Options');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Type', 'text/html');
+  // The editor previews a cloud document with allow-same-origin (as players do); script-free by CSP.
+  if (entry.widget_type === 'cloud-doc') res.setHeader('Content-Security-Policy', require('../lib/cloud-docs').RENDER_CSP);
   res.send(html);
 });
 
@@ -967,17 +1366,6 @@ function renderWebpage(c, iframeSandbox = 'allow-scripts', origin) {
 <iframe src="${escapeHtml(url)}" sandbox="${escapeHtml(iframeSandbox)}"></iframe>
 ${c.refresh_interval > 0 ? `<script>setInterval(()=>document.querySelector('iframe').src=document.querySelector('iframe').src,${c.refresh_interval * 1000});</script>` : ''}
 </body></html>`;
-}
-
-function renderSocial(c) {
-  return `<!DOCTYPE html><html><head><style>
-  body { background:${safeCss(c.background, '#000')}; color:${safeCss(c.color, '#FFF')}; font-family:-apple-system,sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
-</style></head><body>
-<div style="text-align:center">
-  <p style="font-size:24px">Social Feed</p>
-  <p style="opacity:0.5;margin-top:8px">${escapeHtml(c.platform) || 'twitter'}: ${escapeHtml(c.query) || ''}</p>
-  <p style="opacity:0.3;margin-top:16px;font-size:13px">Configure API key in widget settings</p>
-</div></body></html>`;
 }
 
 // Directory Board — lobby tenant directory with scrolling content, header/footer,

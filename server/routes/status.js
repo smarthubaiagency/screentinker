@@ -115,7 +115,7 @@ router.get('/', (req, res) => {
     // #go2rtc: whether live video is enabled server-wide (the master switch). The dashboard uses
     // this to decide whether to OFFER the per-workspace/per-device toggles at all; both of those
     // flags are inert unless this is on. A boolean, no sidecar detail leaks here.
-    features: { live_video: !!config.liveVideoEnabled, talk: !!config.talkEnabled },
+    features: { live_video: !!config.liveVideoEnabled, talk: !!config.talkEnabled, view_only: !!config.viewOnlyEnabled },
   };
 
   /*
@@ -204,7 +204,7 @@ router.get('/backup', (req, res) => {
 });
 
 // User data export (own data only)
-router.get('/export', (req, res) => {
+router.get('/export', async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).json({ error: 'Token required' });
 
@@ -228,7 +228,7 @@ router.get('/export', (req, res) => {
   const user = db.prepare('SELECT id, email, name, role, auth_provider, plan_id, created_at FROM users WHERE id = ?').get(userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const devices = db.prepare('SELECT id, name, status, ip_address, android_version, app_version, screen_width, screen_height, created_at FROM devices WHERE user_id = ?').all(userId);
+  const devices = db.prepare('SELECT id, name, status, ip_address, android_version, app_version, screen_width, screen_height, tags, created_at FROM devices WHERE user_id = ?').all(userId);
   const deviceIds = devices.map(d => d.id);
   const devicePlaceholders = deviceIds.map(() => '?').join(',') || "'__none__'";
 
@@ -239,10 +239,39 @@ router.get('/export', (req, res) => {
   const layoutPlaceholders = layoutIds.map(() => '?').join(',') || "'__none__'";
   const layoutZones = layoutIds.length ? db.prepare(`SELECT * FROM layout_zones WHERE layout_id IN (${layoutPlaceholders})`).all(...layoutIds) : [];
 
-  const playlists = db.prepare('SELECT id, name, description, is_auto_generated, smart_rules, created_at, updated_at FROM playlists WHERE user_id = ?').all(userId);
+  const playlists = db.prepare('SELECT id, name, description, is_auto_generated, smart_rules, created_at, updated_at, corporate FROM playlists WHERE user_id = ?').all(userId)
+    .map(({ corporate, ...p }) => (corporate ? { ...p, corporate: 1 } : p));
   const playlistIds = playlists.map(p => p.id);
   const playlistPlaceholders = playlistIds.map(() => '?').join(',') || "'__none__'";
-  const playlistItems = playlistIds.length ? db.prepare(`SELECT id, playlist_id, content_id, widget_id, child_playlist_id, sort_order, duration_sec FROM playlist_items WHERE playlist_id IN (${playlistPlaceholders})`).all(...playlistIds) : [];
+  const playlistItems = playlistIds.length ? db.prepare(`SELECT id, playlist_id, content_id, widget_id, child_playlist_id, sort_order, duration_sec, slot_id FROM playlist_items WHERE playlist_id IN (${playlistPlaceholders})`).all(...playlistIds)
+    .map(({ slot_id, ...pi }) => (slot_id ? { ...pi, slot_id } : pi)) : [];
+  /*
+   * ⚠️ CORPORATE (spec §6.3). A corporate playlist travels with its local slots, so a re-import into
+   * the same org's head office keeps the slot ids the stores' content is attached to. What does NOT
+   * travel is said in the manifest, explicitly: "Where it plays" (mandates) and stores' slot content
+   * (fills) name other workspaces, and the workspace export has silently dropped things before.
+   */
+  const corporateIds = playlists.filter((p) => p.corporate).map((p) => p.id);
+  let corporateSlots = [];
+  let corporateManifest = null;
+  let fillsNotExported = 0;
+  try {
+    if (corporateIds.length) {
+      corporateSlots = db.prepare(`SELECT id, playlist_id, name, help_text, max_items, max_total_sec, allow_video, allow_widgets,
+                                          fallback_content_id, fallback_widget_id, fallback_duration_sec, retired_at
+                                     FROM corporate_slots WHERE playlist_id IN (${corporateIds.map(() => '?').join(',')})`).all(...corporateIds);
+      const orgRow = db.prepare('SELECT w.organization_id FROM playlists p JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = ?').get(corporateIds[0]);
+      corporateManifest = {
+        organization_id: orgRow ? orgRow.organization_id : null,
+        playlists: corporateIds.length,
+        slots: corporateSlots.length,
+        mandates_not_exported: db.prepare(`SELECT COUNT(*) AS n FROM corporate_mandates WHERE playlist_id IN (${corporateIds.map(() => '?').join(',')})`).get(...corporateIds).n,
+      };
+    }
+    if (playlistIds.length) {
+      fillsNotExported = db.prepare(`SELECT COUNT(*) AS n FROM corporate_slot_fills WHERE fill_playlist_id IN (${playlistPlaceholders})`).get(...playlistIds).n;
+    }
+  } catch (_) { /* no corporate tables */ }
 
   const schedules = db.prepare('SELECT id, device_id, group_id, zone_id, content_id, widget_id, layout_id, playlist_id, title, start_time, end_time, timezone, recurrence, recurrence_end, priority, enabled, color, created_at FROM schedules WHERE user_id = ?').all(userId);
   const videoWalls = db.prepare('SELECT * FROM video_walls WHERE user_id = ?').all(userId);
@@ -251,7 +280,7 @@ router.get('/export', (req, res) => {
   const wallDevices = wallIds.length ? db.prepare(`SELECT * FROM video_wall_devices WHERE wall_id IN (${wallPlaceholders})`).all(...wallIds) : [];
 
   const kioskPages = db.prepare('SELECT id, name, config, created_at FROM kiosk_pages WHERE user_id = ?').all(userId);
-  const deviceGroups = db.prepare('SELECT id, name, color, created_at FROM device_groups WHERE user_id = ?').all(userId);
+  const deviceGroups = db.prepare('SELECT id, name, color, rules, created_at FROM device_groups WHERE user_id = ?').all(userId);
   const groupIds = deviceGroups.map(g => g.id);
   const groupPlaceholders = groupIds.map(() => '?').join(',') || "'__none__'";
   const groupMembers = groupIds.length ? db.prepare(`SELECT * FROM device_group_members WHERE group_id IN (${groupPlaceholders})`).all(...groupIds) : [];
@@ -275,6 +304,10 @@ router.get('/export', (req, res) => {
     layout_zones: layoutZones,
     playlists,
     playlist_items: playlistItems,
+    ...(corporateManifest ? { corporate: corporateManifest, corporate_slots: corporateSlots } : {}),
+    // Store content for head office's slots is a playlist like any other (exported above); which slot
+    // and level it fills names head office's workspace, so that link is not exported.
+    ...(fillsNotExported ? { corporate_fills_not_exported: fillsNotExported } : {}),
     schedules,
     video_walls: videoWalls,
     video_wall_devices: wallDevices,
@@ -297,9 +330,28 @@ router.get('/export', (req, res) => {
 
     // Collect file info and add files to archive
     const filesToInclude = [];
+    const storageLoc = require('../lib/storage/locations');
     for (const c of exportData.content) {
       if (c.remote_url || !c.filename) continue;
-      const row = db.prepare('SELECT filepath, thumbnail_path FROM content WHERE id = ?').get(c.id);
+      const row = db.prepare('SELECT * FROM content WHERE id = ?').get(c.id);
+      /*
+       * A row whose bytes live in a storage backend (lib/storage) is fetched into the storage cache
+       * first, so the archive is complete wherever the media is kept. A copy that cannot be read
+       * is left out, exactly as a missing local file always has been.
+       */
+      if (row && storageLoc.hasExplicitLocations(row.id)) {
+        for (const [kind, col, field] of [['asset', 'filepath', 'original_filepath'], ['thumb', 'thumbnail_path', 'original_thumbnail']]) {
+          if (!row[col] || (kind === 'thumb' && row.thumbnail_path === row.filepath)) continue;
+          try {
+            const abs = await storageLoc.ensureLocalFile(row, kind);
+            if (abs && fs.existsSync(abs)) {
+              c[field] = path.basename(row[col]);
+              archive.file(abs, { name: `files/${c.id}/${c[field]}` });
+            }
+          } catch (_) { /* unreadable everywhere: omitted */ }
+        }
+        continue;
+      }
       if (row?.filepath) {
         const filePath = path.join(config.contentDir, path.basename(row.filepath));
         if (fs.existsSync(filePath)) {
@@ -459,13 +511,35 @@ router.post('/import', proxyImportIfCopied, importUpload.single('file'), async (
   // Map old IDs to new IDs
   const idMap = { devices: {}, content: {}, widgets: {}, layouts: {}, zones: {}, playlists: {}, groups: {}, walls: {}, kiosk: {} };
 
+  /*
+   * ⚠️ CORPORATE (spec §6.3). Corporate playlists come back as corporate ONLY when the importer can
+   * author them AND the target is the org's head office workspace; anywhere else they are ordinary
+   * playlists and each local slot becomes its fallback item (or is dropped), reported in the summary.
+   * This route is outside resolveTenancy, so the actor is built here.
+   */
+  let corpImport = false;
+  let corpOrgId = null;
+  const actorLib = require('../lib/corporate/actor');
+  // The importer, as the corporate backstop must judge every write below: this route resolves its own
+  // session (multipart), so it never passes resolveTenancy where the request actor is normally set.
+  const importer = actorLib.fromUser({ id: userId, role: sessionRole });
+  // For the rest of THIS request (the transaction and the v1 conversion after it): fail closed.
+  actorLib.als.enterWith(importer);
+  try {
+    const wsOrg = db.prepare('SELECT w.organization_id, o.hq_workspace_id FROM workspaces w JOIN organizations o ON o.id = w.organization_id WHERE w.id = ?').get(workspaceId);
+    corpOrgId = wsOrg ? wsOrg.organization_id : null;
+    corpImport = !!(wsOrg && wsOrg.hq_workspace_id === workspaceId && actorLib.canAuthorOrg(importer, corpOrgId));
+  } catch (_) { corpImport = false; }
+  const exportedSlots = new Map((Array.isArray(data.corporate_slots) ? data.corporate_slots : []).map((x) => [x.id, x]));
+
   const importDb = db.transaction(() => {
     // Import devices (as offline, unlinked - they'll need re-pairing)
     for (const d of (data.devices || [])) {
       const newId = uuid.v4();
       idMap.devices[d.id] = newId;
       const pairingCode = sixDigitCode(); // CSPRNG (lib/numeric-code): this code claims a device
-      db.prepare(`INSERT INTO devices (id, user_id, workspace_id, name, pairing_code, status, screen_width, screen_height, created_at) VALUES (?, ?, ?, ?, ?, 'provisioning', ?, ?, ?)`).run(newId, userId, workspaceId, d.name, pairingCode, d.screen_width || null, d.screen_height || null, d.created_at || Math.floor(Date.now() / 1000));
+      const tags = require('../lib/content-tags').normalizeTags(d.tags == null ? undefined : require('../lib/content-tags').parseTags(d.tags));
+      db.prepare(`INSERT INTO devices (id, user_id, workspace_id, name, pairing_code, status, screen_width, screen_height, tags, created_at) VALUES (?, ?, ?, ?, ?, 'provisioning', ?, ?, ?, ?)`).run(newId, userId, workspaceId, d.name, pairingCode, d.screen_width || null, d.screen_height || null, tags && tags.length ? JSON.stringify(tags) : null, d.created_at || Math.floor(Date.now() / 1000));
       stats.devices++;
     }
 
@@ -542,6 +616,9 @@ router.post('/import', proxyImportIfCopied, importUpload.single('file'), async (
 
       db.prepare(`INSERT INTO content (id, user_id, workspace_id, filename, filepath, mime_type, file_size, duration_sec, remote_url, thumbnail_path, width, height, created_at, byte_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newId, userId, workspaceId, c.filename, newFilepath, c.mime_type, c.file_size || 0, c.duration_sec || null, c.remote_url || null, newThumbnail, c.width || null, c.height || null, c.created_at || Math.floor(Date.now() / 1000), restoredDigest);
       stats.content++;
+      // The restored file is local; if the workspace writes to a bucket it moves there once this
+      // transaction has committed (a rolled-back import leaves no row, and the settle is a no-op).
+      if (newFilepath) require('../lib/storage/locations').settleSoon(newId);
     }
 
     // Import widgets
@@ -559,6 +636,20 @@ router.post('/import', proxyImportIfCopied, importUpload.single('file'), async (
           config = JSON.stringify(require('../lib/templates/widget').buildConfig(parsed.template, parsed.values, workspaceId));
         } catch {
           config = JSON.stringify({ template: typeof parsed.template === 'string' ? parsed.template.slice(0, 100) : '', values: {}, ds_refs: [] });
+        }
+      }
+      // A dashboard widget's config is validated as a whole (lib/bi/widget.js), against a connection
+      // of THIS workspace's organization. One that does not pass — an export from another server
+      // names connections that do not exist here — keeps only its provider, and the screen says to
+      // choose a connection.
+      if (w.widget_type === 'bi-dashboard') {
+        const bi = require('../lib/bi/widget');
+        let parsed = {};
+        try { parsed = JSON.parse(config); } catch { parsed = {}; }
+        try {
+          config = JSON.stringify(bi.normaliseConfig(db, require('../lib/bi/connections').orgOfWorkspace(db, workspaceId), parsed));
+        } catch {
+          config = JSON.stringify(bi.PROVIDERS.includes(parsed && parsed.provider) ? { provider: parsed.provider, mode: 'connection' } : {});
         }
       }
       db.prepare(`INSERT INTO widgets (id, user_id, workspace_id, widget_type, name, config, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(newId, userId, workspaceId, w.widget_type, w.name, config, w.created_at || Math.floor(Date.now() / 1000));
@@ -589,12 +680,75 @@ router.post('/import', proxyImportIfCopied, importUpload.single('file'), async (
         // read must not reach a screen. Folder ids inside rules are the source workspace's and will
         // not match here until the operator re-points them.
         const smartRules = p.smart_rules ? require('../lib/smart-playlist').normalizeRules(p.smart_rules) : null;
-        db.prepare('INSERT INTO playlists (id, user_id, workspace_id, name, description, is_auto_generated, smart_rules, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(newId, userId, workspaceId, p.name, p.description || '', p.is_auto_generated || 0, smartRules ? JSON.stringify(smartRules) : null, p.created_at || Math.floor(Date.now() / 1000), p.updated_at || Math.floor(Date.now() / 1000));
+        const asCorporate = corpImport && p.corporate && !smartRules ? 1 : 0;
+        if (asCorporate) idMap.corporate = { ...(idMap.corporate || {}), [p.id]: newId };
+        db.prepare('INSERT INTO playlists (id, user_id, workspace_id, name, description, is_auto_generated, smart_rules, created_at, updated_at, corporate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(newId, userId, workspaceId, p.name, p.description || '', p.is_auto_generated || 0, smartRules ? JSON.stringify(smartRules) : null, p.created_at || Math.floor(Date.now() / 1000), p.updated_at || Math.floor(Date.now() / 1000), asCorporate);
         stats.playlists++;
+      }
+      /*
+       * Local slots of the playlists imported as corporate. A slot id is KEPT when this export came
+       * from this organization and the id is free — or still names this org's slot with no placement
+       * (then it is updated in place and the stores' content still attached to it comes along:
+       * fills_rebound). Otherwise (another org's export, or the slot is still placed in its original
+       * playlist) it gets a new id: re-pointing stores' content away from a playlist that still plays
+       * would change what those screens show.
+       */
+      const slotMap = {};
+      if (corpImport && idMap.corporate) {
+        const sameOrg = !!(data.corporate && data.corporate.organization_id && data.corporate.organization_id === corpOrgId);
+        for (const sl of exportedSlots.values()) {
+          const newPl = idMap.corporate[sl.playlist_id];
+          if (!newPl) continue;
+          const fbContent = sl.fallback_content_id ? (idMap.content[sl.fallback_content_id] || null) : null;
+          const fbWidget = !fbContent && sl.fallback_widget_id ? (idMap.widgets[sl.fallback_widget_id] || null) : null;
+          const cfg = [sl.name || 'Local slot', sl.help_text || null, sl.max_items ?? null, sl.max_total_sec ?? null, sl.allow_video === 0 ? 0 : 1, sl.allow_widgets === 0 ? 0 : 1, fbContent, fbWidget, sl.fallback_duration_sec ?? null];
+          const existing = db.prepare('SELECT id, organization_id FROM corporate_slots WHERE id = ?').get(sl.id);
+          const placed = existing && db.prepare('SELECT 1 FROM playlist_items WHERE slot_id = ?').get(sl.id);
+          let id;
+          if (sameOrg && !existing) {
+            id = sl.id;
+            db.prepare(`INSERT INTO corporate_slots (id, organization_id, playlist_id, name, help_text, max_items, max_total_sec, allow_video, allow_widgets,
+                          fallback_content_id, fallback_widget_id, fallback_duration_sec, retired_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+              .run(id, corpOrgId, newPl, ...cfg, sl.retired_at || null, userId);
+            stats.slots_kept = (stats.slots_kept || 0) + 1;
+          } else if (sameOrg && existing && existing.organization_id === corpOrgId && !placed) {
+            id = sl.id;
+            db.prepare(`UPDATE corporate_slots SET playlist_id = ?, name = ?, help_text = ?, max_items = ?, max_total_sec = ?, allow_video = ?, allow_widgets = ?,
+                          fallback_content_id = ?, fallback_widget_id = ?, fallback_duration_sec = ?, retired_at = ?, updated_at = strftime('%s','now') WHERE id = ?`)
+              .run(newPl, ...cfg, sl.retired_at || null, id);
+            stats.slots_kept = (stats.slots_kept || 0) + 1;
+            stats.fills_rebound = (stats.fills_rebound || 0) + db.prepare('SELECT COUNT(*) AS n FROM corporate_slot_fills WHERE slot_id = ?').get(id).n;
+          } else {
+            id = uuid.v4();
+            db.prepare(`INSERT INTO corporate_slots (id, organization_id, playlist_id, name, help_text, max_items, max_total_sec, allow_video, allow_widgets,
+                          fallback_content_id, fallback_widget_id, fallback_duration_sec, retired_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+              .run(id, corpOrgId, newPl, ...cfg, sl.retired_at || null, userId);
+            stats.slots_remapped = (stats.slots_remapped || 0) + 1;
+          }
+          slotMap[sl.id] = id;
+        }
       }
       for (const pi of (data.playlist_items || [])) {
         const playlistId = idMap.playlists[pi.playlist_id];
         if (!playlistId) continue;
+        if (pi.slot_id) {
+          // A slot placement: kept in a corporate import, else its fallback item (or nothing).
+          if (slotMap[pi.slot_id]) {
+            db.prepare('INSERT INTO playlist_items (playlist_id, slot_id, sort_order, duration_sec) VALUES (?, ?, ?, 10)').run(playlistId, slotMap[pi.slot_id], pi.sort_order || 0);
+            continue;
+          }
+          const sl = exportedSlots.get(pi.slot_id);
+          const fbContent = sl && sl.fallback_content_id ? (idMap.content[sl.fallback_content_id] || null) : null;
+          const fbWidget = sl && !fbContent && sl.fallback_widget_id ? (idMap.widgets[sl.fallback_widget_id] || null) : null;
+          if (fbContent || fbWidget) {
+            db.prepare('INSERT INTO playlist_items (playlist_id, content_id, widget_id, sort_order, duration_sec) VALUES (?, ?, ?, ?, ?)')
+              .run(playlistId, fbContent, fbWidget, pi.sort_order || 0, (sl && sl.fallback_duration_sec) || 10);
+            stats.converted_slots = (stats.converted_slots || 0) + 1;
+          } else {
+            stats.dropped_slots = (stats.dropped_slots || 0) + 1;
+          }
+          continue;
+        }
         const contentId = pi.content_id ? idMap.content[pi.content_id] : null;
         const widgetId = pi.widget_id ? idMap.widgets[pi.widget_id] : null;
         // Nested items remap through the SAME playlist id map — every playlist is inserted above,
@@ -671,7 +825,8 @@ router.post('/import', proxyImportIfCopied, importUpload.single('file'), async (
     for (const g of (data.device_groups || [])) {
       const newId = uuid.v4();
       idMap.groups[g.id] = newId;
-      db.prepare(`INSERT INTO device_groups (id, user_id, workspace_id, name, color, created_at) VALUES (?, ?, ?, ?, ?, ?)`).run(newId, userId, workspaceId, g.name, g.color || '#3B82F6', g.created_at || Math.floor(Date.now() / 1000));
+      const rules = require('../lib/device-group-rules').parseRules(g.rules);   // invalid -> a hand-built group
+      db.prepare(`INSERT INTO device_groups (id, user_id, workspace_id, name, color, rules, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(newId, userId, workspaceId, g.name, g.color || '#3B82F6', rules ? JSON.stringify(rules) : null, g.created_at || Math.floor(Date.now() / 1000));
       stats.device_groups++;
     }
     for (const gm of (data.device_group_members || [])) {

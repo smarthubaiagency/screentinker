@@ -126,10 +126,14 @@ PENDING_SWAP_DEADLINE_MS = 60_000
 
 
 def should_defer_swap(is_running: bool, wall_follower: bool, has_content_on_screen: bool,
-                      currently_playing_id: Optional[str], new_content_ids: Sequence[str]) -> bool:
+                      currently_playing_id: Optional[str], new_content_ids: Sequence[str],
+                      interrupt_changed: bool = False) -> bool:
     """Should a playlist update wait for the current item to finish? False = apply now.
 
     Guard 1: an EMPTY new list is an operator saying "stop showing that" — never deferred.
+    An emergency alert raised or cleared (the set of `interrupt` items differs) is never deferred
+    either: holding a raised alert back for the rest of an item, or a cleared one on screen, is the
+    failure the alert exists to prevent.
     Guard 2 is the caller's: pair a deferral with PENDING_SWAP_DEADLINE_MS, because an item that
     never advances (a YouTube embed) would otherwise strand the swap forever.
     """
@@ -139,6 +143,8 @@ def should_defer_swap(is_running: bool, wall_follower: bool, has_content_on_scre
         return False
     if len(new_content_ids) == 0:  # guard 1: an explicit stop
         return False
+    if interrupt_changed:
+        return False
     return currently_playing_id not in new_content_ids
 
 
@@ -146,6 +152,9 @@ def should_defer_swap(is_running: bool, wall_follower: bool, has_content_on_scre
 
 # The mime the server stamps on an uploaded HTML bundle (lib/html-bundle.js).
 BUNDLE_MIME = "application/vnd.screentinker.bundle+zip"
+# A hold item (server/lib/hold-item.js): blank or freeze for its duration — a timed item, never
+# "unknown type, skip" (skipping it silently shortens the timeline it exists to keep).
+HOLD_MIME = "application/x-st-hold"
 
 
 def ends_on_timer(mime_type: str, is_widget: bool) -> bool:
@@ -158,7 +167,7 @@ def ends_on_timer(mime_type: str, is_widget: bool) -> bool:
     """
     mime_type = mime_type or ""
     return (mime_type.startswith("image/") or is_widget or mime_type == "video/youtube"
-            or mime_type == BUNDLE_MIME)
+            or mime_type == BUNDLE_MIME or mime_type == HOLD_MIME)
 
 
 # ============================== PlaybackStall (#297) ==============================

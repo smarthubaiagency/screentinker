@@ -14,6 +14,7 @@
   <link rel="stylesheet" href="/css/variables.css">
   <link rel="stylesheet" href="/css/reset.css">
   <link rel="stylesheet" href="/css/main.css">
+  <link rel="stylesheet" href="/css/library.css">
   <script src="/socket.io/socket.io.js"></script>
   <!-- #238: the players' own rotation rule (server/lib/orientation-style.js), served under /player
        because it IS the player's — the dashboard previews of rotated screens went sideways for as
@@ -107,6 +108,15 @@
             </svg>
             <span>Playlists</span>
           </a></li>
+          <!-- Head office (corporate) playlists. Hidden until /api/corporate/settings says this person
+               has something there: "Corporate" for head office, "Head office" for a store whose
+               screens head office drives (js/app.js syncCorporateNav). -->
+          <li id="corporateNavItem" style="display:none"><a href="#/corporate" class="nav-link" data-view="corporate">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 21h18"/><path d="M5 21V7l7-4 7 4v14"/><path d="M9 21v-6h6v6"/><line x1="9" y1="10" x2="9.01" y2="10"/><line x1="15" y1="10" x2="15.01" y2="10"/>
+            </svg>
+            <span>Corporate</span>
+          </a></li>
           <li><a href="#/layouts" class="nav-link" data-view="layouts">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/>
@@ -148,6 +158,18 @@
             </svg>
             <span>Slides</span>
           </a></li>
+          <li><a href="#/qr-codes" class="nav-link" data-view="qr-codes">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3"/>
+            </svg>
+            <span data-i18n="nav.qr_codes">QR codes</span>
+          </a></li>
+          <li><a href="#/social" class="nav-link" data-view="social">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/><path d="M8.5 11h.01M12 11h.01M15.5 11h.01"/>
+            </svg>
+            <span data-i18n="nav.social">Social feeds</span>
+          </a></li>
           <li><a href="#/widgets" class="nav-link" data-view="widgets">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="2" y="2" width="8" height="8" rx="1"/><rect x="14" y="2" width="8" height="8" rx="1"/>
@@ -184,6 +206,24 @@
             </svg>
             <span data-i18n="nav.triggers">Triggers</span>
           </a></li>
+          <li><a href="#/alerts" class="nav-link" data-view="alerts">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+            <span data-i18n="nav.alerts">Alerts</span>
+          </a></li>
+          <li><a href="#/emergency-feeds" class="nav-link" data-view="emergency-feeds">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+            <span data-i18n="nav.emergency_feeds">Emergency feeds</span>
+          </a></li>
+          <li><a href="#/automation" class="nav-link" data-view="automation">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/><line x1="14" y1="4" x2="10" y2="20"/>
+            </svg>
+            <span data-i18n="nav.automation">Automation</span>
+          </a></li>
           <li><a href="#/data-sources" class="nav-link" data-view="data-sources">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
@@ -206,6 +246,12 @@
               <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>
             </svg>
             <span>Reports</span>
+          </a></li>
+          <li><a href="#/audience" class="nav-link" data-view="audience">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+            </svg>
+            <span>Audience</span>
           </a></li>
           <li><a href="#/activity" class="nav-link" data-view="activity">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -280,6 +326,10 @@
           <li class="platform-nav" style="display:none"><a href="#/platform/branding" class="nav-link" data-view="platform-branding">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="13.5" cy="6.5" r="1.5"/><circle cx="17.5" cy="10.5" r="1.5"/><circle cx="8.5" cy="7.5" r="1.5"/><circle cx="6.5" cy="12.5" r="1.5"/><path d="M12 2a10 10 0 1 0 0 20c.9 0 1.5-.7 1.5-1.5 0-.4-.1-.7-.4-1-.2-.3-.4-.6-.4-1 0-.8.7-1.5 1.5-1.5H16a6 6 0 0 0 6-6c0-4.4-4.5-8-10-8z"/></svg>
             <span data-i18n="nav.platform.branding">Branding</span>
+          </a></li>
+          <li class="platform-nav" style="display:none"><a href="#/platform/rollouts" class="nav-link" data-view="platform-rollouts">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>
+            <span data-i18n="nav.platform.rollouts">Player rollouts</span>
           </a></li>
           <li class="platform-nav" style="display:none"><a href="#/platform/system" class="nav-link" data-view="platform-system">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><path d="M6 6.5h.01M6 17.5h.01"/></svg>

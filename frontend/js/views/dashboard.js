@@ -3,14 +3,18 @@ import { on, off, requestScreenshot, startGroupTalk, stopGroupTalk } from '../so
 import { BroadcastTalkClient } from '../lib/talk-client.js';
 import { showToast } from '../components/toast.js';
 import { esc, livenessBadge, isPlatformAdmin, screenshotUrl, compareVersions } from '../utils.js';
+import { mountWallLive } from '../components/wall-live.js';
 import { t, tn } from '../i18n.js';
 import * as gettingStarted from '../components/getting-started.js';
 import * as whatsNew from '../components/whats-new.js';
 import { showDeviceOwnerQRModal } from '../components/device-owner-qr-modal.js';
 import { openMoveServerModal } from '../components/move-server-modal.js';
 import { openGroupPowerScheduleModal } from '../components/group-power-schedule-modal.js';
+import { openGroupRulesModal, groupRulesSummary } from '../components/group-rules.js';
 import { frameDeviceOutput } from '../lib/device-frame.js';
 import { selectedRemoteOrg } from '../components/workspace-switcher.js';
+import * as cui from '../components/corporate-ui.js';
+import { openDeviceMoveDialog } from '../components/device-move-dialog.js';
 
 const DESTRUCTIVE_COMMANDS = ['reboot', 'shutdown'];
 // Command types only — labels resolved through t('dashboard.cmd.<type>')
@@ -62,6 +66,12 @@ const playbackByDevice = new Map();
 // Multi-select state for actions on the dashboard cards.
 const selectedDeviceIds = new Set();
 let selectableGroups = [];
+// What head office decides in this workspace (components/corporate-ui.js workspaceCoverage): which
+// groups it covers, so a group card can say so instead of offering a playlist the server refuses.
+let corpCoverage = null;
+// The group commands only org admins may send to a screen head office's playlist drives
+// (server/lib/corporate/guard.js GATED_COMMANDS).
+const CORP_GATED_GROUP_COMMANDS = ['set_server_url', 'shell', 'install_apk', 'launch', 'kiosk_unlock', 'screen_off', 'shutdown', 'set_screen_timeout'];
 
 function formatTimeAgo(timestamp) {
   if (!timestamp) return t('common.never');
@@ -159,6 +169,20 @@ function fillVersionFilter(devices) {
   if (sel && keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
 }
 
+/** The tag filter: every tag in use on this page, with its screen count. Hidden when none is. */
+function fillTagFilter(devices) {
+  const sel = document.getElementById('deviceTagFilter');
+  if (!sel) return;
+  const keep = sel.value;
+  const counts = new Map();
+  for (const d of devices) for (const tg of (Array.isArray(d.tags) ? d.tags : [])) counts.set(tg, (counts.get(tg) || 0) + 1);
+  const tags = [...counts.keys()].sort();
+  sel.innerHTML = `<option value="">${esc(t('dashboard.filter.all_tags'))}</option>`
+    + tags.map((tg) => `<option value="${esc(tg)}">#${esc(tg)} (${counts.get(tg)})</option>`).join('');
+  sel.hidden = !tags.length;
+  if (keep && counts.has(keep)) sel.value = keep;
+}
+
 function isBehindServedApk(device) {
   if (device.platform_family !== 'android' || !servedApkVersion || !device.app_version) return false;
   const c = compareVersions(device.app_version, servedApkVersion);
@@ -204,7 +228,7 @@ function renderDeviceCard(device) {
   const realBattery = device.battery_level !== null && device.battery_level !== undefined
     && !(Number(device.battery_level) === 0 && !device.battery_charging);
   return `
-    <div class="device-card${checked ? ' selected' : ''}" draggable="true" data-device-id="${device.id}" data-device-name="${esc(device.name)}" data-can-screenshot="${canShot ? '1' : '0'}" data-app-version="${esc(device.app_version || '')}" data-behind="${behind ? '1' : '0'}" onclick="window.location.hash='/device/${device.id}'">
+    <div class="device-card${checked ? ' selected' : ''}" draggable="true" data-device-id="${device.id}" data-device-name="${esc(device.name)}" data-can-screenshot="${canShot ? '1' : '0'}" data-app-version="${esc(device.app_version || '')}" data-behind="${behind ? '1' : '0'}" data-tags="${esc((Array.isArray(device.tags) ? device.tags : []).join(' '))}" onclick="window.location.hash='/device/${device.id}'">
       <span class="device-card-drag" title="${esc(t('dashboard.drag_to_reorder'))}" onclick="event.stopPropagation()">⠿</span>
       <label class="device-card-select" title="${t('dashboard.select_for_wall')}" onclick="event.stopPropagation()">
         <input type="checkbox" class="device-select-cb" data-device-id="${device.id}"${checked ? ' checked' : ''}>
@@ -240,7 +264,8 @@ function renderDeviceCard(device) {
           </span>` : ''}${device.ota_status === 'manual_update_required' ? `
           <span class="device-ota-badge" title="${esc(t('dashboard.device_ota_stuck', { version: device.ota_target_version || '?', n: device.ota_attempts || 0 }))}" style="margin-left:6px;display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--warning);vertical-align:middle">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>update
-          </span>` : ''}</div>
+          </span>` : ''}</div>${Array.isArray(device.tags) && device.tags.length ? `
+        <div class="device-card-tags" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:2px">${device.tags.slice(0, 4).map((tg) => `<span style="font-size:10px;color:var(--text-secondary);background:var(--bg-primary);padding:1px 6px;border-radius:8px">#${esc(tg)}</span>`).join('')}${device.tags.length > 4 ? `<span style="font-size:10px;color:var(--text-muted)">+${device.tags.length - 4}</span>` : ''}</div>` : ''}
         ${device.owner_name || device.owner_email ? `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px">
             <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
@@ -292,6 +317,18 @@ function renderDeviceCard(device) {
   `;
 }
 
+// A wall's card shows the WALL: every panel's screenshot where it hangs (components/wall-live.js),
+// refreshed on the same 30s cadence as the screen cards — the way a screen's card shows the screen.
+let wallLiveMounts = [];
+function mountWallCards(walls, devices) {
+  for (const m of wallLiveMounts) m.destroy();
+  wallLiveMounts = [];
+  for (const w of walls) {
+    const host = document.querySelector(`.wall-card[data-wall-id="${CSS.escape(w.id)}"] .wall-card-live`);
+    if (host && (w.devices || []).length) wallLiveMounts.push(mountWallLive(host, { wall: w, devices, live: true, refreshMs: 30000, compact: true }));
+  }
+}
+
 function renderWallCard(wall) {
   // Compose a tiny grid preview using the wall's actual cols×rows. Each cell
   // is filled (assigned) or hollow (empty slot).
@@ -308,10 +345,12 @@ function renderWallCard(wall) {
   return `
     <div class="device-card wall-card" data-wall-id="${wall.id}" onclick="window.location.hash='#/wall/${wall.id}'">
       <div class="device-card-preview wall-card-preview">
-        <div class="wall-card-grid" style="grid-template-columns:repeat(${wall.grid_cols},1fr);grid-template-rows:repeat(${wall.grid_rows},1fr)">${cells.join('')}</div>
+        ${(wall.devices || []).length
+          ? `<div class="wall-card-live" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:6px"></div>`
+          : `<div class="wall-card-grid" style="grid-template-columns:repeat(${wall.grid_cols},1fr);grid-template-rows:repeat(${wall.grid_rows},1fr)">${cells.join('')}</div>`}
         <div class="device-card-status">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
-          <span>${wall.grid_cols}×${wall.grid_rows} wall</span>
+          <span>${(wall.devices || []).length ? (wall.devices.length + '-panel') : wall.grid_cols + '×' + wall.grid_rows} wall</span>
         </div>
       </div>
       <div class="device-card-body">
@@ -349,9 +388,23 @@ function getGroupPlaylistLabel(devices, playlists) {
   return t('dashboard.mixed_playlists');
 }
 
+/*
+ * Head office on a group card (spec §7.10): "Head office: {name}" when its playlist covers the
+ * group, in place of the playlist picker (assigning one would be refused: CORPORATE_OVERRIDE), and
+ * how many synced members drop out because they have their own slot content.
+ */
+function corpGroupBadge(group) {
+  const g = corpCoverage && corpCoverage.groups && corpCoverage.groups[group.id];
+  if (!g) return '';
+  if (!g.covered) return cui.chip(tn('corp.group.partial', g.mandated_members), 'hq', t('corp.tip.locked'), { lock: true });
+  return cui.chip(g.dark ? t('corp.badge.dark') : t('corp.group.badge', { name: g.playlist_name || '' }), g.dark ? 'dark' : 'hq', t('corp.group.badge_tip', { target: g.target_label || '' }), { lock: true })
+    + (g.sync_excluded ? ` <span style="font-size:11px;color:var(--warning)">${esc(tn('corp.group.sync_excluded', g.sync_excluded))}</span>` : '');
+}
+const corpGroupCovered = (group) => !!(corpCoverage && corpCoverage.groups && corpCoverage.groups[group.id] && corpCoverage.groups[group.id].covered);
+
 function renderGroupSection(group, devices, playlists) {
   const onlineCount = devices.filter(d => d.status === 'online').length;
-  const playlistLabel = getGroupPlaylistLabel(devices, playlists);
+  const playlistLabel = corpGroupCovered(group) ? '' : getGroupPlaylistLabel(devices, playlists);
   return `
     <div class="group-section" data-group-id="${group.id}" style="margin-bottom:24px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding:8px 12px;background:var(--bg-secondary);border-radius:8px;border-left:4px solid ${esc(group.color || '#3B82F6')}">
@@ -359,13 +412,16 @@ function renderGroupSection(group, devices, playlists) {
           <strong style="font-size:15px">${esc(group.name)}</strong>
           <span style="color:var(--text-muted);font-size:12px">${tn('dashboard.devices_count', devices.length)} &middot; ${t('dashboard.online_count', { n: onlineCount })}</span>
           ${playlistLabel ? `<span style="font-size:11px;color:var(--text-secondary);background:var(--bg-primary);padding:2px 8px;border-radius:10px">${t('dashboard.playlist_label', { name: playlistLabel })}</span>` : ''}
+          ${corpGroupBadge(group)}
+          ${group.rules ? `<span style="font-size:11px;color:var(--accent, #3B82F6);background:var(--bg-primary);padding:2px 8px;border-radius:10px" title="${esc(t('grouprules.badge_hint'))}">${esc(t('grouprules.badge', { summary: groupRulesSummary(group.rules) }))}</span>` : ''}
         </div>
         <div style="display:flex;gap:6px;align-items:center">
+          ${devices.length > 0 && corpGroupCovered(group) ? `<button type="button" class="btn btn-secondary btn-sm corp-group-why" data-group-id="${group.id}" style="padding:4px 8px;font-size:12px;white-space:nowrap">${cui.LOCK_SVG} ${esc(t('corp.group.why'))}</button>` : ''}
           ${devices.length > 0 ? `
-          <select class="input group-playlist-select" data-group-id="${group.id}" data-group-name="${esc(group.name)}" style="width:160px;padding:4px 8px;font-size:12px;background:var(--bg-input)">
+          ${corpGroupCovered(group) ? '' : `<select class="input group-playlist-select" data-group-id="${group.id}" data-group-name="${esc(group.name)}" style="width:160px;padding:4px 8px;font-size:12px;background:var(--bg-input)">
             <option value="">${t('dashboard.set_playlist_placeholder')}</option>
             ${(playlists || []).map(p => `<option value="${esc(p.id)}">${esc(p.name)}${p.status === 'draft' ? ' ' + t('dashboard.draft_suffix') : ''}</option>`).join('')}
-          </select>
+          </select>`}
           <select class="input group-cmd-select" data-group-id="${group.id}" data-group-name="${esc(group.name)}" data-device-count="${devices.length}" style="width:150px;padding:4px 8px;font-size:12px;background:var(--bg-input)">
             <option value="">${t('dashboard.send_command_placeholder')}</option>
             ${GROUP_COMMANDS.map(c => `<option value="${c.type}" ${c.destructive ? 'style="color:var(--danger)"' : ''}>${t(CMD_LABEL_KEY[c.type])}</option>`).join('')}
@@ -394,6 +450,7 @@ function renderGroupSection(group, devices, playlists) {
           ` : ''}
           <!-- #talk broadcast: PA to every device in this group. Hidden until live video is confirmed. -->
           <button class="btn talk-scope-btn" data-scope-kind="group" data-group-id="${group.id}" style="display:none;padding:4px 10px;font-size:12px">🎙️ ${t('dashboard.talk_group')}</button>
+          <button class="btn btn-secondary btn-sm group-rules-btn" data-group-id="${group.id}" style="padding:4px 8px;font-size:12px;white-space:nowrap" title="${esc(t('grouprules.button_hint'))}">${t(group.rules ? 'grouprules.button_edit' : 'grouprules.button')}</button>
           <button class="btn" data-group-delete="${group.id}" style="padding:4px 8px;font-size:12px;color:var(--danger)" title="${t('dashboard.delete_group_tooltip')}">&#x2715;</button>
         </div>
       </div>
@@ -461,6 +518,7 @@ function renderSelectionBar(scope, groupId = null) {
             </div>
           </details>`}
       <button class="btn btn-primary btn-sm" data-selection-action="wall">${t('dashboard.create_wall')}</button>
+      <button class="btn btn-secondary btn-sm" data-selection-action="move-workspace">${t('move.button')}</button>
     </div>
   `;
 }
@@ -546,6 +604,7 @@ export function render(container) {
         </optgroup>
         <optgroup id="versionFilterGroup" label="${t('dashboard.filter.by_version')}" hidden></optgroup>
       </select>
+      <select id="deviceTagFilter" class="input" style="width:160px;background:var(--bg-input)" hidden title="${esc(t('dashboard.filter.by_tag'))}"></select>
       <details class="card-fields-menu" id="cardFieldsMenu">
         <summary class="btn btn-secondary btn-sm">${t('dashboard.card_fields')}</summary>
         <div class="card-fields-pop">
@@ -600,6 +659,7 @@ export function render(container) {
   // Search and filter
   document.getElementById('deviceSearch').oninput = () => filterDevices();
   document.getElementById('deviceFilter').onchange = () => filterDevices();
+  document.getElementById('deviceTagFilter').onchange = () => filterDevices();
   // #467: card details, remembered per browser.
   {
     const hidden = hiddenCardFields();
@@ -623,18 +683,20 @@ export function render(container) {
     const filter = document.getElementById('deviceFilter').value;    // '' | healthy | degraded | offline | offline:<reason>
     const reasonDrill = filter.startsWith('offline:') ? filter.slice(8) : null; // drill into a manner-of-death
     const versionDrill = filter.startsWith('version:') ? filter.slice(8) : null;  // #467: 'behind' | '=<version>' 
+    const tagFilter = document.getElementById('deviceTagFilter')?.value || '';
     document.querySelectorAll('.device-card').forEach(card => {
       const name = card.querySelector('.device-card-name')?.textContent.toLowerCase() || '';
       const el = card.querySelector('.device-card-status [data-liveness]');
       const cardState = el?.dataset.liveness || '';
       const cardReason = el?.dataset.offlineReason || '';
       const matchSearch = !search || name.includes(search);
+      const matchTag = !tagFilter || (card.dataset.tags || '').split(' ').includes(tagFilter);
       const matchState = versionDrill
         ? (versionDrill === 'behind' ? card.dataset.behind === '1' : card.dataset.appVersion === versionDrill.slice(1))
         : reasonDrill
         ? (cardState === 'offline' && cardReason === reasonDrill)     // Offline drill-in: liveness AND reason (e.g. silent = MDM-killed set)
         : (!filter || cardState === filter);                         // existing three-state filter — unchanged
-      card.style.display = (matchSearch && matchState) ? '' : 'none';
+      card.style.display = (matchSearch && matchState && matchTag) ? '' : 'none';
     });
     refreshSelectionBar();
   }
@@ -795,11 +857,19 @@ export function render(container) {
     } else if (action.dataset.selectionAction === 'remove') {
       const ids = visible.map(card => card.dataset.deviceId).filter(id => selectedDeviceIds.has(id));
       const { done, failed } = await runBulk(ids, (deviceId) =>
-        api.removeDeviceFromGroup(bar.dataset.groupId, deviceId));
+        cui.withImpactAck((o) => api.removeDeviceFromGroup(bar.dataset.groupId, deviceId, o)));
       reportBulk(done, failed, 'dashboard.toast.removed_from_group');
       loadDashboard();
     } else if (action.dataset.selectionAction === 'wall') {
       createWallFromSelection();
+    } else if (action.dataset.selectionAction === 'move-workspace') {
+      const ids = visible.map(card => card.dataset.deviceId).filter(id => selectedDeviceIds.has(id));
+      let wsId = null;
+      try { wsId = JSON.parse(localStorage.getItem('user'))?.current_workspace_id || null; } catch (_) { wsId = null; }
+      openDeviceMoveDialog(ids, {
+        currentWorkspaceId: wsId,
+        onMoved: () => { ids.forEach((id) => selectedDeviceIds.delete(id)); loadDashboard(); },
+      });
     }
   };
   container.addEventListener('click', selectionActionHandler);
@@ -819,7 +889,7 @@ export function render(container) {
         const group = await api.createGroup(name);
         groupId = group.id;
       }
-      const { done, failed } = await runBulk(ids, (deviceId) => api.addDeviceToGroup(groupId, deviceId));
+      const { done, failed } = await runBulk(ids, (deviceId) => cui.withImpactAck((o) => api.addDeviceToGroup(groupId, deviceId, o)));
       reportBulk(done, failed, 'dashboard.toast.added_to_group');
       loadDashboard();
     } catch (err) {
@@ -963,7 +1033,15 @@ async function createWallFromSelection() {
       grid_col: i % cols,
       grid_row: Math.floor(i / cols),
     }));
-    await api.setWallDevices(wall.id, placement);
+    try {
+      await cui.withImpactAck((o) => api.setWallDevices(wall.id, placement, o));
+    } catch (e) {
+      // Declined "I've checked these": the wall exists, empty — open it so the person can decide.
+      if (!e.cancelled) throw e;
+      showToast(e.message, 'info');
+      window.location.hash = `#/wall/${wall.id}`;
+      return;
+    }
     selectedDeviceIds.clear();
     showToast('Video wall created', 'success');
     window.location.hash = `#/wall/${wall.id}`;
@@ -1088,9 +1166,10 @@ async function loadDashboard() {
     const remoteOrg = selectedRemoteOrg();
     if (remoteOrg) return loadRemoteDashboard(remoteOrg);
 
-    const [rawDevices, groups, playlists, walls] = await Promise.all([
-      api.getDevices(), api.getGroups(), api.getPlaylists(), api.getWalls(),
+    const [rawDevices, groups, playlists, walls, coverage] = await Promise.all([
+      api.getDevices(), api.getGroups(), api.getPlaylists(), api.getWalls(), cui.workspaceCoverage({ force: true }),
     ]);
+    corpCoverage = coverage;
     selectableGroups = groups || [];
 
     // Deduplicate devices by id — a stale reconnect race can briefly cause the same
@@ -1100,6 +1179,7 @@ async function loadDashboard() {
     const devices = Array.from(seen.values());
     await loadServedApkVersion();   // #467: before any card renders, so "behind" is decided once
     fillVersionFilter(devices);
+    fillTagFilter(devices);
 
     /*
      * What's new. shouldFetch() is a localStorage read against the version app.js already knows,
@@ -1251,6 +1331,7 @@ async function loadDashboard() {
 
     main.innerHTML = html;
     frameCardScreenshots();
+    mountWallCards(walls || [], devices);
     attachGroupHandlers(groupsWithDevices);
 
     // Drop any selections for devices that have since been absorbed into a
@@ -1273,6 +1354,22 @@ function attachGroupHandlers(groupsWithDevices) {
   // The weekly backlight schedule for the group. The member list is passed through so the modal
   // can say how many panels cannot honour one, and how many override it with their own — neither
   // of which is visible from a group row.
+  // Dynamic membership rules (components/group-rules.js). Saving re-fills the group on the server.
+  document.querySelectorAll('.group-rules-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const g = groupsWithDevices.find((x) => x.id === btn.getAttribute('data-group-id'));
+      if (!g) return;
+      openGroupRulesModal({
+        group: { id: g.id, name: g.name, rules: g.rules || null },
+        onSave: async (rules) => {
+          await api.updateGroup(g.id, { rules });
+          showToast(t(rules ? 'grouprules.toast_saved' : 'grouprules.toast_off'), 'success');
+          loadDashboard();
+        },
+      });
+    });
+  });
   document.querySelectorAll('.group-power-btn').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1402,15 +1499,15 @@ function attachGroupHandlers(groupsWithDevices) {
       try {
         // Add first, then drop the old memberships: if the add fails the screen keeps the group it
         // had rather than being left ungrouped by a half-finished move.
-        await api.addDeviceToGroup(groupId, deviceId);
+        await cui.withImpactAck((o) => api.addDeviceToGroup(groupId, deviceId, o));
         for (const g of others) {
           if (g.id === groupId) continue;
-          try { await api.removeDeviceFromGroup(g.id, deviceId); }
+          try { await cui.withImpactAck((o) => api.removeDeviceFromGroup(g.id, deviceId, o)); }
           catch (e) { showToast(t('dashboard.toast.move_partial', { group: g.name }), 'warning'); }
         }
         showToast(t('dashboard.toast.moved_device', { name: deviceName, group: targetGroup.name }), 'success');
         loadDashboard();
-      } catch (err) { showToast(err.message, 'error'); }
+      } catch (err) { showToast(err.message, err.cancelled ? 'info' : 'error'); }
     });
   });
 
@@ -1434,12 +1531,22 @@ function attachGroupHandlers(groupsWithDevices) {
       const memberships = groupsByDeviceId.get(deviceId) || [];
       if (memberships.length === 0) return; // already ungrouped
       try {
-        await Promise.all(memberships.map(m => api.removeDeviceFromGroup(m.id, deviceId)));
+        for (const m of memberships) await cui.withImpactAck((o) => api.removeDeviceFromGroup(m.id, deviceId, o));
         showToast(tn('dashboard.toast.removed_device', memberships.length, { name: deviceName }), 'success');
         loadDashboard();
-      } catch (err) { showToast(err.message, 'error'); }
+      } catch (err) { showToast(err.message, err.cancelled ? 'info' : 'error'); loadDashboard(); }
     });
   });
+
+  // Head office covers this group: explain, and say where it is changed.
+  document.querySelectorAll('.corp-group-why').forEach((btn) => btn.addEventListener('click', () => {
+    const g = corpCoverage && corpCoverage.groups[btn.dataset.groupId];
+    if (!g) return;
+    cui.explainLocked({
+      text: t('corp.err.CORPORATE_OVERRIDE', { name: g.playlist_name || '' }) + ' ' + t('corp.group.why_detail', { target: g.target_label || '' }),
+      actions: corpCoverage.is_admin ? [{ label: t('corp.dev.change_in_corporate'), primary: true, onClick: () => { window.location.hash = '#/corporate/where'; } }] : [],
+    });
+  }));
 
   // Playlist assignment handlers
   document.querySelectorAll('.group-playlist-select').forEach(select => {
@@ -1529,6 +1636,16 @@ function attachGroupHandlers(groupsWithDevices) {
       const count = e.target.dataset.deviceCount;
       const cmdLabel = t(CMD_LABEL_KEY[type] || type);
 
+      // Head office's screens: only org admins may send these (the server refuses them per screen).
+      // When every screen in the group is one of them, explain now instead of asking to confirm a
+      // command that cannot run anywhere.
+      const cg = corpCoverage && corpCoverage.groups && corpCoverage.groups[groupId];
+      if (cg && !corpCoverage.is_admin && CORP_GATED_GROUP_COMMANDS.includes(type) && cg.members > 0 && cg.mandated_members >= cg.members) {
+        e.target.value = '';
+        cui.explainLocked({ text: t('corp.group.cmd_locked', { name: cg.playlist_name || '', action: t(`corp.ctl.${type}`) }) });
+        return;
+      }
+
       if (DESTRUCTIVE_COMMANDS.includes(type)) {
         if (!confirm(t('dashboard.confirm_destructive_command', { cmd: cmdLabel.toUpperCase(), n: count, group: groupName }))) {
           e.target.value = '';
@@ -1560,7 +1677,13 @@ function attachGroupHandlers(groupsWithDevices) {
         if (result.unsupported > 0) {
           msg += ' ' + t('dashboard.toast.command_unsupported_n', { n: result.unsupported });
         }
-        showToast(msg, (result.offline > 0 || result.unsupported > 0) ? 'warning' : 'success');
+        // Screens head office's playlist drives refuse the gated commands: say how many, and why.
+        const refused = Number(result.refused) || 0;
+        if (refused > 0) {
+          const why = (result.results || []).find((r) => r && r.status === 'refused');
+          msg += ' ' + tn('corp.group.cmd_refused', refused) + ' ' + (why && why.error ? why.error : t('corp.group.cmd_refused_why'));
+        }
+        showToast(msg, refused > 0 && !result.sent ? 'error' : (result.offline > 0 || result.unsupported > 0 || refused > 0) ? 'warning' : 'success');
       } catch (err) {
         showToast(err.message, 'error');
       }
@@ -1575,10 +1698,10 @@ function attachGroupHandlers(groupsWithDevices) {
       const id = btn.dataset.groupDelete;
       if (!confirm(t('dashboard.confirm_delete_group'))) return;
       try {
-        await api.deleteGroup(id);
+        await cui.withImpactAck((o) => api.deleteGroup(id, o));
         showToast(t('dashboard.toast.group_deleted'), 'success');
         loadDashboard();
-      } catch (e) { showToast(e.message, 'error'); }
+      } catch (e) { showToast(e.message, e.cancelled ? 'info' : 'error'); }
     });
   });
 
@@ -1708,6 +1831,8 @@ export function cleanup() {
   off('device-removed', () => {});
   if (refreshInterval) clearInterval(refreshInterval);
   if (progressTickInterval) clearInterval(progressTickInterval);
+  for (const m of wallLiveMounts) m.destroy();
+  wallLiveMounts = [];
   statusHandler = null;
   screenshotHandler = null;
   playbackHandler = null;

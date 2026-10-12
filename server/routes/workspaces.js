@@ -11,6 +11,7 @@ const appConfig = require('../config');
 const replicaProxy = require('../lib/replica-proxy');
 const { logActivity, getClientIp } = require('../services/activity');
 const { sendEmail } = require('../services/email');
+const { releaseWorkspaceMember } = require('../lib/user-deletion');
 
 // Workspace management routes. Operates on a target workspace specified by
 // URL param, NOT the caller's currently active workspace - so this router
@@ -594,8 +595,13 @@ router.delete('/:id/members/:userId', (req, res) => {
   if (member.role === 'workspace_admin' && countWorkspaceAdmins(ws.id) <= 1) {
     return res.status(409).json({ error: 'Cannot remove the last admin' });
   }
-  db.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?')
-    .run(ws.id, req.params.userId);
+  // What they set up here under their own name goes with the membership (Canva links, folder syncs,
+  // REST-hook subscriptions) - lib/user-deletion.js releaseWorkspaceMember.
+  db.transaction(() => {
+    db.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?')
+      .run(ws.id, req.params.userId);
+    releaseWorkspaceMember(db, { userId: req.params.userId, workspaceIds: [ws.id] });
+  })();
   res.json({ success: true });
 });
 
@@ -664,14 +670,18 @@ router.post('/:id/command', (req, res) => {
   if (!deviceNs) return res.status(503).json({ error: 'The realtime layer is not available.' });
 
   const devices = db.prepare('SELECT * FROM devices WHERE workspace_id = ?').all(ws.id);
+  // ⚠️ This router does not pass resolveTenancy, so there is no ambient actor: pass it explicitly,
+  // or deliverCommand would judge the call as system and skip the head office device-control rule.
+  const actor = require('../lib/corporate/actor').fromReq(req);
   const results = devices.map((device) => ({
-    device_id: device.id, name: device.name, ...deliverCommand(deviceNs, device, type, payload),
+    device_id: device.id, name: device.name, ...deliverCommand(deviceNs, device, type, payload, { actor }),
   }));
   const sent = results.filter(r => r.status === 'sent' || r.status === 'relayed').length;
   const offline = results.filter(r => r.status === 'offline' || r.status === 'queued').length;
   const unsupported = results.filter(r => r.status === 'unsupported').length;
+  const refused = results.filter(r => r.status === 'refused').length;
   logActivity(req.user.id, 'workspace_command', `workspace: ${ws.name} (${ws.id}) type=${type} sent=${sent}`, null, getClientIp(req), ws.id);
-  res.json({ success: true, type, total: results.length, sent, offline, unsupported, results });
+  res.json({ success: true, type, total: results.length, sent, offline, unsupported, ...(refused ? { refused } : {}), results });
 });
 
 module.exports = router;

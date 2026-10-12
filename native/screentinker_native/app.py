@@ -36,9 +36,10 @@ from .logic.offline_play_queue import OfflinePlayQueue, make_play, new_id
 from .net import device_http
 from .net.link import DeviceLink
 from .net.triggers import TriggerManager
-from .player.cache import ContentCache, DownloadCoordinator
+from .player.cache import ContentCache, DownloadCoordinator, trigger_content_ids
 from .player.engine import PlaybackEngine
 from .platform import audio, brightness, deviceinfo, display, ops, privileged, shell
+from .system.audience import AudienceController
 from .system.power_schedule import PowerSchedule
 from .system.updater import Updater
 from .ui.extras import SlideAudio, TriggerOverlay, new_frame_key, rtc_page
@@ -88,6 +89,7 @@ class App:
         if args.server:
             self.config.server_url = args.server
         self.qt = QGuiApplication.instance()
+        self._operator_exit = False     # the on-screen "Exit player" was chosen (see run())
         self._post = _UiPost()
         self.stage = Stage(self)
         self.cache = ContentCache(os.path.join(self.config.state_dir, "content"))
@@ -115,6 +117,13 @@ class App:
         self.kiosk_sessions.load()
         self._kiosk_in_flight = False
         self._kiosk_errors = collections.deque(maxlen=10)
+        # Audience counting (system/audience.py): needs the optional add-on; off unless the payload
+        # turns it on. Counts only — queued here, sent on device:audience, dropped on the ack.
+        self._audience_in_flight = False
+        self.audience = AudienceController(
+            self.config.state_dir, on_buckets=self.flush_audience,
+            set_indicator=lambda on: self.on_ui(lambda: self.stage.set("audienceIndicator", on)),
+            camera_override=self.config.system_value("audience_camera"))
         c = self.engine.controller
         self.kiosk = KioskSession(self.stage, self.config.state_dir, hold=c.hold, release=c.release,
                                   skip=c.next, error=self.send_kiosk_error, session_end=self._kiosk_session_end)
@@ -181,11 +190,16 @@ class App:
 
     # ------------------------------------------------------------------ link handlers (net thread)
     def capabilities(self):
-        return capabilities.declared_capabilities(self._brightness_supported)
+        caps = capabilities.declared_capabilities(self._brightness_supported)
+        # A statement of ability only (the add-on is installed and a camera is there); whether it
+        # counts is the organization's switch, sent in the payload.
+        if self.audience.available:
+            caps.append("audience.camera")
+        return caps
 
     def device_info(self):
         w = self.stage.window
-        scr = QGuiApplication.primaryScreen()
+        scr = (w.screen() if w is not None else None) or QGuiApplication.primaryScreen()
         size = scr.size() if scr else None
         dpr = scr.devicePixelRatio() if scr else 1.0
         info = {
@@ -238,12 +252,44 @@ class App:
         self._kiosk_in_flight = False
         self.flush_kiosk_sessions()
         self._flush_kiosk_errors()
+        self._audience_in_flight = False
+        self.flush_audience()
 
     def on_paired(self, device_id, name):
         self.on_ui(lambda: self._status_changed("paired", name))
 
     def on_unpaired(self, reason):
+        self.stop_audience()
         self.on_ui(lambda: self._status_changed("unpaired", reason))
+
+    def stop_audience(self):
+        """Unpaired or deleted (any reason, any thread): the camera stops NOW — no organization is
+        asking for counts any more — and the saved payload forgets the switch, so a restart before the
+        panel is paired again cannot turn it back on. The controller is thread-safe."""
+        self.audience.on_payload({})
+        cached = self.config.get("cached_payload")
+        if isinstance(cached, dict) and "audience" in cached:
+            self.config.set("cached_payload", {k: v for k, v in cached.items() if k != "audience"})
+
+    def on_deleted(self):
+        """Deleted on the dashboard (net thread): drop every downloaded asset and bundle render
+        EXCEPT trigger media. Trigger items are not in a playlist and must fire from local disk the
+        instant they arrive; the routine prune reclaims them later if a new payload drops them."""
+        self.stop_audience()            # before the wipe: privacy first, even if the wipe fails
+        engine = getattr(self, "engine", None)
+        keep = trigger_content_ids(getattr(engine, "payload", None))
+        removed = self.cache.prune(keep)
+        bundles = getattr(engine, "bundles", None)
+        if bundles is not None:
+            for n in os.listdir(bundles.root):
+                if n.split(".", 1)[0] in keep:
+                    continue
+                try:
+                    os.unlink(os.path.join(bundles.root, n))
+                    removed += 1
+                except OSError:
+                    pass
+        log.info("device deleted on server: removed %d downloaded file(s)", removed)
 
     def on_offline_ack(self, d):
         pass   # handled by the grace timer in flush_offline_plays (the ack carries counts, not ids)
@@ -310,6 +356,8 @@ class App:
             asyncio.ensure_future(self.pty.close(d))
         elif event == "device:kiosk-sessions-ack":
             self._on_kiosk_ack(d)
+        elif event == "device:audience-ack":
+            self._on_audience_ack(d)
 
     async def _adopt_net_payload(self, d):
         """The parts of a payload that live on the network thread."""
@@ -319,6 +367,7 @@ class App:
     def _adopt_ui_payload(self, d):
         self.power.update(d.get("power_schedule"))
         self.engine.on_payload(d)
+        self.audience.on_payload(d)
 
     # ------------------------------------------------------------------ downloads (any thread)
     def ensure_downloads(self, want, prune):
@@ -350,6 +399,8 @@ class App:
     # ------------------------------------------------------------------ proof of play
     def play_event(self, event, item, completed):
         cid = item.content_id or item.widget_id or ""
+        if event == "play_start":
+            self.audience.set_item("content" if item.content_id else "widget", cid or None)
         if self.link.connected:
             self._offline_open = None
             p = {"device_id": self.config.device_id, "event": event, "content_id": cid or None,
@@ -427,6 +478,32 @@ class App:
         if ids and self.kiosk_sessions.size():
             self.flush_kiosk_sessions()
 
+    # ------------------------------------------------------------------ audience counting
+    def flush_audience(self):
+        """Send queued per-minute counts, one batch at a time (any thread). A bucket leaves the queue
+        only on device:audience-ack, which names what the server stored or refused for good; a lost
+        ack means a resend, and the server keys on device + minute + item."""
+        if self._audience_in_flight or not self.link.connected or not self.config.device_id:
+            return
+        batch = self.audience.peek()
+        if not batch:
+            return
+        self._audience_in_flight = True
+        self.emit("device:audience", {"device_id": self.config.device_id, "buckets": batch})
+        if self.loop:
+            # An older server never acks: stop waiting after a while so a later flush can retry.
+            self.loop.call_soon_threadsafe(lambda: self.loop.call_later(30, self._audience_ack_timeout))
+
+    def _audience_ack_timeout(self):
+        self._audience_in_flight = False
+
+    def _on_audience_ack(self, d):
+        ids = [i for i in (d.get("ids") or []) if isinstance(i, str) and i]
+        left = self.audience.ack(ids)
+        self._audience_in_flight = False
+        if ids and left:
+            self.flush_audience()
+
     def send_kiosk_error(self, reason, detail):
         """A failed interactive page, as a dashboard incident (already throttled by the caller).
         ⚠️ The commonest failure is "no network", exactly when it cannot be sent: the last few are held
@@ -492,7 +569,30 @@ class App:
             self.show_status("Offline — reconnecting", str(detail or ""))
 
     def _content_on_screen(self):
-        return self.engine.mode == "zones" or self.engine.controller.has_content_on_screen
+        return self.engine.mode in ("zones", "wallzones") or self.engine.controller.has_content_on_screen
+
+    def _watch_gl_flavour(self, win):
+        """Tell the shader library whether the GL context is OpenGL ES, which decides the GLSL
+        variants it bakes (player/transitions.py bake_profile). Read on the render thread once Qt has
+        created the context (DirectConnection: the context is only current there)."""
+        from PySide6.QtCore import Qt
+
+        def check():
+            try:
+                gles = _context_is_gles()
+            except Exception as e:
+                log.warning("could not tell GL from GLES (%s); keeping the desktop bake", e)
+                return
+            self.on_ui(lambda: self.engine.shaders.set_gles(gles))
+        win.sceneGraphInitialized.connect(check, Qt.ConnectionType.DirectConnection)
+        if win.isSceneGraphInitialized():
+            # ⚠️ Already up, so the signal has fired: on eglfs (Pi Lite) the scene graph initialises
+            # synchronously, before this runs. Read the window's ACTUAL surface format. NOT
+            # QOpenGLContext.openGLModuleType(): Debian's Qt reports LibGL there although the live
+            # context is OpenGL ES 3.1 (measured on a Pi 4), so it would pick the wrong bake.
+            from PySide6.QtGui import QSurfaceFormat
+            self.engine.shaders.set_gles(
+                win.format().renderableType() == QSurfaceFormat.RenderableType.OpenGLES)
 
     def show_status(self, title, detail=""):
         self.stage.set("statusTitle", title)
@@ -588,7 +688,16 @@ class App:
     def _cmd_set_timezone(self, p):
         tz = str(p.get("timezone") or "")
         if tz:
-            self.on_net(self._op_log("set_timezone", ops.set_timezone(tz)))
+            self.on_net(self._set_timezone(tz))
+
+    async def _set_timezone(self, tz):
+        # ⚠️ Changing the OS zone does not change OURS: glibc loads the zone once per process, so the
+        # player kept the old one until it restarted. Log times were off, and so were schedules on a
+        # device with no zone of its own (they fall back to the process's local time).
+        ok = await self._op_log("set_timezone", ops.set_timezone(tz))
+        if ok:
+            reload_local_zone()
+        return ok
 
     def _cmd_update(self, p):
         self.on_net(self.updater.check(forced=True))
@@ -723,6 +832,7 @@ class App:
             return
         self.blanked = off
         self.stage.set("blank", off)
+        self.audience.set_visible(not off)      # nobody can look at a dark screen
         self.restore_mute()
 
         async def go():
@@ -943,9 +1053,11 @@ class App:
     # ------------------------------------------------------------------ on-device menu
     def _refresh_menu(self):
         acts = [{"id": "refresh", "label": "Reload content"},
-                {"id": "repair", "label": "Forget pairing and re-pair"},
-                {"id": "reboot", "label": "Reboot"},
-                {"id": "shutdown", "label": "Shut down"}]
+                {"id": "repair", "label": "Forget pairing and re-pair"}]
+        # Only where the privileged helper exists (it is what reboots): a Mac, or a source checkout,
+        # would otherwise show two buttons that do nothing.
+        if privileged.available():
+            acts += [{"id": "reboot", "label": "Reboot"}, {"id": "shutdown", "label": "Shut down"}]
         if not self.config.get("kiosk_locked"):
             acts.append({"id": "exit", "label": "Exit player"})
         self.stage.set("menuActions", acts)
@@ -968,8 +1080,11 @@ class App:
         elif aid == "exit" and not self.config.get("kiosk_locked"):
             self.emit("device:exit", {"device_id": self.config.device_id, "reason": "clean_exit", "detail": "menu"})
             # 42 = "an operator chose to exit": the Windows helper's watchdog stands down instead of
-            # relaunching (winhelper/service.py EXIT_BY_OPERATOR).
-            QTimer.singleShot(300, lambda: self.qt.exit(EXIT_BY_OPERATOR))
+            # relaunching (winhelper/service.py EXIT_BY_OPERATOR). A backend may name its own code:
+            # launchd can only tell "clean" (0) from "not", so macOS stays down on 0.
+            code = getattr(ops, "EXIT_BY_OPERATOR", EXIT_BY_OPERATOR)
+            self._operator_exit = True
+            QTimer.singleShot(300, lambda: self.qt.exit(code))
 
     # ------------------------------------------------------------------ Stage callbacks
     def on_slot_event(self, surface, token, event, detail):
@@ -1009,9 +1124,25 @@ class App:
             self.stage.set("shadersSupported", api != QSGRendererInterface.GraphicsApi.Software)
             log.info("scene graph: %s (shader transitions %s)", api.name,
                      "on" if self.stage.shadersSupported else "off: crossfade")
+            if api == QSGRendererInterface.GraphicsApi.OpenGL:
+                self._watch_gl_flavour(win)
         except Exception as e:
             log.warning("could not read the scene-graph backend (%s); assuming GPU", e)
+        # --display / ST_DISPLAY: put the window on that output before going full screen there.
+        from .ui import screen_pick
+        idx = screen_pick.wanted_index(getattr(self.args, "display", None))
+        if idx is not None:
+            target = screen_pick.pick(QGuiApplication.screens(), QGuiApplication.primaryScreen(), idx)
+            if target is not None:
+                win.setScreen(target)
+                win.setGeometry(target.geometry())
+                log.info("display %d: %s", idx, target.name())
         if not self.args.windowed:
+            if getattr(ops, "HIDE_CURSOR", False):
+                # A kiosk Mac shows the arrow over content otherwise; input injection does not need it.
+                from PySide6.QtCore import Qt
+                from PySide6.QtGui import QCursor
+                self.qt.setOverrideCursor(QCursor(Qt.CursorShape.BlankCursor))
             if sys.platform == "win32":
                 # Fullscreen alone sits UNDER the taskbar and Start menu on Windows (seen in the VM);
                 # a kiosk surface must be topmost.
@@ -1028,7 +1159,29 @@ class App:
         # showing what it had.
         self.engine.restore_cached()
         threading.Thread(target=self._net_main, name="net", daemon=True).start()
-        return self.qt.exec()
+        rc = self.qt.exec()
+        self.audience.shutdown()      # faces still in view leave now; the partial minute is queued
+        # A backend whose supervisor only tells "clean" from "not" (macOS launchd) turns a clean quit
+        # nobody chose from the menu into one that brings the player back while the kiosk is locked.
+        final = getattr(ops, "final_exit_code", None)
+        if final is not None:
+            rc = final(rc, self._operator_exit, bool(self.config.get("kiosk_locked")))
+        return rc
+
+
+def reload_local_zone():
+    """Make this process pick up a time zone the OS just switched to (no-op where there is no tzset)."""
+    if hasattr(time, "tzset"):
+        time.tzset()
+
+
+def _context_is_gles():
+    """On the render thread with the scene graph's context current: is it OpenGL ES?"""
+    from PySide6.QtGui import QOpenGLContext
+    ctx = QOpenGLContext.currentContext()
+    if ctx is not None:
+        return ctx.isOpenGLES()
+    return QOpenGLContext.openGLModuleType() == QOpenGLContext.OpenGLModuleType.LibGLES
 
 
 def _single_instance():
@@ -1061,8 +1214,23 @@ def _main(argv=None):
     ap.add_argument("--server", help="server URL (overrides the stored one)")
     ap.add_argument("--state-dir", help="where pairing/cache/state live")
     ap.add_argument("--windowed", action="store_true", help="do not go fullscreen (development)")
+    ap.add_argument("--display", help="which screen to use, 0 = the first (default: the primary); or ST_DISPLAY")
+    ap.add_argument("--install-autostart", action="store_true",
+                    help="start this player at login and keep it running (macOS LaunchAgent)")
+    ap.add_argument("--remove-autostart", action="store_true", help="undo --install-autostart")
     ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--audience-check", nargs="?", const="", metavar="CLIP",
+                    help="check the audience-counting add-on (and count faces in CLIP), then exit")
     args = ap.parse_args(argv)
+    if args.install_autostart or args.remove_autostart:
+        if not hasattr(ops, "install_autostart"):
+            print("autostart is set up by the installer on this OS")
+            return 2
+        if args.remove_autostart:
+            print("removed" if ops.remove_autostart() else "was not installed")
+            return 0
+        print("installed:", ops.install_autostart(args.server))
+        return 0
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if sys.stderr is None or getattr(sys, "frozen", False):
@@ -1081,10 +1249,23 @@ def _main(argv=None):
             sys.stdout = open(os.devnull, "w")
     for noisy in ("socketio", "engineio", "aiohttp.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    if args.audience_check is not None:
+        import json as _json
+        from .system.audience import self_check
+        result = self_check(args.audience_check or None)
+        line = _json.dumps(result)
+        log.info("audience check: %s", line)
+        print(line)
+        return 0 if result.get("addon") else 3
 
     if sys.platform == "win32" and not _single_instance():
         log.info("another player is already running in this session; exiting")
         return 0
+    if hasattr(ops, "single_instance"):
+        from .config import default_state_dir
+        if not ops.single_instance(args.state_dir or default_state_dir()):
+            log.info("another player is already running for this user; exiting")
+            return 0
 
     # Qt's own warnings (QML errors, shader failures, multimedia) go to stderr by default — which a
     # windowed Windows build discards. Route them into the player log.

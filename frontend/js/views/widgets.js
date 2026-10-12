@@ -47,6 +47,10 @@ function dateFormatLabel(format) {
  */
 import { esc, hydrateAuthImages } from '../utils.js';
 import { pluginFieldsHtml, readPluginFields } from '../lib/plugin-fields.js';
+import { mountMenuEditor, readMenuConfig } from '../components/menu-board-editor.js';
+import { mountBiEditor, readBiConfig } from '../components/bi-dashboard-editor.js';
+import { mountSocialEditor, readSocialConfig } from '../components/social-wall-editor.js';
+import { mountRoomEditor, readRoomConfig } from '../components/room-display-editor.js';
 
 // A refused request must reject, not resolve.
 //
@@ -69,7 +73,7 @@ const API = (url, opts = {}) => {
 
 // Widget type ids only — name + desc are looked up via t() so they switch
 // language with the rest of the UI.
-const WIDGET_TYPES = ['clock', 'weather', 'rss', 'text', 'webpage', 'social', 'directory-board', 'directory-search', 'transition'];
+const WIDGET_TYPES = ['clock', 'weather', 'rss', 'text', 'webpage', 'cloud-doc', 'social', 'directory-board', 'directory-search', 'menu-board', 'bi-dashboard', 'room-display', 'transition'];
 const WIDGET_ICONS = {
   clock: '&#128339;',
   weather: '&#9925;',
@@ -79,6 +83,10 @@ const WIDGET_ICONS = {
   social: '&#128172;',
   'directory-board': '&#127970;',
   'directory-search': '&#128269;',
+  'menu-board': '&#127860;',
+  'cloud-doc': '&#128209;',
+  'bi-dashboard': '&#128202;',
+  'room-display': '&#128682;',
   transition: '&#127916;',
   // Built-in, but never offered in the "new widget" grid: a template widget is created from the
   // Templates library (the server refuses POST /widgets for it) and edited with the same form.
@@ -467,8 +475,8 @@ function showPreviewModal(sessionId, widgetType) {
   // #104: webpage widgets pointing at frame-denying sites (X-Frame-Options) can't be
   // embedded in a browser preview — and an XFO refusal is provably indistinguishable
   // client-side from a working embed, so we don't guess. Always show the honest note.
-  const webpageNote = widgetType === 'webpage'
-    ? `<div style="padding:8px 16px;border-top:1px solid var(--border);color:var(--text-secondary);font-size:13px;text-align:center">${t('widget.webpage_blocked_note')}</div>`
+  const webpageNote = widgetType === 'webpage' || widgetType === 'cloud-doc'
+    ? `<div style="padding:8px 16px;border-top:1px solid var(--border);color:var(--text-secondary);font-size:13px;text-align:center">${t(widgetType === 'cloud-doc' ? 'widget.cloud.preview_note' : 'widget.webpage_blocked_note')}</div>`
     : '';
   overlay.innerHTML = `
     <div style="width:100%;max-width:1400px;height:90vh;background:var(--bg-card);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--border)">
@@ -519,7 +527,7 @@ export async function render(container) {
       `).join('')}
     </div>
     <div class="content-grid" id="widgetGrid"></div>
-    <div id="pluginSubmitCard" style="display:none;margin-top:32px" class="card"></div>
+    <div id="pluginSubmitCard" style="display:none;margin-top:32px" class="corp-card"></div>
 
     <!-- Widget Config Modal -->
     <div class="modal-overlay" id="widgetModal" style="display:none">
@@ -540,6 +548,9 @@ export async function render(container) {
   `;
 
   let editingWidget = null;
+  // The config the open form was filled from. Saving starts from it, so a key the form has no field
+  // for (min_webview, or an idle_warning_sec set through the API) survives a save from the dashboard.
+  let formBaseConfig = {};
   let creatingType = null;
   let dirState = { categories: [], logo_url: '', background_images: [] };
   // Cached widget list from the last load — used to populate the directory-search
@@ -642,6 +653,7 @@ export async function render(container) {
   }
 
   function showConfigForm(type, config) {
+    formBaseConfig = config || {};
     const plugin = pluginTypeById().get(type);
     const typeName = plugin ? (plugin.label || plugin.type) : widgetTypeName(type);
     document.getElementById('widgetModalTitle').textContent = editingWidget
@@ -657,6 +669,17 @@ export async function render(container) {
       return;
     }
 
+    /*
+     * ⚠️ EVERY stored config value below goes through escAttr — numbers and colours included.
+     *
+     * `config` is whatever JSON was last saved (the route validates only the timezone), so a
+     * "font_size" can be any string. An HTML widget's body is free-form markup BY DESIGN: dropped raw
+     * into <textarea>${...}</textarea> a `</textarea><img onerror=…>` closed the box and ran script in
+     * the dashboard origin for whoever clicked Edit. Escaping the textarea body is also what makes it
+     * ROUND-TRIP: textarea content is RCDATA, so entities are decoded — a widget showing a literal
+     * `&lt;b&gt;` came back as a real <b> and a plain re-save (even just a rename) changed the screen.
+     * escAttr encodes & < > " so the browser decodes it back to exactly the stored string.
+     */
     switch (type) {
       case 'clock':
         {
@@ -667,47 +690,47 @@ export async function render(container) {
           <div class="form-group"><label>${t('widget.field.format')}</label><select id="wFormat" class="input" style="background:var(--bg-input)"><option value="12h" ${config.format === '12h' ? 'selected' : ''}>${t('widget.field.format_12h')}</option><option value="24h" ${config.format === '24h' ? 'selected' : ''}>${t('widget.field.format_24h')}</option></select></div>
           <div class="form-group"><label>${t('widget.field.timezone')}</label>${timezoneField(timezone)}<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"><button type="button" class="btn btn-secondary btn-sm" id="wUseDashboardTimezone">${t('widget.field.use_dashboard_timezone')}</button><button type="button" class="btn btn-secondary btn-sm" id="wUseServerTimezone">${t('widget.field.use_server_timezone')}</button></div><div class="form-hint" id="wTimezoneHint" style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.field.timezone_hint')}</div></div>
           <div class="form-group"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="wShowSeconds" ${config.show_seconds === false ? '' : 'checked'}> ${t('widget.field.show_seconds')}</label></div>
-          <div class="form-group"><label>${t('widget.field.locale')}</label><input type="text" id="wLocale" class="input" value="${config.locale || ''}" placeholder="es-ES"><div class="form-hint" style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.field.locale_hint')}</div></div>
-          <div class="form-group"><label>${t('widget.field.font_size_px')}</label><input type="number" id="wFontSize" class="input" value="${config.font_size || 64}"></div>
+          <div class="form-group"><label>${t('widget.field.locale')}</label><input type="text" id="wLocale" class="input" value="${escAttr(config.locale || '')}" placeholder="es-ES"><div class="form-hint" style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.field.locale_hint')}</div></div>
+          <div class="form-group"><label>${t('widget.field.font_size_px')}</label><input type="number" id="wFontSize" class="input" value="${escAttr(config.font_size || 64)}"></div>
           <div class="form-group"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="wShowDate" ${config.show_date === false ? '' : 'checked'}> ${t('widget.field.show_date')}</label></div>
           <div class="form-group"><label>${t('widget.field.date_format')}</label><select id="wDateFormat" class="input" style="background:var(--bg-input)"><option value="full" ${dateFormat === 'full' ? 'selected' : ''}>${dateFormatLabel('full')}</option><option value="long" ${dateFormat === 'long' ? 'selected' : ''}>${dateFormatLabel('long')}</option><option value="medium" ${dateFormat === 'medium' ? 'selected' : ''}>${dateFormatLabel('medium')}</option><option value="short" ${dateFormat === 'short' ? 'selected' : ''}>${dateFormatLabel('short')}</option></select></div>
           <div class="form-group"><label>${t('widget.field.date_position')}</label><select id="wDatePosition" class="input" style="background:var(--bg-input)"><option value="below" ${datePosition === 'below' ? 'selected' : ''}>${t('widget.field.date_position_below')}</option><option value="above" ${datePosition === 'above' ? 'selected' : ''}>${t('widget.field.date_position_above')}</option><option value="left" ${datePosition === 'left' ? 'selected' : ''}>${t('widget.field.date_position_left')}</option><option value="right" ${datePosition === 'right' ? 'selected' : ''}>${t('widget.field.date_position_right')}</option></select></div>
-          <div class="form-group"><label>${t('widget.field.date_font_size_px')}</label><input type="number" id="wDateFontSize" class="input" value="${config.date_font_size || Math.max(16, Math.round((config.font_size || 64) / 3))}" min="8"></div>
-          <div class="form-group"><label>${t('widget.field.date_color')}</label><input type="color" id="wDateColor" value="${config.date_color || config.color || '#FFFFFF'}" style="width:60px;height:32px;border:none"></div>
-          <div class="form-group"><label>${t('widget.field.color')}</label><input type="color" id="wColor" value="${config.color || '#FFFFFF'}" style="width:60px;height:32px;border:none"></div>
-          <div class="form-group"><label>${t('widget.field.background')}</label><input type="color" id="wBg" value="${config.background || '#000000'}" style="width:60px;height:32px;border:none"></div>`;
+          <div class="form-group"><label>${t('widget.field.date_font_size_px')}</label><input type="number" id="wDateFontSize" class="input" value="${escAttr(config.date_font_size || Math.max(16, Math.round((config.font_size || 64) / 3)))}" min="8"></div>
+          <div class="form-group"><label>${t('widget.field.date_color')}</label><input type="color" id="wDateColor" value="${escAttr(config.date_color || config.color || '#FFFFFF')}" style="width:60px;height:32px;border:none"></div>
+          <div class="form-group"><label>${t('widget.field.color')}</label><input type="color" id="wColor" value="${escAttr(config.color || '#FFFFFF')}" style="width:60px;height:32px;border:none"></div>
+          <div class="form-group"><label>${t('widget.field.background')}</label><input type="color" id="wBg" value="${escAttr(config.background || '#000000')}" style="width:60px;height:32px;border:none"></div>`;
         }
         break;
       case 'weather':
         html += `
           <div class="form-group"><label>${t('widget.field.location')}</label><input type="text" id="wLocation" class="input" value="${esc(config.location || '')}" placeholder="${t('widget.field.location_placeholder')}"></div>
           <div class="form-group"><label>${t('widget.field.units')}</label><select id="wUnits" class="input" style="background:var(--bg-input)"><option value="imperial" ${config.units !== 'metric' ? 'selected' : ''}>${t('widget.field.units_imperial')}</option><option value="metric" ${config.units === 'metric' ? 'selected' : ''}>${t('widget.field.units_metric')}</option></select></div>
-          <div class="form-group"><label>${t('widget.field.font_size')}</label><input type="number" id="wFontSize" class="input" value="${config.font_size || 48}"></div>
-          <div class="form-group"><label>${t('widget.field.color')}</label><input type="color" id="wColor" value="${config.color || '#FFFFFF'}" style="width:60px;height:32px;border:none"></div>
+          <div class="form-group"><label>${t('widget.field.font_size')}</label><input type="number" id="wFontSize" class="input" value="${escAttr(config.font_size || 48)}"></div>
+          <div class="form-group"><label>${t('widget.field.color')}</label><input type="color" id="wColor" value="${escAttr(config.color || '#FFFFFF')}" style="width:60px;height:32px;border:none"></div>
           <div class="form-group"><label>${t('widget.field.layout')}</label><select id="wLayout" class="input" style="background:var(--bg-input)"><option value="vertical" ${config.layout !== 'horizontal' ? 'selected' : ''}>${t('widget.field.layout_vertical')}</option><option value="horizontal" ${config.layout === 'horizontal' ? 'selected' : ''}>${t('widget.field.layout_horizontal')}</option></select></div>
           <div class="form-group"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="wShowLocation" ${config.show_location === false ? '' : 'checked'}> ${t('widget.field.show_location')}</label></div>
-          <div class="form-group"><label>${t('widget.field.locale')}</label><input type="text" id="wWeatherLocale" class="input" value="${config.locale || ''}" placeholder="es"><div class="form-hint" style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.field.weather_locale_hint')}</div></div>`;
+          <div class="form-group"><label>${t('widget.field.locale')}</label><input type="text" id="wWeatherLocale" class="input" value="${escAttr(config.locale || '')}" placeholder="es"><div class="form-hint" style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.field.weather_locale_hint')}</div></div>`;
         break;
       case 'rss':
         html += `
-          <div class="form-group"><label>${t('widget.field.feed_url')}</label><input type="text" id="wFeedUrl" class="input" value="${config.feed_url || ''}" placeholder="https://example.com/feed.xml"></div>
-          <div class="form-group"><label>${t('widget.field.scroll_speed_seconds')}</label><input type="number" id="wScrollSpeed" class="input" value="${config.scroll_speed || 30}"></div>
-          <div class="form-group"><label>${t('widget.field.max_items')}</label><input type="number" id="wMaxItems" class="input" value="${config.max_items || 10}"></div>
-          <div class="form-group"><label>${t('widget.field.font_size')}</label><input type="number" id="wFontSize" class="input" value="${config.font_size || 24}"></div>
-          <div class="form-group"><label>${t('widget.field.color')}</label><input type="color" id="wColor" value="${config.color || '#FFFFFF'}" style="width:60px;height:32px;border:none"></div>
-          <div class="form-group"><label>${t('widget.field.background')}</label><input type="color" id="wBg" value="${config.background || '#000000'}" style="width:60px;height:32px;border:none"></div>`;
+          <div class="form-group"><label>${t('widget.field.feed_url')}</label><input type="text" id="wFeedUrl" class="input" value="${escAttr(config.feed_url || '')}" placeholder="https://example.com/feed.xml"></div>
+          <div class="form-group"><label>${t('widget.field.scroll_speed_seconds')}</label><input type="number" id="wScrollSpeed" class="input" value="${escAttr(config.scroll_speed || 30)}"></div>
+          <div class="form-group"><label>${t('widget.field.max_items')}</label><input type="number" id="wMaxItems" class="input" value="${escAttr(config.max_items || 10)}"></div>
+          <div class="form-group"><label>${t('widget.field.font_size')}</label><input type="number" id="wFontSize" class="input" value="${escAttr(config.font_size || 24)}"></div>
+          <div class="form-group"><label>${t('widget.field.color')}</label><input type="color" id="wColor" value="${escAttr(config.color || '#FFFFFF')}" style="width:60px;height:32px;border:none"></div>
+          <div class="form-group"><label>${t('widget.field.background')}</label><input type="color" id="wBg" value="${escAttr(config.background || '#000000')}" style="width:60px;height:32px;border:none"></div>`;
         break;
       case 'text':
         html += `
-          <div class="form-group"><label>${t('widget.field.html_content')}</label><textarea id="wHtml" class="input" rows="6" style="font-family:monospace;font-size:12px">${config.html || '<h1 style="color:white;text-align:center;margin-top:40px">Hello World</h1>'}</textarea></div>
-          <div class="form-group"><label>${t('widget.field.css_optional')}</label><textarea id="wCss" class="input" rows="3" style="font-family:monospace;font-size:12px">${config.css || ''}</textarea></div>
-          <div class="form-group"><label>${t('widget.field.background')}</label><input type="color" id="wBg" value="${config.background || '#000000'}" style="width:60px;height:32px;border:none"></div>`;
+          <div class="form-group"><label>${t('widget.field.html_content')}</label><textarea id="wHtml" class="input" rows="6" style="font-family:monospace;font-size:12px">${escAttr(config.html || '<h1 style="color:white;text-align:center;margin-top:40px">Hello World</h1>')}</textarea></div>
+          <div class="form-group"><label>${t('widget.field.css_optional')}</label><textarea id="wCss" class="input" rows="3" style="font-family:monospace;font-size:12px">${escAttr(config.css || '')}</textarea></div>
+          <div class="form-group"><label>${t('widget.field.background')}</label><input type="color" id="wBg" value="${escAttr(config.background || '#000000')}" style="width:60px;height:32px;border:none"></div>`;
         break;
       case 'webpage':
         html += `
-          <div class="form-group"><label>${t('widget.field.url')}</label><input type="text" id="wUrl" class="input" value="${esc(config.url || '')}" placeholder="https://example.com"></div>
-          <div class="form-group"><label>${t('widget.field.zoom_pct')}</label><input type="number" id="wZoom" class="input" value="${Number(config.zoom) || 100}"></div>
-          <div class="form-group"><label>${t('widget.field.refresh_interval')}</label><input type="number" id="wRefresh" class="input" value="${Number(config.refresh_interval) || 0}"></div>
+          <div class="form-group"><label>${t('widget.field.url')}</label><input type="text" id="wUrl" class="input" value="${escAttr(config.url || '')}" placeholder="https://example.com"></div>
+          <div class="form-group"><label>${t('widget.field.zoom_pct')}</label><input type="number" id="wZoom" class="input" value="${escAttr(Number(config.zoom) || 100)}"></div>
+          <div class="form-group"><label>${t('widget.field.refresh_interval')}</label><input type="number" id="wRefresh" class="input" value="${escAttr(Number(config.refresh_interval) || 0)}"></div>
           <!-- #473: walk-up interactive page. Android players only; elsewhere it stays a passive page. -->
           <div class="form-group" style="padding:10px;border:1px dashed var(--border);border-radius:6px">
             <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
@@ -716,7 +739,9 @@ export async function render(container) {
             </label>
             <div id="wInteractiveOpts" style="margin-top:10px;${config.interactive ? '' : 'display:none'}">
               <div id="wInteractiveSupport" style="font-size:12px;color:var(--text-muted);margin-bottom:10px"></div>
-              <div class="form-group"><label>${t('widget.web.idle_timeout')}</label><input type="number" id="wIdle" class="input" min="15" max="3600" value="${Number(config.idle_timeout_sec) || 60}"></div>
+              <div class="form-group"><label>${t('widget.web.idle_timeout')}</label><input type="number" id="wIdle" class="input" min="15" max="3600" value="${escAttr(Number(config.idle_timeout_sec) || 60)}"></div>
+              <div class="form-group"><label>${t('widget.web.idle_warning')}</label>${idleWarningSelect(config)}
+                <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.web.idle_warning_hint')}</div></div>
               <div class="form-group"><label>${t('widget.web.allowed_domains')}</label><input type="text" id="wDomains" class="input" value="${esc(Array.isArray(config.allowed_domains) ? config.allowed_domains.join(', ') : (config.allowed_domains || ''))}" placeholder="${esc(t('widget.web.allowed_domains_ph'))}">
                 <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.web.allowed_domains_hint')}</div></div>
               <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;margin-bottom:8px">
@@ -727,16 +752,42 @@ export async function render(container) {
                 <input type="checkbox" id="wKeepConsent" ${config.keep_consent ? 'checked' : ''} style="margin-top:3px">
                 <span>${t('widget.web.keep_consent')}<br><span style="font-size:12px;color:var(--text-muted)">${t('widget.web.keep_consent_hint')}</span></span>
               </label>
+              <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;margin-top:8px">
+                <input type="checkbox" id="wWipeSite" ${config.wipe_site_data === false ? '' : 'checked'} style="margin-top:3px">
+                <span>${t('widget.web.wipe_site_data')}<br><span style="font-size:12px;color:var(--text-muted)">${t('widget.web.wipe_site_data_hint')}</span></span>
+              </label>
               <div id="wKeepNamesRow" class="form-group" style="margin-top:8px;${config.keep_consent ? '' : 'display:none'}"><label>${t('widget.web.keep_cookie_names')}</label><input type="text" id="wKeepNames" class="input" value="${esc(Array.isArray(config.keep_cookie_names) ? config.keep_cookie_names.join(', ') : (config.keep_cookie_names || ''))}" placeholder="${esc(t('widget.web.keep_cookie_names_ph'))}">
                 <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.web.keep_cookie_names_hint')}</div></div>
               <div style="font-size:12px;color:var(--text-muted);margin-top:8px">${t('widget.web.zoom_hint')}</div>
             </div>
           </div>`;
         break;
-      case 'social':
+      case 'cloud-doc':
+        // The server rebuilds the link (lib/cloud-docs.js); #wCloudCheck shows what it resolved to.
         html += `
-          <div class="form-group"><label>${t('widget.field.platform')}</label><select id="wPlatform" class="input" style="background:var(--bg-input)"><option value="twitter">${t('widget.field.platform_twitter')}</option><option value="instagram">${t('widget.field.platform_instagram')}</option></select></div>
-          <div class="form-group"><label>${t('widget.field.query')}</label><input type="text" id="wQuery" class="input" value="${esc(config.query || '')}" placeholder="${t('widget.field.query_placeholder')}"></div>`;
+          <div class="form-group"><label>${t('widget.cloud.url')}</label>
+            <textarea id="wCloudUrl" class="input" rows="2" spellcheck="false" placeholder="https://docs.google.com/presentation/d/…">${escAttr(config.url || '')}</textarea>
+            <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.cloud.url_hint')}</div>
+            <div id="wCloudCheck" style="font-size:12px;margin-top:6px"></div></div>
+          <div class="form-group"><label>${t('widget.cloud.delay')}</label><input type="number" id="wCloudDelay" class="input" min="1" max="3600" value="${escAttr(Number(config.delay_sec) || 10)}"></div>
+          <div class="form-group"><label>${t('widget.cloud.refresh')}</label><input type="number" id="wCloudRefresh" class="input" min="0" max="1440" value="${escAttr(config.refresh_min ?? '')}" placeholder="${escAttr(t('widget.cloud.refresh_ph'))}">
+            <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('widget.cloud.refresh_hint')}</div></div>
+          <div class="form-group"><label>${t('widget.field.zoom_pct')}</label><input type="number" id="wZoom" class="input" min="25" max="400" value="${escAttr(Number(config.zoom) || 100)}"></div>
+          <div class="form-group"><label>${t('widget.field.background')}</label><input type="color" id="wBg" value="${escAttr(config.background || '#000000')}" style="width:60px;height:32px;border:none"></div>`;
+        break;
+      case 'social':
+        html += `<div id="wSocialEditor"></div>`;
+        break;
+      case 'menu-board':
+        // components/menu-board-editor.js renders into this box once the modal is open.
+        html += `<div id="wMenuEditor"></div>`;
+        break;
+      case 'bi-dashboard':
+        html += `<div id="wBiEditor"></div>`;
+        break;
+      case 'room-display':
+        // components/room-display-editor.js renders into this box once the modal is open.
+        html += `<div id="wRoomEditor"></div>`;
         break;
       case 'directory-board':
         html += `
@@ -820,7 +871,7 @@ export async function render(container) {
           </div>
           <div class="form-group"><label>${t('widget.trans.params')}</label><div id="wTransParams"></div></div>
           <div class="form-group" style="max-width:220px"><label>${t('widget.trans.duration')}</label>
-            <input type="number" id="wTransDuration" class="input" value="${config.durationMs || 800}" min="150" max="3000" step="50"></div>
+            <input type="number" id="wTransDuration" class="input" value="${escAttr(config.durationMs || 800)}" min="150" max="3000" step="50"></div>
           <div class="form-group" style="max-width:300px"><label>${t('widget.trans.scope')}</label>
             <select id="wTransScope" class="input" style="background:var(--bg-input)">
               <option value="all" ${config.scope !== 'next' ? 'selected' : ''}>${t('widget.trans.scope_all')}</option>
@@ -832,11 +883,12 @@ export async function render(container) {
 
     document.getElementById('widgetConfigForm').innerHTML = html;
     const modalEl = document.querySelector('#widgetModal .modal');
-    if (modalEl) modalEl.style.width = type === 'directory-board' ? '720px' : (type === 'transition' ? '620px' : '560px');
+    if (modalEl) modalEl.style.width = type === 'menu-board' ? '860px' : type === 'directory-board' ? '720px' : (type === 'transition' ? '620px' : '560px');
     document.getElementById('widgetModal').style.display = 'flex';
     // Transitions carry their own live preview, so the iframe "Preview" button doesn't apply.
     const pvBtn = document.getElementById('previewWidgetBtn');
-    if (pvBtn) pvBtn.style.display = (type === 'transition') ? 'none' : '';
+    // A room display reads its saved room's live state, which an unsaved preview has no id for.
+    if (pvBtn) pvBtn.style.display = (type === 'transition' || type === 'room-display') ? 'none' : '';
 
     if (type === 'webpage') {
       const box = document.getElementById('wInteractive');
@@ -891,8 +943,43 @@ export async function render(container) {
       renderLogoPicker();
     }
 
+    if (type === 'menu-board') mountMenuEditor(document.getElementById('wMenuEditor'), config, { apiGet: (u) => API(u) });
+    if (type === 'cloud-doc') initCloudDocForm();
+    if (type === 'bi-dashboard') mountBiEditor(document.getElementById('wBiEditor'), config, { apiGet: (u) => API(u) });
+    if (type === 'social') mountSocialEditor(document.getElementById('wSocialEditor'), config, { apiGet: (u) => API(u) });
+    if (type === 'room-display') mountRoomEditor(document.getElementById('wRoomEditor'), config, {
+      get: (u) => API(u),
+      post: (u, b) => API(u, { method: 'POST', body: JSON.stringify(b || {}) }),
+      put: (u, b) => API(u, { method: 'PUT', body: JSON.stringify(b || {}) }),
+    });
     if (type === 'transition') initTransitionForm(config);
     if (type === 'clock') initClockForm();
+  }
+
+  function initCloudDocForm() {
+    const box = document.getElementById('wCloudUrl');
+    const out = document.getElementById('wCloudCheck');
+    if (!box || !out) return;
+    const KIND = { slides: t('widget.cloud.kind_slides'), doc: t('widget.cloud.kind_doc'), sheet: t('widget.cloud.kind_sheet'), office: t('widget.cloud.kind_office') };
+    let seq = 0;
+    const check = async () => {
+      const url = box.value.trim();
+      if (!url) { out.textContent = ''; return; }
+      const mine = ++seq;
+      try {
+        const r = await API('/widgets/cloud-doc/check', { method: 'POST', body: JSON.stringify({ url, delay_sec: document.getElementById('wCloudDelay')?.value }) });
+        if (mine !== seq) return;
+        out.style.color = 'var(--success,#15803d)';
+        out.innerHTML = `✓ ${esc(r.provider === 'google' ? 'Google' : 'Microsoft')} · ${esc(KIND[r.kind] || r.kind)} — <a href="${escAttr(r.url)}" target="_blank" rel="noopener noreferrer">${esc(t('widget.cloud.open'))}</a>`;
+      } catch (e) {
+        if (mine !== seq) return;
+        out.style.color = 'var(--danger,#b91c1c)';
+        out.textContent = e.message;
+      }
+    };
+    box.addEventListener('change', check);
+    box.addEventListener('blur', check);
+    check();
   }
 
   function initClockForm() {
@@ -1314,6 +1401,18 @@ export async function render(container) {
     }
   }
 
+  /* The "Still there?" warning before an interactive page resets, in seconds: Off / 5 / 10 / 20 s, plus whatever
+     value the widget already has (set through the API), so opening the form never changes it. */
+  function idleWarningSelect(cfg) {
+    const current = cfg ? cfg.idle_warning_sec : undefined;   // a number, clamped below; never markup
+    const cur = current === undefined || current === null || current === '' ? 10 : Math.min(60, Math.max(0, parseInt(current, 10) || 0));
+    const opts = [0, 5, 10, 20];
+    if (!opts.includes(cur)) opts.push(cur);
+    opts.sort((a, b) => a - b);
+    return `<select id="wIdleWarn" class="input" style="background:var(--bg-input)">${opts.map((n) =>
+      `<option value="${n}" ${n === cur ? 'selected' : ''}>${n === 0 ? esc(t('widget.web.idle_warning_off')) : esc(t('widget.web.idle_warning_sec', { n }))}</option>`).join('')}</select>`;
+  }
+
   function getConfigFromForm(type) {
     const config = {};
     const val = id => document.getElementById(id)?.value;
@@ -1342,6 +1441,8 @@ export async function render(container) {
       case 'rss': Object.assign(config, { feed_url: val('wFeedUrl'), scroll_speed: parseInt(val('wScrollSpeed')) || 30, max_items: parseInt(val('wMaxItems')) || 10, font_size: parseInt(val('wFontSize')) || 24, color: val('wColor'), background: val('wBg') }); break;
       case 'text': Object.assign(config, { html: val('wHtml'), css: val('wCss'), background: val('wBg') }); break;
       case 'webpage': {
+        // Start from what the form was filled from: keys it has no field for are kept, not dropped.
+        for (const [k, v] of Object.entries(formBaseConfig || {})) if (k !== '_name') config[k] = v;
         Object.assign(config, { url: val('wUrl'), zoom: parseInt(val('wZoom')) || 100, refresh_interval: parseInt(val('wRefresh')) || 0 });
         const on = !!document.getElementById('wInteractive')?.checked;
         config.interactive = on;
@@ -1349,6 +1450,8 @@ export async function render(container) {
           config.idle_timeout_sec = Math.min(3600, Math.max(15, parseInt(val('wIdle')) || 60));
           config.allowed_domains = String(val('wDomains') || '').split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
           config.home_button = !!document.getElementById('wHomeBtn')?.checked;
+          config.idle_warning_sec = Math.min(60, Math.max(0, parseInt(val('wIdleWarn'), 10) || 0));
+          config.wipe_site_data = !!document.getElementById('wWipeSite')?.checked;
           config.keep_consent = !!document.getElementById('wKeepConsent')?.checked;
           config.keep_cookie_names = config.keep_consent
             ? String(val('wKeepNames') || '').split(/[\s,]+/).map((d) => d.trim()).filter((d) => /^[A-Za-z0-9_.-]+[*]?$/.test(d) && d !== '*')
@@ -1356,7 +1459,17 @@ export async function render(container) {
         }
         break;
       }
-      case 'social': Object.assign(config, { platform: val('wPlatform'), query: val('wQuery') }); break;
+      case 'cloud-doc': {
+        const refresh = String(val('wCloudRefresh') || '').trim();
+        Object.assign(config, { url: val('wCloudUrl'), delay_sec: parseInt(val('wCloudDelay')) || 10, zoom: parseInt(val('wZoom')) || 100, background: val('wBg') || '#000000' });
+        if (refresh !== '') config.refresh_min = Math.max(0, parseInt(refresh) || 0);
+        break;
+      }
+      case 'social': Object.assign(config, readSocialConfig()); break;
+      case 'menu-board': Object.assign(config, readMenuConfig()); break;
+      case 'bi-dashboard': Object.assign(config, readBiConfig()); break;
+        break;
+      case 'room-display': Object.assign(config, readRoomConfig()); break;
       case 'transition': {
         const shaders = Array.from(document.querySelectorAll('#wTransList input[type=checkbox]:checked')).map(c => c.dataset.id);
         const params = {}; // per-shader tuned values held in transState.params
@@ -1458,9 +1571,9 @@ export async function render(container) {
           </div>
           <div class="content-item-actions">
             <button class="btn btn-secondary btn-sm" data-edit-widget="${escAttr(w.id)}">${t('common.edit')}</button>
-            <button class="btn btn-secondary btn-sm" data-duplicate-widget="${escAttr(w.id)}" title="${escAttr(t('widget.duplicate_hint'))}">${t('widget.duplicate')}</button>
-            <button class="btn btn-secondary btn-sm" data-history-widget="${escAttr(w.id)}" title="${t('history.button')}">${t('history.button')}</button>
-            <button class="btn btn-danger btn-sm" data-delete-widget="${escAttr(w.id)}">${t('common.delete')}</button>
+            <button class="btn btn-secondary btn-sm btn-icon-only" data-duplicate-widget="${escAttr(w.id)}" title="${escAttr(t('widget.duplicate_hint'))}" aria-label="${escAttr(t('widget.duplicate'))}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+            <button class="btn btn-secondary btn-sm btn-icon-only" data-history-widget="${escAttr(w.id)}" title="${t('history.button')}" aria-label="${t('history.button')}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg></button>
+            <button class="btn btn-danger btn-sm btn-icon-only" data-delete-widget="${escAttr(w.id)}" title="${t('common.delete')}" aria-label="${t('common.delete')}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
           </div>
           <div data-approval-widget="${escAttr(w.id)}" style="padding:0 12px 10px"></div>
         </div>

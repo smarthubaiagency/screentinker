@@ -82,6 +82,7 @@ router.post('/content', checkStorageLimit, upload.single('file'), async (req, re
   } catch (e) {
     // A non-media upload is the caller's error, not ours (lib/upload-sniff rejects it).
     if (e && e.name === 'UnsupportedUploadError') return res.status(400).json({ error: e.message });
+    if (e && e.name === 'StorageWriteError') { e.discard(); return res.status(502).json({ error: e.message }); }
     console.error('agency upload error:', e.message);
     res.status(500).json({ error: 'Upload failed' });
   }
@@ -100,6 +101,16 @@ router.post('/playlists/:playlistId/items', (req, res) => {
   // "key invalid" reset. This runs BEFORE the draft/publish branch, so auto-publish can't slip through.
   if (isZonedPlaylist(db, req.params.playlistId)) {
     return res.status(409).json({ error: "This playlist can't accept uploads right now — it's been assigned to a zone on a screen. Ask your contact." });
+  }
+
+  // CORPORATE: a token never writes head office's playlist, even one allowlisted before it became
+  // corporate (CORPORATE_TOKEN). The backstop would refuse the INSERT too; this is the clear answer.
+  {
+    const corpGuard = require('../lib/corporate/guard');
+    try { corpGuard.assertPlaylistWritable(req, { id: req.params.playlistId }, 'items'); } catch (e) {
+      if (corpGuard.send(res, e, req)) return;
+      throw e;
+    }
   }
 
   const content = db.prepare('SELECT id, workspace_id, duration_sec FROM content WHERE id = ?').get(content_id);
@@ -128,6 +139,13 @@ router.post('/playlists/:playlistId/items', (req, res) => {
   if (!(TIME_RE.test(en) || en === '24:00')) return res.status(400).json({ error: 'end must be HH:MM or 24:00' });
 
   { const smartErr = require('../lib/smart-playlist').smartAddError(db, req.params.playlistId); if (smartErr) return res.status(400).json({ error: smartErr }); }
+  // CORPORATE: an allowlisted store playlist may be the store's content for head office's local
+  // slot — the agency adds within the slot's limits like anyone else (publish re-checks them).
+  try { require('../lib/corporate/fills').assertCanAdd(db, req.params.playlistId, [{ content_id, duration_sec }]); } catch (e) {
+    const corpGuard = require('../lib/corporate/guard');
+    if (corpGuard.send(res, e, req)) return;
+    throw e;
+  }
   const order = db.prepare('SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM playlist_items WHERE playlist_id = ?').get(req.params.playlistId).n;
   const itemId = db.prepare('INSERT INTO playlist_items (playlist_id, content_id, sort_order, duration_sec) VALUES (?, ?, ?, ?)')
     .run(req.params.playlistId, content_id, order, duration_sec).lastInsertRowid;

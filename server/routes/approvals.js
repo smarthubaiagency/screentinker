@@ -13,6 +13,8 @@ const releases = require('../lib/releases');
 const { ReleaseError } = require('../lib/release-policy');
 
 function fail(res, e) {
+  // A head office refusal (the guard, or the backstop's RAISE) keeps its code and corporate block.
+  if (require('../lib/corporate/guard').send(res, e)) return undefined;
   if (e && (e.name === 'ApprovalError' || e.name === 'ReleaseError' || e.status)) {
     return res.status(e.status || 409).json({ error: e.message, code: e.code || null });
   }
@@ -86,9 +88,24 @@ router.get('/:id', requireWorkspaceRead, (req, res) => {
     diff_from_live: state ? revisions.diffStates(s.resource_type, live, state) : null,
     authors: [...approvals.authorsOf(db, s)],
     is_reviewer: approvals.isReviewer(db, req.workspaceId, req.user.id),
-    can_publish: canWrite(req),
+    ...publishRight(req, s),
   });
 });
+
+/*
+ * Head office (spec §6.2, R11): a reviewer in the HQ workspace may APPROVE a corporate playlist, but
+ * only a corporate author may PUBLISH it — publishPlaylist refuses anyone else. The queue says so
+ * ("Waiting for an admin to publish") instead of offering a Publish button that is refused.
+ */
+function publishRight(req, s) {
+  const write = canWrite(req);
+  if (s.resource_type !== 'playlist') return { can_publish: write };
+  const corpGuard = require('../lib/corporate/guard');
+  const g = corpGuard.governanceOf(db, s.resource_id);
+  if (g.kind !== 'corporate' && g.kind !== 'corporate_child') return { can_publish: write };
+  const author = !req.viaToken && corpGuard.canAuthor(req, g.orgId);
+  return { can_publish: write && author, waiting_for_author: !author, corporate: true };
+}
 
 router.post('/:id/withdraw', requireWorkspaceWrite, (req, res) => {
   if (!loadSubmission(req, res)) return;
@@ -97,10 +114,26 @@ router.post('/:id/withdraw', requireWorkspaceWrite, (req, res) => {
 });
 
 router.post('/:id/approve', requireWorkspaceWrite, (req, res) => {
-  if (!loadSubmission(req, res)) return;
-  try { res.json(approvals.decide(db, { submissionId: req.params.id, decision: 'approve', reviewer: actor(req), comment: req.body && req.body.comment, expectedVersion: req.body && req.body.version, ip: req.ip })); }
+  const sub = loadSubmission(req, res);
+  if (!sub) return;
+  try {
+    const out = approvals.decide(db, { submissionId: req.params.id, decision: 'approve', reviewer: actor(req), comment: req.body && req.body.comment, expectedVersion: req.body && req.body.version, ip: req.ip });
+    automationEvent(sub, 'content_approved');
+    res.json(out);
+  }
   catch (e) { fail(res, e); }
 });
+
+/** Zapier-style subscribers (lib/automation/events.js): what was approved / released, by name. */
+function automationEvent(sub, type) {
+  const table = { content: 'content', playlist: 'playlists', widget: 'widgets', layout: 'layouts' }[sub.resource_type];
+  let name = null;
+  try { if (table) { const r = db.prepare(`SELECT ${table === 'content' ? 'filename' : 'name'} AS n FROM ${table} WHERE id = ?`).get(sub.resource_id); name = r ? r.n : null; } } catch (_) { /* */ }
+  const data = type === 'playlist_published'
+    ? { playlist_id: sub.resource_id, playlist_name: name, submission_id: sub.id }
+    : { resource_type: sub.resource_type, resource_id: sub.resource_id, name, submission_id: sub.id };
+  require('../lib/automation/events').emit(db, sub.workspace_id, type, data);
+}
 
 router.post('/:id/request-changes', requireWorkspaceWrite, (req, res) => {
   if (!loadSubmission(req, res)) return;
@@ -119,6 +152,7 @@ router.post('/:id/publish', requireWorkspaceWrite, (req, res) => {
   if (s.status !== 'approved') return res.status(409).json({ error: `This submission is ${s.status.replace('_', ' ')}; only an approved submission can be published`, code: 'not_approved' });
   try {
     const out = releases.releaseDraft(db, s.resource_type, s.resource_id, req, { actor: actor(req) });
+    if (s.resource_type === 'playlist') automationEvent(s, 'playlist_published');
     res.json({ submission: approvals.getSubmission(db, s.id), released: true, changed: out && out.changed !== false });
   } catch (e) { fail(res, e); }
 });

@@ -7,7 +7,7 @@ const oidcProviders = require('../lib/oidc-providers');
 const { canAdminWorkspace } = require('../lib/permissions');
 const { requirePlatformAdmin, requireAdmin } = require('../middleware/auth');
 const { logActivity, getClientIp } = require('../services/activity');
-const { deleteWorkspaceCascade, deleteOrgCascade } = require('../lib/user-deletion');
+const { deleteWorkspaceCascade, deleteOrgCascade, releaseWorkspaceMember } = require('../lib/user-deletion');
 const { platformDefaultRow, HARDCODED_BRANDING, PLATFORM_DEFAULT_ID } = require('../lib/branding');
 
 // Admin-provisioned user creation (#10). Operates on a target workspace
@@ -221,6 +221,8 @@ router.delete('/orgs/:id', requirePlatformAdmin, (req, res) => {
   const org = db.prepare('SELECT id, name FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return res.status(404).json({ error: 'Organization not found' });
   try {
+    // Also removes the org's uploaded files + .history copies once the rows are committed gone
+    // (audit F23) - /uploads/content is public, so leaving them was not deleting the data.
     deleteOrgCascade(db, { orgId: org.id });
   } catch (e) {
     return res.status(500).json({ error: 'Failed to delete organization' });
@@ -266,8 +268,38 @@ router.put('/orgs/:id/talk', requirePlatformAdmin, (req, res) => {
 router.delete('/workspaces/:id', requirePlatformAdmin, (req, res) => {
   const ws = db.prepare('SELECT id, name, organization_id FROM workspaces WHERE id = ?').get(req.params.id);
   if (!ws) return res.status(404).json({ error: 'Workspace not found' });
+  /*
+   * ⚠️ CORPORATE (risk R17): an org's head office workspace holds the corporate playlists its
+   * mandates point at (a NO ACTION foreign key — the delete would fail at COMMIT with a bare
+   * FOREIGN KEY error). Refuse while any mandate uses them, saying where; otherwise let it go and
+   * clear the org's pointer to it.
+   */
+  {
+    let hqOf = [];
+    try { hqOf = db.prepare('SELECT id FROM organizations WHERE hq_workspace_id = ?').all(ws.id); } catch (_) { hqOf = []; /* pre-corporate schema */ }
+    if (hqOf.length) {
+      const inUse = db.prepare(`SELECT COUNT(*) AS n FROM corporate_mandates cm JOIN playlists p ON p.id = cm.playlist_id
+          WHERE p.workspace_id = ?`).get(ws.id).n;
+      if (inUse) {
+        const screens = db.prepare(`SELECT COUNT(*) AS n FROM device_resolved_playlist r JOIN playlists p ON p.id = r.playlist_id
+            WHERE p.workspace_id = ? AND r.source = 'corporate'`).get(ws.id).n;
+        const corpGuard = require('../lib/corporate/guard');
+        return corpGuard.send(res, corpGuard.err('CORPORATE_HQ_IN_USE', { workspace: ws.name, screens }), req);
+      }
+    }
+  }
   try {
-    deleteWorkspaceCascade(db, { workspaceId: ws.id });
+    // One transaction (audit F23 + corporate): the corporate cleanup runs INSIDE the cascade's own
+    // transaction, so it commits only with the delete it belongs to, and the files still go after commit.
+    deleteWorkspaceCascade(db, {
+      workspaceId: ws.id,
+      before: () => {
+        require('../lib/corporate/cleanup').removeWorkspaceTargets(db, ws.id);
+        try {
+          db.prepare('UPDATE organizations SET hq_workspace_id = NULL, corporate_enabled = 0 WHERE hq_workspace_id = ?').run(ws.id);
+        } catch (_) { /* pre-corporate schema: nothing points at it */ }
+      },
+    });
   } catch (e) {
     return res.status(500).json({ error: 'Failed to delete workspace' });
   }
@@ -314,6 +346,8 @@ router.put('/users/:id/workspace', requirePlatformAdmin, (req, res) => {
     db.prepare('DELETE FROM workspace_members WHERE user_id = ?').run(target.id);
     db.prepare('INSERT INTO workspace_members (workspace_id, user_id, role, invited_by) VALUES (?, ?, ?, ?)')
       .run(ws.id, target.id, 'workspace_viewer', req.user.id);
+    // A move leaves the old workspace: what they set up there under their own name goes with it.
+    releaseWorkspaceMember(db, { userId: target.id, workspaceIds: memberships.map(m => m.workspace_id).filter(id => id !== ws.id) });
   });
   txn();
 
@@ -446,7 +480,10 @@ router.put('/users/:id/workspaces/:workspaceId', requirePlatformAdmin, (req, res
 router.delete('/users/:id/workspaces/:workspaceId', requirePlatformAdmin, (req, res) => {
   const member = db.prepare('SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?').get(req.params.workspaceId, req.params.id);
   if (!member) return res.status(404).json({ error: 'Membership not found' });
-  db.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?').run(req.params.workspaceId, req.params.id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?').run(req.params.workspaceId, req.params.id);
+    releaseWorkspaceMember(db, { userId: req.params.id, workspaceIds: [req.params.workspaceId] });
+  })();
   req.workspaceId = req.params.workspaceId;
   const target = db.prepare('SELECT email FROM users WHERE id = ?').get(req.params.id);
   logActivity(req.user.id, 'admin_remove_user_workspace', `target: ${target?.email}, workspace: ${req.params.workspaceId}`, null, getClientIp(req), req.params.workspaceId);
@@ -564,9 +601,9 @@ router.put('/telemetry', requirePlatformAdmin, async (req, res) => {
 
 // ===================== Version update indicator =====================
 // check-update = requireAdmin — a read-only GHCR poll, operational.
-// trigger-update = requirePlatformAdmin — it runs `docker compose up -d` on the
-// HOST via docker.sock (root-equivalent), so it's restricted to platform-owner
-// level; DOCKER_UPDATE_ENABLED gates it further (off by default).
+// trigger-update / update-status = requirePlatformAdmin — they queue and watch an upgrade of
+// the whole instance. The work is done by the separate host-side updater (lib/instance-updater.js,
+// docs/instance-updater.md), never by this process.
 
 const ghcrCheck = require('../lib/ghcr-check');
 const VERSION = require('../version');
@@ -618,29 +655,48 @@ function detectInstall() {
   return { kind: 'unknown', command: null };
 }
 
-// POST /api/admin/trigger-update — run docker compose pull && up -d where this instance is
-// actually docker-managed, otherwise hand back the command that suits how it IS installed.
-router.post('/trigger-update', requirePlatformAdmin, async (req, res) => {
-  const { exec } = require('child_process');
-  const install = detectInstall();
-  const cmd = install.command;
-
-  if (install.kind !== 'docker' || !require('../config').dockerUpdateEnabled) {
+// POST /api/admin/trigger-update — queue an upgrade for the host-side updater, when one is
+// installed; otherwise hand back the command that suits how this instance IS installed.
+//
+// ⚠️ This used to exec `docker compose pull && up -d` from inside the app (DOCKER_UPDATE_ENABLED).
+// That could never work: the image has no docker CLI, and a container recreating itself kills the
+// command half way. The updater is a separate process precisely so the upgrade outlives the restart.
+router.post('/trigger-update', requirePlatformAdmin, (req, res) => {
+  const updater = require('../lib/instance-updater');
+  const u = updater.info();
+  if (!u.available) {
+    const install = detectInstall();
     return res.json({
-      docker_enabled: false,
+      queued: false,
+      updater: u,
       install: install.kind,
-      instructions: cmd
+      instructions: install.command
         || 'This instance was not installed in a way the server recognises, so there is no safe command to suggest. See docs/operations.md for the upgrade steps.',
     });
   }
+  const target = (req.body && req.body.target) || ghcrCheck.getLatestVersion();
+  try {
+    const job = updater.requestUpdate({ target, current: VERSION, userId: req.user.id });
+    logActivity(req.user.id, 'admin_trigger_update', `queued upgrade v${VERSION} -> v${job.target} (${job.kind} updater)`, null, getClientIp(req), null);
+    res.json({ queued: true, ...job });
+  } catch (e) {
+    if (e instanceof updater.UpdaterError) return res.status(e.code === 'busy' ? 409 : 400).json({ error: e.message, code: e.code });
+    console.error('[updater] could not queue the request:', e && e.message);
+    res.status(500).json({ error: 'Could not queue the upgrade request' });
+  }
+});
 
-  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
-    const output = (stdout || '') + (stderr || '');
-    if (err) {
-      return res.json({ success: false, output, docker_enabled: true, error: err.message });
-    }
-    logActivity(req.user.id, 'admin_trigger_update', `docker compose up -d`, null, getClientIp(req), null);
-    res.json({ success: true, output, docker_enabled: true });
+// GET /api/admin/update-status — what the dashboard polls while an upgrade runs (and across the
+// restart: the status lives outside this process).
+router.get('/update-status', requirePlatformAdmin, (req, res) => {
+  const updater = require('../lib/instance-updater');
+  const latest = ghcrCheck.getLatestVersion();
+  res.json({
+    current: VERSION,
+    latest: latest || null,
+    update_available: latest ? ghcrCheck.compareVersions(latest, VERSION) > 0 : false,
+    updater: updater.info(),
+    ...updater.status(),
   });
 });
 
@@ -686,7 +742,46 @@ router.get('/plans', requirePlatformAdmin, (req, res) => {
      WHERE u.plan_id IS NOT NULL AND u.plan_id NOT IN (SELECT id FROM plans)
      GROUP BY u.plan_id
   `).all();
-  res.json({ plans, orphaned });
+  res.json({ plans, orphaned, stripe_configured: !!require('../lib/stripe-client').get() });
+});
+
+/*
+ * Edit and create plans (lib/plan-admin.js). Platform admin only: a plan's limits apply at once to
+ * every account on it, and its linked Stripe prices are what new customers are charged. A save is
+ * refused while a shown price disagrees with the Stripe price linked to it.
+ */
+function sendPlanError(res, e) {
+  const { PlanError } = require('../lib/plan-admin');
+  if (e instanceof PlanError) return res.status(e.status).json({ error: e.message, field: e.field });
+  console.error('[admin/plans]', e);
+  return res.status(500).json({ error: 'The plan could not be saved' });
+}
+
+router.get('/plans/:id/impact', requirePlatformAdmin, (req, res) => {
+  if (!db.prepare('SELECT 1 FROM plans WHERE id = ?').get(req.params.id)) return res.status(404).json({ error: 'Plan not found' });
+  res.json(require('../lib/plan-admin').impactOf(db, req.params.id));
+});
+
+router.put('/plans/:id', requirePlatformAdmin, async (req, res) => {
+  const planAdmin = require('../lib/plan-admin');
+  try {
+    const before = db.prepare('SELECT * FROM plans WHERE id = ?').get(req.params.id);
+    const r = await planAdmin.updatePlan(db, require('../lib/stripe-client').get(), req.params.id, req.body);
+    if (r.changed.length) {
+      const detail = r.changed.map((k) => `${k}: ${before[k] === null ? '—' : before[k]} → ${r.plan[k] === null ? '—' : r.plan[k]}`).join(', ');
+      logActivity(req.user.id, 'admin_update_plan', `${r.plan.display_name} (${r.plan.id}): ${detail}`.slice(0, 1000), null, getClientIp(req), null);
+    }
+    res.json({ plan: r.plan, changed: r.changed, warnings: r.stripe.warnings, stripe_checked: r.stripe.checked, impact: planAdmin.impactOf(db, r.plan.id) });
+  } catch (e) { sendPlanError(res, e); }
+});
+
+router.post('/plans', requirePlatformAdmin, async (req, res) => {
+  const planAdmin = require('../lib/plan-admin');
+  try {
+    const r = await planAdmin.createPlan(db, require('../lib/stripe-client').get(), req.body);
+    logActivity(req.user.id, 'admin_create_plan', `${r.plan.display_name} (${r.plan.id})`, null, getClientIp(req), null);
+    res.status(201).json({ plan: r.plan, warnings: r.stripe.warnings, stripe_checked: r.stripe.checked });
+  } catch (e) { sendPlanError(res, e); }
 });
 
 // ─── Sales / limited-time discounts (lib/promotions.js) ─────────────────────────

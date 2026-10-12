@@ -98,6 +98,9 @@ module.exports = {
   // Scale-out C3: disk a replica may spend on cached media, PER primary (edge). 10 GiB unless set.
   replicaCacheBytes: (() => { const n = Number(process.env.REPLICA_CACHE_BYTES); return Number.isFinite(n) && n > 0 ? Math.floor(n) : 10 * 1024 * 1024 * 1024; })(),
   primaryRedirect: ['1', 'true', 'yes'].includes(String(process.env.PRIMARY_REDIRECT || '').toLowerCase()),
+  // Browser origins allowed to call /mcp cross-origin (comma-separated, exact match). Empty = none:
+  // MCP clients are native or server-side and need no CORS. See the note on mcpCors in server.js.
+  mcpCorsOrigins: String(process.env.MCP_CORS_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean),
 
   /* ==========================================================================================
    * PLUGINS — off by default and INVISIBLE.
@@ -221,6 +224,21 @@ module.exports = {
   // Redirect / -> /app instead of serving the marketing landing page.
   // For self-hosted internal deployments that don't want the public homepage.
   disableHomepage: ['true', '1'].includes(String(process.env.DISABLE_HOMEPAGE || '').toLowerCase()),
+  /*
+   * View-only display access (lib/view-access.js): a read-only /view/<token> link per display, off
+   * per display until an admin turns it on. This switch removes the feature from the whole instance.
+   * Default: ON for self-hosted, OFF for the hosted cloud; VIEW_ONLY_ENABLED=true|false overrides.
+   */
+  viewOnlyEnabled: process.env.VIEW_ONLY_ENABLED !== undefined && process.env.VIEW_ONLY_ENABLED !== ''
+    ? ['true', '1'].includes(String(process.env.VIEW_ONLY_ENABLED).toLowerCase())
+    : process.env.SELF_HOSTED === 'true',
+  /*
+   * Proxies whose X-Forwarded-For the view-only NETWORK check believes (comma-separated IPs/CIDRs,
+   * or proxy-addr names such as loopback). Empty = believe only the TCP peer. ⚠️ Deliberately NOT the
+   * app-wide trust list, which trusts every private address and would let any LAN host claim to be
+   * inside an allowed range.
+   */
+  viewTrustedProxies: String(process.env.VIEW_TRUSTED_PROXIES || '').split(',').map((s) => s.trim()).filter(Boolean),
   // Issue #12: auto-create a personal org + Default workspace for self-service
   // signups (public register + OAuth). Defaults TRUE so single-tenant and the
   // hosted self-service flow are unaffected; set AUTO_CREATE_ORG_ON_SIGNUP=false
@@ -400,6 +418,34 @@ module.exports = {
     accrualBatch: parseInt(process.env.BILLING_ACCRUAL_BATCH) || 2000,
     accrualCapSeconds: parseInt(process.env.BILLING_ACCRUAL_CAP_SECONDS) || 30,
   },
+
+  /*
+   * Hosted AI images (docs/ai-credits.md). Platform-level provider hooks that spend ORG credits —
+   * separate from the bring-your-own ai_settings path, which never touches credits.
+   *
+   * ⚠️ NO API KEYS LIVE IN THIS OBJECT. lib/ai-hosted.js reads XAI_API_KEY / OPENAI_API_KEY /
+   * AI_HOSTED_COMPAT_API_KEY from process.env at call time, so a JSON.stringify(config) anywhere
+   * (diagnostics, a debug log) cannot leak one. A provider is offered only when its key is set.
+   */
+  aiHosted: {
+    xaiBaseUrl: (process.env.XAI_BASE_URL || 'https://api.x.ai/v1').replace(/\/+$/, ''),
+    openaiBaseUrl: (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, ''),
+    // Optional future OpenAI-compatible image provider. Both this AND its key must be set.
+    compatBaseUrl: (process.env.AI_HOSTED_COMPAT_BASE_URL || '').replace(/\/+$/, ''),
+    // Customer price = provider cost × markup, rounded up to the cent.
+    markup: 2,
+    // Included monthly allotment = this share of the org's screen bill (lib/billing.js formula).
+    includedShare: 0.10,
+    // Extra rate-card rows (JSON array, same shape as config/ai-rate-card.js) — add a verified
+    // model without a code change.
+    extraRateCard: (() => {
+      try { const v = JSON.parse(process.env.AI_HOSTED_RATE_CARD || '[]'); return Array.isArray(v) ? v : []; }
+      catch { console.warn('[config] AI_HOSTED_RATE_CARD is not valid JSON — ignored'); return []; }
+    })(),
+    // A reservation still pending after this long is a crashed attempt: refunded at boot / on sweep.
+    reservationStaleSec: parseInt(process.env.AI_HOSTED_RESERVATION_STALE_SEC) || 900,
+    providerTimeoutMs: parseInt(process.env.AI_HOSTED_TIMEOUT_MS) || 120000,
+  },
   // #146 Item E — coalescing log flush + batched event_loop_lag telemetry.
   logCoalesceFlushMs: parseInt(process.env.LOG_COALESCE_FLUSH_MS) || 30000,
   lagFlushMs: parseInt(process.env.LAG_FLUSH_MS) || 10000,
@@ -472,7 +518,6 @@ module.exports = {
 
   // Version update indicator — polls GHCR for the latest Docker image tag via
   // anonymous token flow. All optional with safe defaults.
-  dockerUpdateEnabled: process.env.DOCKER_UPDATE_ENABLED === 'true',
   ghcrCheckIntervalHours: parseInt(process.env.GHCR_CHECK_INTERVAL_HOURS) || 36,
   composeFilePath: process.env.COMPOSE_FILE_PATH || '/opt/screentinker/docker-compose.yml',
 

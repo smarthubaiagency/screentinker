@@ -110,7 +110,7 @@ function releaseLayoutDraft(db, layoutId, req, { actor } = {}) {
     applyZones(db, layoutId, Array.isArray(draft.zones) ? draft.zones : []);
     policy.afterRelease(db, { type: 'layout', id: layoutId, gate, actor: actor || actorOf(req), summary: 'Published' });
   })();
-  pushDevices(req, db.prepare('SELECT id FROM devices WHERE layout_id = ?').all(layoutId).map((r) => r.id));
+  pushDevices(req, db.prepare(require('./wall-layout').SCREENS_ON_LAYOUT_SQL).all(layoutId, layoutId).map((r) => r.id));
   audit('release:layout', { userId: actor && actor.userId, workspaceId: l.workspace_id, details: { layout_id: layoutId, submission_id: gate.submission ? gate.submission.id : null } });
   return { gate };
 }
@@ -130,7 +130,9 @@ function releaseContentDraft(db, contentId, req, { actor } = {}) {
   const draft = revisions.parseJson(c.draft_json, null);
   if (!draft) { const e = new Error('This item has no unpublished draft'); e.status = 400; throw e; }
   const gate = policy.assertReleasable(db, { workspaceId: c.workspace_id, type: 'content', id: contentId });
-  if (draft.filepath && !fs.existsSync(path.join(config.contentDir, path.basename(draft.filepath)))) {
+  // A draft that keeps the live bytes (draft.filepath === the live one) needs no local file: the live
+  // copy may be in a storage backend (lib/storage). Only NEW draft bytes must be on disk.
+  if (draft.filepath && draft.filepath !== c.filepath && !fs.existsSync(path.join(config.contentDir, path.basename(draft.filepath)))) {
     const e = new Error('The draft file is missing on disk; upload it again'); e.status = 409; throw e;
   }
   const prevRev = revisions.latest(db, 'content', contentId);
@@ -159,11 +161,22 @@ function releaseContentDraft(db, contentId, req, { actor } = {}) {
     policy.afterRelease(db, { type: 'content', id: contentId, gate, actor: actor || actorOf(req), summary: 'Published' });
   })();
   pushDevices(req, require('./devices-playing').devicesPlayingContent(contentId));
+  // The released draft's bytes are a local file; if this workspace writes to a bucket they move
+  // there now (lib/storage). Until that finishes — or if it fails — the local copy serves.
+  if (draft.filepath && draft.filepath !== c.filepath) require('./storage/locations').settleSoon(contentId, { kinds: ['asset', 'thumb'] });
   audit('release:content', { userId: actor && actor.userId, workspaceId: c.workspace_id, details: { content_id: contentId, submission_id: gate.submission ? gate.submission.id : null } });
   return { gate };
 }
 
 function releaseDraft(db, type, id, req, opts) {
+  /*
+   * ⚠️ CORPORATE (critique H7): approvals publish and revisions publish-draft release here without
+   * passing the media routes' write checks, so the org-owned media rule is applied at the release
+   * itself. Playlists are checked inside publishPlaylist; a deck through its playlist here.
+   */
+  if (type === 'widget' || type === 'layout' || type === 'content' || type === 'slide_deck') {
+    require('./corporate/guard').assertMediaWritable(req, type, id);
+  }
   if (type === 'widget') return releaseWidgetDraft(db, id, req, opts);
   if (type === 'layout') return releaseLayoutDraft(db, id, req, opts);
   if (type === 'content') return releaseContentDraft(db, id, req, opts);
@@ -172,7 +185,8 @@ function releaseDraft(db, type, id, req, opts) {
   const e = new Error('Unknown resource type'); e.status = 400; throw e;
 }
 
-function discardDraft(db, type, id) {
+function discardDraft(db, type, id, req) {
+  if (req) require('./corporate/guard').assertMediaWritable(req, type, id);
   if (type === 'widget') db.prepare('UPDATE widgets SET draft_config = NULL WHERE id = ?').run(id);
   else if (type === 'layout') db.prepare('UPDATE layouts SET draft_zones = NULL WHERE id = ?').run(id);
   else if (type === 'content') {

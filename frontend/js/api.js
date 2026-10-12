@@ -1,5 +1,51 @@
 const API_BASE = '/api';
 
+// The admin's own IANA zone, sent when pairing so a display still on its OS image's default zone
+// (Raspberry Pi OS ships Europe/London) can be set to where its admin is. A zone name only: no
+// location. undefined where the browser can't say.
+export function browserTimezone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined; } catch (_) { return undefined; }
+}
+
+/*
+ * The Error a failed request throws. ⚠️ Its MESSAGE IS UNCHANGED from what every caller has always
+ * read (the server's `error` text), so `catch (e) { showToast(e.message) }` behaves exactly as
+ * before. What is new rides beside it: `status`, `code` and the whole `body`, so a caller that needs
+ * more — the corporate slot list, which mandate shadows a screen — no longer loses it here.
+ *
+ * Head office (corporate) refusals carry a `code` (CORPORATE_*, FILL_*) and are shown in the
+ * viewer's language from i18n (`corp.err.<CODE>`), falling back to the server's own text when no
+ * key exists — never the raw key.
+ *
+ * ⚠️ The translator is INJECTED (app.js calls setErrorTranslator(t) at startup) rather than imported:
+ * api.js is loaded on its own by tests and tools with nothing but fetch/localStorage stubbed, and an
+ * i18n import would drag navigator/locale state into every one of them.
+ */
+let translate = null;
+export function setErrorTranslator(fn) { translate = typeof fn === 'function' ? fn : null; }
+
+export function requestError(status, body) {
+  const b = body && typeof body === 'object' ? body : {};
+  let msg = b.error || 'Request failed';
+  const code = typeof b.code === 'string' ? b.code : null;
+  if (code && translate && /^(CORPORATE_|FILL_)/.test(code)) {
+    const t = translate;
+    const key = `corp.err.${code}`;
+    const corp = b.corporate || {};
+    const vars = {
+      name: corp.playlist_name || '', target: (corp.mandate_target && corp.mandate_target.label) || '',
+    };
+    const template = t(key);
+    if (template !== key) {
+      // Only when every placeholder the translation needs can be filled; otherwise the server's
+      // own sentence (which always names things correctly) is the better message.
+      const needed = [...template.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
+      if (needed.every((k) => vars[k])) msg = t(key, vars);
+    }
+  }
+  return Object.assign(new Error(msg), { status, code, body: b });
+}
+
 export function getAuthHeaders() {
   const token = localStorage.getItem('token');
   return token ? { Authorization: `Bearer ${token}` } : {};
@@ -209,6 +255,9 @@ async function meshWrite(routed, options) {
   return payload.result ?? payload;
 }
 
+// DELETE has no body: an acknowledgement rides in the query string.
+function ackQuery(opts) { return opts && opts.acknowledge_impact ? '?acknowledge_impact=1' : ''; }
+
 async function request(url, options = {}) {
   const routed = remoteRoute(url, options.method);
   if (routed && routed.refuse) throw new Error(routed.refuse);
@@ -245,7 +294,7 @@ async function request(url, options = {}) {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || 'Request failed');
+    throw requestError(res.status, err);
   }
   return res.json();
 }
@@ -365,7 +414,7 @@ export const api = {
   // Provisioning
   pairDevice: (pairing_code, name) => request('/provision/pair', {
     method: 'POST',
-    body: JSON.stringify({ pairing_code, name })
+    body: JSON.stringify({ pairing_code, name, browser_timezone: browserTimezone() })
   }),
 
   // Content
@@ -429,6 +478,26 @@ export const api = {
   batchMoveContent: (ids, folderId) => request('/content/batch/move', {
     method: 'POST',
     body: JSON.stringify({ ids, folder_id: folderId || null })
+  }),
+
+  // The Content Library page (server lib/content-library.js): one page of results with the real
+  // total and each row's usage. `opts` are the page's own state; only set values are sent.
+  // folderId: undefined = the whole workspace ("All content"), null = the root, <id> = that folder.
+  getLibraryPage: (opts = {}, signal) => {
+    const p = new URLSearchParams({ envelope: '1' });
+    const q = (opts.q || '').trim();
+    if (!q && opts.folderId !== undefined) p.set('folder_id', opts.folderId === null ? 'root' : opts.folderId);
+    if (q) p.set('q', q);
+    for (const k of ['type', 'status', 'usage', 'scope', 'sort']) if (opts[k] && opts[k] !== 'all') p.set(k, opts[k]);
+    p.set('limit', String(opts.limit || 48));
+    p.set('offset', String(opts.offset || 0));
+    return request(`/content?${p.toString()}`, signal ? { signal } : undefined);
+  },
+  getLibrarySummary: () => request('/content/library-summary'),
+  getContentUsage: (id) => request(`/content/${id}/usage`),
+  batchTagContent: (ids, add, remove) => request('/content/batch/tags', {
+    method: 'POST',
+    body: JSON.stringify({ ids, ...(add && add.length ? { add } : {}), ...(remove && remove.length ? { remove } : {}) })
   }),
 
   // Folders
@@ -547,20 +616,22 @@ export const api = {
     return wasBatch ? out : out[0];
   },
 
-  addRemoteContent: (url, name, mime_type) => request('/content/remote', {
+  // folderId (optional, the library's destination): the new item is filed there instead of the root.
+  addRemoteContent: (url, name, mime_type, folderId) => request('/content/remote', {
     method: 'POST',
-    body: JSON.stringify({ url, name, mime_type })
+    body: JSON.stringify({ url, name, mime_type, ...(folderId ? { folder_id: folderId } : {}) })
   }),
 
-  addYoutubeContent: (url, name) => request('/content/youtube', {
+  addYoutubeContent: (url, name, folderId) => request('/content/youtube', {
     method: 'POST',
-    body: JSON.stringify({ url, name })
+    body: JSON.stringify({ url, name, ...(folderId ? { folder_id: folderId } : {}) })
   }),
 
   // IPTV: add a live HLS stream (the player opens the .m3u8 on its LAN; the server never fetches it).
-  addHlsContent: (url, name) => request('/content/hls', {
+  addHoldContent: (mode, name, folderId) => request('/content/hold', { method: 'POST', body: JSON.stringify({ mode, name, ...(folderId ? { folder_id: folderId } : {}) }) }),
+  addHlsContent: (url, name, folderId) => request('/content/hls', {
     method: 'POST',
-    body: JSON.stringify({ url, name })
+    body: JSON.stringify({ url, name, ...(folderId ? { folder_id: folderId } : {}) })
   }),
 
   // Assignments
@@ -597,11 +668,14 @@ export const api = {
   getGroups: () => request('/groups'),
   createGroup: (name, color) => request('/groups', { method: 'POST', body: JSON.stringify({ name, color }) }),
   updateGroup: (id, data) => request(`/groups/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  groupRulesPreview: (rules) => request('/groups/rules-preview', { method: 'POST', body: JSON.stringify({ rules }) }),
   resyncGroup: (id) => request(`/groups/${id}/resync`, { method: 'POST' }),
-  deleteGroup: (id) => request(`/groups/${id}`, { method: 'DELETE' }),
+  // opts.acknowledge_impact: resend after the person ticked "I've checked these" (store triggers
+  // the change would hide — components/corporate-ui.js withImpactAck).
+  deleteGroup: (id, opts = {}) => request(`/groups/${id}${ackQuery(opts)}`, { method: 'DELETE' }),
   getGroupDevices: (id) => request(`/groups/${id}/devices`),
-  addDeviceToGroup: (groupId, device_id) => request(`/groups/${groupId}/devices`, { method: 'POST', body: JSON.stringify({ device_id }) }),
-  removeDeviceFromGroup: (groupId, deviceId) => request(`/groups/${groupId}/devices/${deviceId}`, { method: 'DELETE' }),
+  addDeviceToGroup: (groupId, device_id, opts = {}) => request(`/groups/${groupId}/devices`, { method: 'POST', body: JSON.stringify({ device_id, ...opts }) }),
+  removeDeviceFromGroup: (groupId, deviceId, opts = {}) => request(`/groups/${groupId}/devices/${deviceId}${ackQuery(opts)}`, { method: 'DELETE' }),
   sendGroupCommand: (groupId, type, payload) => request(`/groups/${groupId}/command`, { method: 'POST', body: JSON.stringify({ type, payload }) }),
   // #312 follow-up: fan a command out to every device in a workspace (admin-gated server-side).
   // Used for the workspace-wide server-URL rewrite when a server is relocated.
@@ -610,9 +684,12 @@ export const api = {
   // Video walls
   getWalls: () => request('/walls'),
   createWall: (data) => request('/walls', { method: 'POST', body: JSON.stringify(data) }),
-  setWallDevices: (id, devices) => request(`/walls/${id}/devices`, { method: 'PUT', body: JSON.stringify({ devices }) }),
+  setWallDevices: (id, devices, opts = {}) => request(`/walls/${id}/devices`, { method: 'PUT', body: JSON.stringify({ devices, ...opts }) }),
   updateWall: (id, data) => request(`/walls/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  deleteWall: (id) => request(`/walls/${id}`, { method: 'DELETE' }),
+  deleteWall: (id, opts = {}) => request(`/walls/${id}${ackQuery(opts)}`, { method: 'DELETE' }),
+  // Move screens to another workspace of the same organization (admins of both).
+  previewMoveDevices: (ids, workspaceId, { bring = false } = {}) => request(`/devices/move-workspace/preview?device_ids=${encodeURIComponent(ids.join(','))}&workspace_id=${encodeURIComponent(workspaceId)}${bring ? '&bring_playlist=1' : ''}`),
+  moveDevices: (ids, workspaceId, opts = {}) => request('/devices/move-workspace', { method: 'POST', body: JSON.stringify({ device_ids: ids, workspace_id: workspaceId, ...opts }) }),
 
   // Playlists
   getPlaylists: () => request('/playlists'),
@@ -641,6 +718,10 @@ export const api = {
   // #313: mint or roll the enrolment key that lets a storage-less web player identify itself.
   createEnrolKey: (id) => request(`/devices/${id}/enrol-key`, { method: 'POST' }),
   revokeEnrolKey: (id) => request(`/devices/${id}/enrol-key`, { method: 'DELETE' }),
+  // View-only access (server lib/view-access.js)
+  getViewAccess: (id) => request(`/devices/${id}/view`),
+  updateViewAccess: (id, body) => request(`/devices/${id}/view`, { method: 'PUT', body: JSON.stringify(body) }),
+  regenerateViewLink: (id) => request(`/devices/${id}/view/regenerate`, { method: 'POST' }),
   assignPlaylistToDevice: (playlistId, device_id) => request(`/playlists/${playlistId}/assign`, { method: 'POST', body: JSON.stringify({ device_id }) }),
   clearDevicePlaylist: (device_id) => request(`/devices/${device_id}/playlist`, { method: 'DELETE' }),
   publishPlaylist: (id) => request(`/playlists/${id}/publish`, { method: 'POST' }),
@@ -726,6 +807,9 @@ export const api = {
   adminListOrgs: () => request('/admin/orgs'),
   // Platform-admin view: EVERY plan incl. hidden ones, with subscriber counts.
   adminListPlans: () => request('/admin/plans'),
+  adminPlanImpact: (id) => request(`/admin/plans/${encodeURIComponent(id)}/impact`),
+  adminUpdatePlan: (id, data) => request(`/admin/plans/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(data) }),
+  adminCreatePlan: (data) => request('/admin/plans', { method: 'POST', body: JSON.stringify(data) }),
   adminListPromotions: () => request('/admin/promotions'),
   adminCreatePromotion: (body) => request('/admin/promotions', { method: 'POST', body: JSON.stringify(body) }),
   adminEndPromotion: (id) => request(`/admin/promotions/${encodeURIComponent(id)}/end`, { method: 'POST' }),
@@ -758,6 +842,15 @@ export const api = {
   aiGenerateLayered: (prompt, dims, objects) => request('/ai/generate-layered', {
     method: 'POST', body: JSON.stringify({ prompt, ...(dims || {}), objects }),
   }),
+  /*
+   * ScreenTinker-hosted images, paid in ORG credits (server/routes/ai-hosted.js). The caller always
+   * names provider/model/resolution/quality — the server has no default — and sends a fresh
+   * idempotency_key per click so a network retry cannot charge twice.
+   */
+  aiHostedStatus: () => request('/ai/hosted/status'),
+  aiHostedUsage: () => request('/ai/hosted/usage'),
+  aiHostedGenerate: (body) => request('/ai/hosted/generate', { method: 'POST', body: JSON.stringify(body) }),
+  aiHostedCheckout: (pack_id) => request('/ai/hosted/checkout', { method: 'POST', body: JSON.stringify({ pack_id }) }),
   aiListModels: (base_url, api_key) => request('/ai/models', { method: 'POST', body: JSON.stringify({ base_url, api_key }) }),
 
   // Instance-level default branding (#15, platform admin).
@@ -827,7 +920,56 @@ export const api = {
   deleteDataSource: (id) => request(`/data-sources/${id}`, {
     method: 'DELETE'
   }),
+
+  // ── Head office (corporate) playlists — /api/corporate, JWT-only. docs/corporate-playlists.md
+  getCorporateSettings: () => request('/corporate/settings'),
+  updateCorporateSettings: (data) => request('/corporate/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  getStoreTriggerImpact: (policy, capSec) => request(`/corporate/settings/store-trigger-impact?policy=${encodeURIComponent(policy)}${capSec ? `&cap_sec=${capSec}` : ''}`),
+  getCorporateWorkspace: () => request('/corporate/workspace'),
+  getCorporateTargets: () => request('/corporate/targets'),
+  getCorporatePlaylists: () => request('/corporate/playlists'),
+  getCorporatePlaylist: (id) => request(`/corporate/playlists/${id}`),
+  createCorporatePlaylist: (name, description) => request('/corporate/playlists', { method: 'POST', body: JSON.stringify({ name, description }) }),
+  promoteCorporatePlaylist: (id) => request(`/corporate/playlists/${id}/promote`, { method: 'POST' }),
+  demoteCorporatePlaylist: (id) => request(`/corporate/playlists/${id}/demote`, { method: 'POST' }),
+  getMandates: () => request('/corporate/mandates'),
+  previewMandate: (params) => request(`/corporate/mandates/preview?${new URLSearchParams(params).toString()}`),
+  createMandate: (data) => request('/corporate/mandates', { method: 'POST', body: JSON.stringify(data) }),
+  updateMandate: (id, data) => request(`/corporate/mandates/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteMandate: (id) => request(`/corporate/mandates/${id}`, { method: 'DELETE' }),
+  previewCorporateScreen: (deviceId, draft) => request(`/corporate/preview?device_id=${encodeURIComponent(deviceId)}${draft ? '&draft=1' : ''}`),
+  createSlot: (playlistId, data) => request(`/corporate/playlists/${playlistId}/slots`, { method: 'POST', body: JSON.stringify(data) }),
+  getSlot: (id) => request(`/corporate/slots/${id}`),
+  updateSlot: (id, data) => request(`/corporate/slots/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteSlot: (id) => request(`/corporate/slots/${id}`, { method: 'DELETE' }),
+  getSlotImpact: (id, params) => request(`/corporate/slots/${id}/impact?${new URLSearchParams(params).toString()}`),
+  getSlotFills: (id) => request(`/corporate/slots/${id}/fills`),
+  createFill: (slotId, data) => request(`/corporate/slots/${slotId}/fills`, { method: 'POST', body: JSON.stringify(data) }),
+  deleteFill: (id) => request(`/corporate/fills/${id}`, { method: 'DELETE' }),
+  previewFill: (id, deviceId) => request(`/corporate/fills/${id}/preview${deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : ''}`),
+  getCorporateStore: () => request('/corporate/store'),
+  getSlotReport: (problemsOnly) => request(`/corporate/reports/slots${problemsOnly ? '?problems=1' : ''}`),
+  getAirtimeReport: (from, to) => request(`/corporate/reports/plays?from=${from}&to=${to}`),
+  getEmergencyAlerts: () => request('/corporate/emergency'),
+  createEmergencyAlert: (data) => request('/corporate/emergency', { method: 'POST', body: JSON.stringify(data) }),
+  updateEmergencyAlert: (id, data) => request(`/corporate/emergency/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteEmergencyAlert: (id) => request(`/corporate/emergency/${id}`, { method: 'DELETE' }),
+  getEmergencyCoverage: (id) => request(`/corporate/emergency/${id}/coverage`),
+  getInstallerSheet: (id) => request(`/corporate/emergency/${id}/installer-sheet`),
+  rotateEmergencySecrets: (id) => request(`/corporate/emergency/${id}/rotate-secrets`, { method: 'POST' }),
+  activateEmergency: (id, durationSec, note) => request(`/corporate/emergency/${id}/activate`, { method: 'POST', body: JSON.stringify({ duration_sec: durationSec, note }) }),
+  clearEmergency: (id) => request(`/corporate/emergency/${id}/clear`, { method: 'POST' }),
 };
+
+/**
+ * The store-slots compliance report as a CSV download. A bearer header cannot ride on an <a href>,
+ * so it is fetched and handed to the browser as a blob.
+ */
+export async function downloadSlotReportCsv(problemsOnly) {
+  const r = await fetch(`${API_BASE}/corporate/reports/slots?format=csv${problemsOnly ? '&problems=1' : ''}`, { headers: getAuthHeaders() });
+  if (!r.ok) throw requestError(r.status, await r.json().catch(() => ({})));
+  return r.blob();
+}
 
 
 // Raw, authenticated fetches for history previews: a widget revision rendered as HTML (for an

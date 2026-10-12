@@ -29,7 +29,7 @@ function present(rev, { withState = false } = {}) {
   const out = { ...rev };
   delete out.state;
   if (withState) out.state = revisions.redactState(revisions.parseJson(rev.state, null));
-  out.has_file = !!rev.file_ref && !!revisions.resolveFileRef(rev.file_ref);
+  out.has_file = !!rev.file_ref && revisions.refExists(rev.file_ref);
   return out;
 }
 
@@ -76,9 +76,19 @@ router.get('/:type/:id/:rev/file', requireWorkspaceRead, (req, res) => {
   const rev = revisions.get(db, req.params.rev);
   if (!rev || rev.resource_id !== req.params.id) return res.status(404).json({ error: 'Revision not found' });
   const which = req.query.thumb === '1' ? rev.thumb_ref : rev.file_ref;
+  const state = revisions.parseJson(rev.state, {});
+  // Retained in a storage backend (lib/storage): stream it from whichever copy answers.
+  const storageLoc = require('../lib/storage/locations');
+  if (which && storageLoc.isStorageRef(which)) {
+    const locs = storageLoc.orderForRead(storageLoc.historyLocations(which));
+    if (!locs.length) return res.status(404).json({ error: 'The media for this revision is no longer retained' });
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    return require('../lib/storage/serve').serveFromStorage(req, res,
+      { id: rev.resource_id, mime_type: req.query.thumb === '1' ? 'image/jpeg' : (state.mime_type || null), filepath: which },
+      'asset', { locations: locs });
+  }
   const abs = which ? revisions.resolveFileRef(which) : null;
   if (!abs) return res.status(404).json({ error: 'The media for this revision is no longer retained' });
-  const state = revisions.parseJson(rev.state, {});
   res.setHeader('Cache-Control', 'private, max-age=300');
   if (req.query.thumb !== '1' && state.mime_type) res.setHeader('Content-Type', state.mime_type);
   res.sendFile(abs);
@@ -99,17 +109,46 @@ router.get('/:type/:id/:rev/render', requireWorkspaceRead, (req, res) => {
   res.send(html);
 });
 
-router.post('/:type/:id/:rev/restore', requireWorkspaceWrite, (req, res) => {
+/*
+ * CORPORATE (critique H7): a restore rewrites the draft — a governed playlist's items, or an
+ * org-owned asset's bytes (via file_ref). The same author rule as the resource's own routes, applied
+ * before acting. Throws a CorporateError the catch below answers with its code.
+ */
+function assertCorporateWritable(req) {
+  const corpGuard = require('../lib/corporate/guard');
+  if (req.params.type === 'playlist') corpGuard.assertPlaylistWritable(req, { id: req.params.id }, 'restore');
+  else corpGuard.assertMediaWritable(req, req.params.type, req.params.id);
+}
+function sendCorporate(res, e, req) {
+  return require('../lib/corporate/guard').send(res, e, req);
+}
+
+router.post('/:type/:id/:rev/restore', requireWorkspaceWrite, async (req, res) => {
   if (!loadResource(req, res)) return;
+  let materialized = null;
   try {
-    const out = revisions.restoreToDraft(db, { type: req.params.type, id: req.params.id, revisionId: req.params.rev, actor: { ...releases.actorOf(req), kind: 'restore' } });
+    assertCorporateWritable(req);
+    // A content revision retained in a storage backend is fetched to local disk first; the restore
+    // itself works on local files exactly as before (lib/revisions.materializeRefs).
+    if (req.params.type === 'content') {
+      const rev = revisions.get(db, req.params.rev);
+      if (rev && rev.resource_id === req.params.id) materialized = await revisions.materializeRefs(db, rev);
+    }
+    const out = revisions.restoreToDraft(db, { type: req.params.type, id: req.params.id, revisionId: req.params.rev, actor: { ...releases.actorOf(req), kind: 'restore' }, materialized });
     audit('history:restored', { userId: req.user.id, workspaceId: req.workspaceId, ip: req.ip, details: { resource_type: req.params.type, resource_id: req.params.id, from_revision: out.restoredFrom.id, to_revision: out.revision.id } });
     res.json({
       revision: present(out.revision), restored_from: present(out.restoredFrom),
       draft: true, require_approval: policy.approvalRequired(db, req.workspaceId),
       next: policy.approvalRequired(db, req.workspaceId) ? 'submit_for_review' : (req.params.type === 'playlist' || req.params.type === 'slide_deck' ? 'publish' : 'publish_draft'),
+      // Local slots this revision had that no longer exist — said, not silently skipped.
+      ...(out.dropped && out.dropped.length ? { dropped: out.dropped } : {}),
     });
-  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+  } catch (e) {
+    if (sendCorporate(res, e, req)) return;
+    res.status(e.status || 500).json({ error: e.message, code: e.code || null });
+  } finally {
+    for (const f of Object.values(materialized || {})) { if (f) { try { require('fs').unlinkSync(f); } catch (_) { /* already gone */ } } }
+  }
 });
 
 // Widgets, layouts and content: publish (or discard) the separate draft. Gated like any release.
@@ -119,16 +158,22 @@ router.post('/:type/:id/publish-draft', requireWorkspaceWrite, (req, res) => {
   try {
     const out = releases.releaseDraft(db, req.params.type, req.params.id, req, { actor: releases.actorOf(req) });
     res.json({ released: true, mode: out.gate.mode });
-  } catch (e) { res.status(e.status || 500).json({ error: e.message, code: e.code || null }); }
+  } catch (e) {
+    if (sendCorporate(res, e, req)) return;
+    res.status(e.status || 500).json({ error: e.message, code: e.code || null });
+  }
 });
 
 router.post('/:type/:id/discard-draft', requireWorkspaceWrite, (req, res) => {
   if (!loadResource(req, res)) return;
   try {
-    releases.discardDraft(db, req.params.type, req.params.id);
+    releases.discardDraft(db, req.params.type, req.params.id, req);
     revisions.recordCurrent(db, req.params.type, req.params.id, { actor: releases.actorOf(req), summary: 'Draft discarded' });
     res.json({ discarded: true });
-  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+  } catch (e) {
+    if (sendCorporate(res, e, req)) return;
+    res.status(e.status || 500).json({ error: e.message, code: e.code || null });
+  }
 });
 
 module.exports = router;

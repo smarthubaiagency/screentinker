@@ -50,6 +50,19 @@ class MediaPlayerManager(
     // The URL the widget WebView currently has loaded, so re-showing the same widget can be a
     // no-op. Cleared whenever anything else takes the surface (see clearWidgetUrl callers).
     private var currentWidgetUrl: String? = null
+
+    /*
+     * Whether the fullscreen web frame (widget, YouTube, bundle) loaded or failed, for the offline
+     * fallback (OfflineGate). Tagged with the mount it belongs to: a load still finishing for an item
+     * the playlist has already left must not be read as news about the one on screen now.
+     */
+    var onWebLoadState: ((ok: Boolean) -> Unit)? = null
+    private val webLoadState: (Boolean) -> Unit = { ok ->
+        val gen = mountGeneration
+        if (currentType == MediaType.YOUTUBE || currentType == MediaType.WIDGET) {
+            mainHandler.post { if (gen == mountGeneration) onWebLoadState?.invoke(ok) }
+        }
+    }
     // Wall mode: followers must stay muted even as the leader's sync switches them
     // to a new (possibly unmuted) item, so the mute has to survive each playVideo.
     private var wallMute = false
@@ -77,7 +90,7 @@ class MediaPlayerManager(
     private var warmTexture: SurfaceTexture? = null
     private var warmSurface: Surface? = null
 
-    enum class MediaType { NONE, VIDEO, IMAGE, YOUTUBE, WIDGET }
+    enum class MediaType { NONE, VIDEO, IMAGE, YOUTUBE, WIDGET, LIVE_INPUT }
 
     init {
         setupExoPlayer()
@@ -413,6 +426,7 @@ class MediaPlayerManager(
     private fun mountImageBitmap(bitmap: Bitmap) {
         mountGeneration++
         stopYoutubeIfPlaying()
+        stopLiveInputIfPlaying()
         currentType = MediaType.IMAGE
         currentWidgetUrl = null   // surface reused - a later widget show must reload
         playerView.visibility = android.view.View.GONE
@@ -436,6 +450,47 @@ class MediaPlayerManager(
      * the embed from scratch anyway. Guarded on the OUTGOING type so it must be called before
      * currentType is reassigned, and so it never blanks a widget that is being reused.
      */
+    /*
+     * The screen's HDMI input (LiveInput). Created on first use, in the same parent as the video
+     * surface and directly above it, so it gets the stage's rotation and sits under the overlays.
+     * Released by every other mount path BEFORE it claims the surface — the input holds a hardware
+     * session, and leaving it tuned would keep the cable box's picture on the video plane under
+     * whatever plays next.
+     */
+    private var liveInput: LiveInputPlayer? = null
+
+    private fun liveInputPlayer(): LiveInputPlayer? {
+        liveInput?.let { return it }
+        val parent = playerView.parent as? android.view.ViewGroup ?: return null
+        return LiveInputPlayer(context, parent, parent.indexOfChild(playerView) + 1) { reason ->
+            Log.w("MediaPlayerManager", "live input failed ($reason) — treating as a playback fault")
+            mainHandler.post { onVideoFault() }
+        }.also { liveInput = it }
+    }
+
+    private fun stopLiveInputIfPlaying() {
+        if (currentType != MediaType.LIVE_INPUT) return
+        liveInput?.stop()
+    }
+
+    /** Play the screen's HDMI input (hdmi://<port>). False when this device has no such input. */
+    fun playLiveInput(url: String, muted: Boolean = false): Boolean {
+        Log.i("MediaPlayerManager", "Playing live input: $url")
+        mountGeneration++
+        stopYoutubeIfPlaying()
+        exoPlayer?.stop()
+        val player = liveInputPlayer() ?: return false
+        playerView.visibility = android.view.View.GONE
+        imageView.visibility = android.view.View.GONE
+        youtubeWebView?.visibility = android.view.View.GONE
+        currentType = MediaType.LIVE_INPUT
+        currentWidgetUrl = null
+        return player.play(url, muted || wallMute || triggerMute)
+    }
+
+    /** True while the HDMI input is on screen — screenshots show a placeholder (it is not capturable). */
+    fun isShowingLiveInput(): Boolean = currentType == MediaType.LIVE_INPUT
+
     private fun stopYoutubeIfPlaying() {
         if (currentType != MediaType.YOUTUBE) return
         youtubeWebView?.loadUrl("about:blank")
@@ -444,6 +499,7 @@ class MediaPlayerManager(
     fun playYoutube(embedUrl: String, durationSec: Int = 0, muted: Boolean = false) {
         Log.i("MediaPlayerManager", "Playing YouTube: $embedUrl (muted=$muted)")
         mountGeneration++
+        stopLiveInputIfPlaying()
         currentType = MediaType.YOUTUBE
         currentWidgetUrl = null   // surface reused - a later widget show must reload
         youtubeMuted = muted || wallMute || triggerMute
@@ -455,7 +511,7 @@ class MediaPlayerManager(
         exoPlayer?.stop()
 
         youtubeWebView?.apply {
-            com.remotedisplay.player.util.WebViewSupport.configure(this, "YouTube")
+            com.remotedisplay.player.util.WebViewSupport.configure(this, "YouTube", webLoadState)
             setBackgroundColor(android.graphics.Color.BLACK)
             // Load via an embed wrapper with a valid youtube.com origin (Error 153 fix).
             // #129: initial mute comes from the per-item flag (no longer hardcoded).
@@ -503,7 +559,7 @@ class MediaPlayerManager(
     fun onAppForegrounded() {
         youtubeWebView?.let { wv -> wv.post { try { wv.resumeTimers(); wv.onResume() } catch (_: Throwable) {} } }
         if (currentType == MediaType.YOUTUBE) postYoutubeCommand("playVideo")
-        if (currentType == MediaType.VIDEO) exoPlayer?.play()
+        if (currentType == MediaType.VIDEO && !isFrozen()) exoPlayer?.play()
     }
 
     // Fullscreen widget render (single-zone / "fullscreen" layouts). Reuses the
@@ -522,6 +578,7 @@ class MediaPlayerManager(
         }
         Log.i("MediaPlayerManager", "Showing widget: $url")
         mountGeneration++
+        stopLiveInputIfPlaying()
         currentType = MediaType.WIDGET
         currentWidgetUrl = url
 
@@ -532,7 +589,7 @@ class MediaPlayerManager(
         exoPlayer?.stop()
 
         youtubeWebView?.apply {
-            com.remotedisplay.player.util.WebViewSupport.configure(this, "Widget")
+            com.remotedisplay.player.util.WebViewSupport.configure(this, "Widget", webLoadState)
             loadUrl(url)
         }
     }
@@ -559,6 +616,7 @@ class MediaPlayerManager(
         }
         Log.i("MediaPlayerManager", "Showing HTML bundle: $key (${html.length} chars)")
         mountGeneration++
+        stopLiveInputIfPlaying()
         currentType = MediaType.WIDGET
         currentWidgetUrl = key
 
@@ -569,7 +627,7 @@ class MediaPlayerManager(
         exoPlayer?.stop()
 
         youtubeWebView?.apply {
-            com.remotedisplay.player.util.WebViewSupport.configure(this, "Bundle")
+            com.remotedisplay.player.util.WebViewSupport.configure(this, "Bundle", webLoadState)
             loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
         }
     }
@@ -578,6 +636,7 @@ class MediaPlayerManager(
         Log.i("MediaPlayerManager", "Streaming video from URL: $url (muted=$muted)")
         mountGeneration++
         stopYoutubeIfPlaying()
+        stopLiveInputIfPlaying()
         currentType = MediaType.VIDEO
         currentWidgetUrl = null   // surface reused - a later widget show must reload
 
@@ -693,6 +752,7 @@ class MediaPlayerManager(
         coverSwitchGap(myGeneration)
         stall.reset()             // a new item starts its own stall clock
         stopYoutubeIfPlaying()
+        stopLiveInputIfPlaying()
         currentType = MediaType.VIDEO
         currentWidgetUrl = null   // surface reused - a later widget show must reload
 
@@ -749,17 +809,48 @@ class MediaPlayerManager(
         if (!runWipe(bitmap, transition, from) { mountImageBitmap(bitmap) }) mountImageBitmap(bitmap)
     }
 
+    /*
+     * A HOLD on the whole screen (Hold). FREEZE keeps the outgoing frame up, paused: the clip is
+     * paused in place, so isPlayingVideo() turns false and neither the group tick nor a wall
+     * follower's relay seeks it, the stall watchdog stands down (it only watches a player told to
+     * play), and coming back to the foreground does not resume it. An image or a page simply stays.
+     * The next mount of anything ends it like any other item.
+     */
+    private var frozenGeneration = -1L
+
+    fun holdFreeze() {
+        frozenGeneration = mountGeneration
+        stall.reset()
+        when (currentType) {
+            MediaType.VIDEO -> try { exoPlayer?.playWhenReady = false } catch (_: Throwable) {}
+            MediaType.YOUTUBE -> postYoutubeCommand("pauseVideo")
+            else -> {}
+        }
+    }
+
+    /** HOLD blank: clear to the background. stop() alone keeps the last video frame on the surface. */
+    fun holdBlank() {
+        mountGeneration++
+        stop()
+        playerView.visibility = android.view.View.GONE
+        imageView.visibility = android.view.View.GONE
+    }
+
+    private fun isFrozen(): Boolean = frozenGeneration == mountGeneration
+
     fun stop() {
         stall.reset()
         exoPlayer?.stop()
         imageView.setImageBitmap(null)
         youtubeWebView?.loadUrl("about:blank")
         youtubeWebView?.visibility = android.view.View.GONE
+        stopLiveInputIfPlaying()
         currentType = MediaType.NONE
         currentWidgetUrl = null   // surface reused - a later widget show must reload
     }
 
     fun release() {
+        liveInput?.release(); liveInput = null
         coverBitmap = null
         mainHandler.removeCallbacks(stallTick)
         mainHandler.removeCallbacks(clearCoverTimeout)
@@ -784,6 +875,7 @@ class MediaPlayerManager(
         when (currentType) {
             MediaType.VIDEO -> exoPlayer?.volume = if (muted) 0f else 1f
             MediaType.YOUTUBE -> setYoutubeMuted(muted)   // #129: was a no-op for YouTube
+            MediaType.LIVE_INPUT -> liveInput?.setMuted(muted)
             else -> {}
         }
     }

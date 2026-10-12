@@ -42,6 +42,9 @@ import com.remotedisplay.player.player.GroupScheduleController
 import com.remotedisplay.player.player.LayoutMode
 import com.remotedisplay.player.player.layoutModeOf
 import com.remotedisplay.player.player.ZoneManager
+import com.remotedisplay.player.player.WallZoneRenderer
+import com.remotedisplay.player.player.WallZones
+import com.remotedisplay.player.player.Hold
 import com.remotedisplay.player.player.ItemTiming
 import com.remotedisplay.player.remote.ScreenshotCapture
 import com.remotedisplay.player.remote.TouchInjector
@@ -59,6 +62,9 @@ class MainActivity : AppCompatActivity() {
     // #170: content-id signature of the last processed playlist, to detect a genuine content change
     // (first load / reassignment / toggle-back) vs the routine 60s same-playlist refresh.
     private var lastDownloadSig: String? = null
+    private lateinit var cacheJanitor: com.remotedisplay.player.data.CacheJanitor
+    private var lastCacheSweepMs = 0L
+    private val webHealth = com.remotedisplay.player.player.OfflineGate.WebHealth()
     private lateinit var screenshotCapture: ScreenshotCapture
     private lateinit var touchInjector: TouchInjector
 
@@ -69,6 +75,8 @@ class MainActivity : AppCompatActivity() {
     private var slideAudioPlayer: SlideAudioPlayer? = null
     private lateinit var updateChecker: UpdateChecker
     private var zoneManager: ZoneManager? = null
+    // Wall zones: a video wall's own layout, each zone paced by the shared clock (WallZoneRenderer).
+    private var wallZones: WallZoneRenderer? = null
     // #473: walk-up interactive web pages (fullscreen only; passive in zones, walls and groups).
     private var kiosk: com.remotedisplay.player.kiosk.KioskSession? = null
     private lateinit var wallController: WallController
@@ -88,6 +96,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusOverlay: View
     private lateinit var statusText: TextView
     private lateinit var rootView: View
+    // Audience counting (audience/AudienceController.kt): off unless the server's payload turns it on.
+    private var audience: com.remotedisplay.player.audience.AudienceController? = null
     private lateinit var pipLayout: FrameLayout       // #109: reparented above rootView (see onCreate)
     private var talkRenderer: org.webrtc.SurfaceViewRenderer? = null   // #talk video: operator webcam overlay
     private lateinit var captureRoot: View            // window content; capture source (includes pipLayout)
@@ -122,7 +132,7 @@ class MainActivity : AppCompatActivity() {
             // boot status until the playlist arrives (no blank screen) rather than blindly hiding it.
             if (wsService?.isConnected() == true && !playlistController.isPlaying) {
                 ackedContent.clear()
-                wsService?.requestPlaylistRefresh()
+                wsService?.requestPlaylistRefresh(force = true)   // once per bind, so the throttle has nothing to protect
             }
         }
 
@@ -204,6 +214,7 @@ class MainActivity : AppCompatActivity() {
         try { systemControl.applyPersistedWindowBrightness(window) } catch (_: Throwable) {}
 
         contentCache = ContentCache(this)
+        cacheJanitor = com.remotedisplay.player.data.CacheJanitor(java.io.File(filesDir, "content_cache"))
         bundleCache = com.remotedisplay.player.data.BundleCache(this)
         // Coordinated background downloads (single-flight + bounded pool + backoff) — reconnect-safe.
         downloadCoordinator = com.remotedisplay.player.data.DownloadCoordinator(
@@ -220,6 +231,11 @@ class MainActivity : AppCompatActivity() {
         statusOverlay = findViewById(R.id.statusOverlay)
         statusText = findViewById(R.id.statusText)
         rootView = findViewById(R.id.rootLayout)
+        audience = com.remotedisplay.player.audience.AudienceController(
+            activity = this,
+            overlayParent = { findViewById<ViewGroup>(android.R.id.content) },
+            onBuckets = { handler.post { wsService?.flushAudience() } },
+        )
 
         // Hide player controls
         playerView.useController = false
@@ -298,17 +314,31 @@ class MainActivity : AppCompatActivity() {
         zoneManager = ZoneManager(this, rootView as FrameLayout) {
             playlistController.onVideoComplete()
         }
+        // Wall zones draw into the wall-transformed rootView, just above the static fullscreen views
+        // (and below the status overlay and anything layered on later).
+        wallZones = WallZoneRenderer(
+            context = this,
+            root = rootView as FrameLayout,
+            stageIndex = { (rootView as ViewGroup).indexOfChild(youtubeWebView) + 1 },
+            syncedNow = { syncedNowMs() },
+            report = { msg -> wsService?.sendLog("sync", "info", msg) }
+        )
 
         // Setup playlist controller
         playlistController = PlaylistController(
-            onItemChanged = { item -> item?.let { playItem(it) } },
+            onItemChanged = { item ->
+                // Audience counts are attributed to what is on screen — every item, including ones
+                // left out of proof-of-play (log_play=0), which is why this is not the onPlayLog hook.
+                audience?.setItem(if (item?.contentId?.isNotEmpty() == true) "content" else "widget", item?.contentId?.ifEmpty { item.widgetId } )
+                item?.let { playItem(it) }
+            },
             // #74/#75: clear the last frame when going idle (else a now-filtered item lingers on screen)
-            onPlaylistEmpty = { kiosk?.hide(); if (::mediaPlayer.isInitialized) mediaPlayer.stop(); showStatus(getString(R.string.waiting_for_content)) },
+            onPlaylistEmpty = { audience?.setItem("none", null); kiosk?.hide(); if (::mediaPlayer.isInitialized) mediaPlayer.stop(); showStatus(getString(R.string.waiting_for_content)) },
             onRequestRefresh = { wsService?.requestPlaylistRefresh() },
-            onNothingScheduled = { kiosk?.hide(); if (::mediaPlayer.isInitialized) mediaPlayer.stop(); showStatus(getString(R.string.nothing_scheduled)) },
+            onNothingScheduled = { audience?.setItem("none", null); kiosk?.hide(); if (::mediaPlayer.isInitialized) mediaPlayer.stop(); showStatus(getString(R.string.nothing_scheduled)) },
             // Screen-resilience: the defined "waiting for content" state — ONLY on a fresh device
             // with nothing to show yet (never while content is on screen; that path keeps current).
-            onWaitingForContent = { kiosk?.hide(); if (::mediaPlayer.isInitialized) mediaPlayer.stop(); showStatus(getString(R.string.waiting_for_content)) },
+            onWaitingForContent = { audience?.setItem("none", null); kiosk?.hide(); if (::mediaPlayer.isInitialized) mediaPlayer.stop(); showStatus(getString(R.string.waiting_for_content)) },
             // Proof-of-play: forward play_start/play_end to the server (device:play-event) so this
             // device shows Total Plays / Hours in Reports. Widgets have no content_id, so key on the
             // widget id instead — keeping play_start and play_end consistent so the row's duration closes.
@@ -394,6 +424,23 @@ class MainActivity : AppCompatActivity() {
             transitionView = transitionView
         )
 
+        /*
+         * Offline fallback (OfflineGate). An item cannot load when the socket to the server is down,
+         * or when that item just failed by itself — decided here rather than from Android's VALIDATED
+         * flag, which took minutes to notice an unplugged modem. The failure is recorded BEFORE the
+         * controller hears about it, so the selection it makes next already passes over the item.
+         */
+        playlistController.setOfflineCheck { item ->
+            com.remotedisplay.player.player.OfflineGate.cannotLoad(item, wsService?.isConnected() == true, webHealth, System.currentTimeMillis())
+        }
+        mediaPlayer.onWebLoadState = { ok ->
+            val key = playlistController.currentItem?.itemKey
+            if (key != null) {
+                if (ok) { webHealth.reportSuccess(key); playlistController.onNetworkItemRecovered() }
+                else { webHealth.reportFailure(key, System.currentTimeMillis()); playlistController.onNetworkItemFailed() }
+            }
+        }
+
         // #344: applyOrientation() may have already run before mediaPlayer existed (its isInitialized
         // guard skipped the geometry push then), so seed the transition-stage geometry now from
         // whatever orientation is currently applied. Later orientation changes push it themselves.
@@ -427,7 +474,7 @@ class MainActivity : AppCompatActivity() {
         groupSchedule = GroupScheduleController(
             playlist = playlistController,
             media = mediaPlayer,
-            syncedNow = { wsService?.syncedNowMs() ?: System.currentTimeMillis() },
+            syncedNow = { syncedNowMs() },
             report = { msg -> wsService?.sendLog("sync", "info", msg) },
             // Double buffer: warm the NEXT clip's second player if it's a locally-cached video, so the
             // boundary switch is a warm swap (no black hold). Non-video / uncached items just skip it.
@@ -447,6 +494,13 @@ class MainActivity : AppCompatActivity() {
         if (cachedJson.isNotEmpty()) {
             try {
                 val cached = JSONObject(cachedJson)
+                // An offline cold start keeps counting if it was counting (the cache is the whole payload).
+                /*
+                 * ⚠️ Audience counting is NOT restored from this cache. It is only rewritten when a
+                 * payload has assignments, so a switch-off that arrived while the screen had none is
+                 * not in it, and restoring it could start a camera an admin had stopped. Counting
+                 * waits for a fresh payload, which says on or off every time.
+                 */
                 val assignments = cached.getJSONArray("assignments")
                 if (assignments.length() > 0) {
                     Log.i("MainActivity", "Restoring cached playlist: ${assignments.length()} items")
@@ -488,6 +542,13 @@ class MainActivity : AppCompatActivity() {
                     // the main thread here, so applyMultiZoneLayout can run directly.
                     val cachedOrder = cached.optString("playback_order", "sequential")
                     when (layoutModeOf(cached)) {
+                        // A wall with its own layout comes back as THIS panel's slice of every zone,
+                        // on the cached clock offset — no server needed (WallZoneRenderer).
+                        LayoutMode.WALL_ZONES -> {
+                            val wc = cached.optJSONObject("wall_config")
+                            val z = cached.optJSONObject("layout")?.optJSONArray("zones")
+                            if (wc != null && z != null) enterWallZones(wc, z, assignments)
+                        }
                         LayoutMode.WALL -> {
                             cached.optJSONObject("wall_config")?.let { wallController.apply(parseWallConfig(it)) }
                             playlistController.updatePlaylist(assignments, cachedOrder)
@@ -518,7 +579,7 @@ class MainActivity : AppCompatActivity() {
         // cache above renders through zoneManager (not playlistController), so isPlaying stays false
         // even though the zones ARE up - without the hasZones guard the connecting overlay flashes on
         // top of the restored zones on every cold boot until the online catch-up hides it.
-        if (!playlistController.isPlaying && zoneManager?.hasZones() != true) {
+        if (!playlistController.isPlaying && zoneManager?.hasZones() != true && wallZones?.isActive != true) {
             showStatus("Connecting to server...")
         }
 
@@ -615,6 +676,12 @@ class MainActivity : AppCompatActivity() {
      * string has not changed, and it never changes on a display that has always been landscape.
      */
     private fun reapplyOrientation() {
+        /*
+         * ⚠️ NOT ON A WALL. The wall transform owns rootView (and sets currentOrientation = null), so
+         * re-measuring here re-rotated a wall panel to "landscape" on the next focus change — seen
+         * on the emulator as a wall zone turned 90° and pushed off its slice after a relaunch.
+         */
+        if (::wallController.isInitialized && wallController.isWall) return
         applyOrientation(currentOrientation ?: "landscape")
     }
 
@@ -808,6 +875,7 @@ class MainActivity : AppCompatActivity() {
          * DURING a window, since blanking the panel is lockNow().
          */
         wsService?.onPowerWindow = { off -> applyPowerWindowFlag(off) }
+        wsService?.onBeforeBlank = { releaseLockScreenWake() }
 
         wsService?.onUnpaired = {
             runOnUiThread {
@@ -828,8 +896,9 @@ class MainActivity : AppCompatActivity() {
                 //
                 // A terminal rejection means this device really is gone from the server, and the
                 // operator needs the pairing code, so provisioning is right. The cache is kept
-                // either way: it is what lets the screen keep showing content while someone walks
-                // over to re-pair it, and re-pairing restores the settings anyway.
+                // here: re-pairing restores the settings, so the same files are wanted again. The
+                // one exception is an explicit delete from the dashboard, which the service has
+                // already wiped before this runs (DeletedDeviceWipe).
                 if (!transient && !blocked) {
                     handler.post {
                         startActivity(Intent(this@MainActivity, ProvisioningActivity::class.java).apply {
@@ -856,6 +925,8 @@ class MainActivity : AppCompatActivity() {
             try { triggerManager?.onPayload(data) } catch (e: Throwable) {
                 Log.w("MainActivity", "trigger adopt failed: ${e.message}")
             }
+            // Audience counting rides every payload; absent means OFF, so this runs before any early return.
+            try { audience?.onPayload(data) } catch (e: Throwable) { Log.w("MainActivity", "audience adopt failed: ${e.message}") }
             /*
              * ⚠️ AND PIN WHAT THEY NEED — the comment above describes the WEB player's mechanism,
              * not this one. There, device-triggers.js appends trigger media to the same
@@ -878,6 +949,7 @@ class MainActivity : AppCompatActivity() {
                 val message = data.optString("message", "Account Suspended")
                 val detail = data.optString("detail", "Please upgrade your plan.")
                 handler.post {
+                    wallZones?.stop()
                     showStatus("$message\n$detail")
                     kiosk?.hide()
                     if (::mediaPlayer.isInitialized) mediaPlayer.stop()
@@ -890,6 +962,7 @@ class MainActivity : AppCompatActivity() {
             val effectiveTz = if (data.isNull("timezone")) null else data.optString("timezone", "").ifEmpty { null }
             playlistController.setTimezone(effectiveTz)
             zoneManager?.setTimezone(effectiveTz)
+            wallZones?.setTimezone(effectiveTz)
 
             // Default / standby content: a per-device, per-payload fallback IMAGE the server attaches
             // TOP-LEVEL (not in assignments) as `default_content`. Handed to the controller so it can
@@ -933,12 +1006,21 @@ class MainActivity : AppCompatActivity() {
                 groupSchedule.exit()                 // wall and group are mutually exclusive
                 kiosk?.hide()                        // interactive pages render passively on a wall
                 playlistController.dropHold()        // a wall never holds; clear any interactive hold
-                wallController.apply(parseWallConfig(wallObj))
-                playlistController.updatePlaylist(assignments, data.optString("playback_order", "sequential"))
+                if (layoutModeOf(data) == LayoutMode.WALL_ZONES) {
+                    // The wall's own layout: every zone on the shared clock, no leader relay.
+                    val lz = data.optJSONObject("layout")!!.optJSONArray("zones")!!
+                    com.remotedisplay.player.util.DebugLog.i("Player", "Layout: WALL ZONES (${lz.length()} zones)")
+                    enterWallZones(wallObj, lz, assignments)
+                } else {
+                    wallZones?.stop()                // layout cleared, or an emergency took the wall
+                    wallController.apply(parseWallConfig(wallObj))
+                    playlistController.updatePlaylist(assignments, data.optString("playback_order", "sequential"))
+                }
             } else {
             // #group-sync: not a wall — enter clock/schedule group sync if the payload carries a
             // group_sync block, else leave it. No leader/relay: the schedule tick drives index +
             // position locally (offline-native). Content renders through the normal path below.
+            wallZones?.stop()                        // never wall zones here either
             wallController.exit()                    // never in wall mode here
             val groupObj = if (data.isNull("group_sync")) null else data.optJSONObject("group_sync")
             if (groupObj != null) groupSchedule.apply(groupObj.optString("group_id")) else groupSchedule.exit()
@@ -1013,6 +1095,28 @@ class MainActivity : AppCompatActivity() {
             // Runs for wall + single-zone; multi-zone drives its own rendering via ZoneManager
             // (the startIfNeeded below is guarded so it won't run behind zones).
             thread {
+                /*
+                 * Reclaim media nothing references any more. The media cache had no eviction at all: a
+                 * removed item's file stayed on disk forever, until a small stick filled up and every
+                 * new download failed. See CacheJanitor for the grace period and the low-space rule.
+                 *
+                 * ⚠️ ONLY FROM A PAYLOAD WITH ASSIGNMENTS — the same rule as the offline playlist copy
+                 * above. An empty push (suspended, unassigned, still draining) says nothing about what
+                 * the next offline period will need, and sweeping on it would empty the cache that
+                 * copy exists to play from. The item on screen is kept too: a #157 deferred removal
+                 * is still playing it. FIRST in this thread, so a disk that is already full is cleared
+                 * before the downloads below need the room.
+                 */
+                if (assignments.length() > 0 && (contentChanged || System.currentTimeMillis() - lastCacheSweepMs > CACHE_SWEEP_EVERY_MS)) {
+                    lastCacheSweepMs = System.currentTimeMillis()
+                    try {
+                        val keep = com.remotedisplay.player.data.CacheJanitor.referencedIds(data).toMutableSet()
+                        playlistController.currentContentId?.takeIf { it.isNotEmpty() }?.let { keep.add(it) }
+                        val swept = cacheJanitor.sweep(keep)
+                        swept.deletedIds.forEach { downloadCoordinator.forget(it) }
+                    } catch (e: Exception) { Log.w("MainActivity", "cache sweep failed: ${e.message}") }
+                }
+
                 for (i in 0 until assignments.length()) {
                     val item = assignments.getJSONObject(i)
                     // Widget assignments have no downloadable content file - skip
@@ -1082,9 +1186,9 @@ class MainActivity : AppCompatActivity() {
                     }
                 } catch (e: Exception) { /* standby pin is best-effort */ }
 
-                // Reclaim renders for bundles that have left the playlist. The media cache has no
-                // eviction at all, but this store is small and bounded by the playlist, so keeping
-                // it tidy costs one pass and stops a long-lived panel accreting dead documents.
+                // Reclaim renders for bundles that have left the playlist. Unlike the media cache
+                // (CacheJanitor, above) this store is small and bounded by the playlist, so it is
+                // pruned on sight: one pass stops a long-lived panel accreting dead documents.
                 try {
                     val live = mutableSetOf<String>()
                     for (i in 0 until assignments.length()) {
@@ -1094,12 +1198,13 @@ class MainActivity : AppCompatActivity() {
                     if (live.isNotEmpty()) bundleCache.pruneToPlaylist(live)
                 } catch (e: Exception) { /* reclaim is best-effort */ }
 
+
                 // Start/resume playback immediately — do NOT wait on downloads (they're async now).
                 // Screen-resilience plays whatever is cached and skips not-yet-ready items; the 3s
                 // recheck swaps new content in once its download completes. Single-zone only; in
                 // multi-zone, ZoneManager drives each zone.
                 handler.post {
-                    if (zoneManager?.hasZones() != true) playlistController.startIfNeeded()
+                    if (zoneManager?.hasZones() != true && wallZones?.isActive != true) playlistController.startIfNeeded()
                 }
             }
             } // end else (not suspended)
@@ -1143,6 +1248,12 @@ class MainActivity : AppCompatActivity() {
         // #473: while a visitor uses an interactive page the operator sees a blank frame and cannot
         // inject input — they would otherwise watch (or type into) a stranger's form.
         wsService?.privacyActive = { kiosk?.sessionActive == true }
+        // The HDMI input is a hardware plane no capture can read (LiveInput): the service sends a
+        // placeholder card while one is up, full screen or in any zone.
+        wsService?.isShowingLiveInput = {
+            (::mediaPlayer.isInitialized && mediaPlayer.isShowingLiveInput()) || zoneManager?.hasLiveInput() == true ||
+                wallZones?.hasLiveInput() == true
+        }
         wsService?.onCaptureScreenshot = {
             screenshotCapture.captureView(captureRoot, 40)
         }
@@ -1214,6 +1325,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 // Screen off = real lock on owner/admin (FORCE_LOCK), else accessibility lock. Exec retired.
                 "screen_off", "lock_now" -> {
+                    releaseLockScreenWake()   // or the lock is undone by our own turn-screen-on
                     if (!stPolicy().lockNow()) {
                         com.remotedisplay.player.service.PowerAccessibilityService.instance?.lockScreen()
                             ?: Log.w("MainActivity", "screen_off/lock_now: no owner/admin/accessibility — unsupported")
@@ -1374,6 +1486,8 @@ class MainActivity : AppCompatActivity() {
                 // isNull() first: org.json's optString hands back the STRING "null" for a JSON null.
                 val contentId = if (item.isNull("content_id")) "" else item.optString("content_id", "")
                 if (contentId.isEmpty()) continue          // widgets carry no content to fetch
+                // A remote item (a stream, a hold://) has no file behind /api/content/:id/file.
+                if (!item.isNull("remote_url") && item.optString("remote_url", "").isNotEmpty()) continue
                 val filename = item.optString("filename", "content")
                 val rev = item.optLong("content_rev", 0L)
                 downloadCoordinator.ensure(contentId, filename, rev)
@@ -1414,13 +1528,23 @@ class MainActivity : AppCompatActivity() {
         }
         kiosk?.hide()
 
+        // A HOLD: nothing new for its duration. FREEZE keeps the outgoing frame, paused; BLANK clears
+        // to the background. Its duration is a timer (ItemTiming.endsOnTimer); in a wall or a synced
+        // group the tick moves on instead. Never a file, never "unknown type -> skip".
+        if (Hold.isHold(item.mimeType)) {
+            if (Hold.mode(item.remoteUrl) == Hold.Mode.FREEZE) mediaPlayer.holdFreeze() else mediaPlayer.holdBlank()
+            wsService?.sendPlaybackState(item.contentId, 0f)
+            return
+        }
+
         if (item.isWidget) {
             // rev makes the URL change when — and only when — the widget's content changed, so an
             // edit reloads while an untouched widget still hits the no-flash reuse path.
             val url = "${config.serverUrl}/api/widgets/${item.widgetId}/render" +
                 (if (config.deviceId.isNotEmpty()) "?device=" + android.net.Uri.encode(config.deviceId) else "?d=") +
-                "&rev=${item.widgetRev}"
-            Log.i("MainActivity", "Playing widget fullscreen: $url")
+                "&rev=${item.widgetRev}" +
+                com.remotedisplay.player.util.WidgetUrls.panelFragment(item.widgetPanel)
+            Log.i("MainActivity", "Playing widget fullscreen: ${url.substringBefore('#')}")
             mediaPlayer.showWidget(url)
             wsService?.sendPlaybackState(item.contentId.ifEmpty { item.widgetId ?: "" }, 0f)
             return
@@ -1433,6 +1557,18 @@ class MainActivity : AppCompatActivity() {
         // for.
         if (item.mimeType == ItemTiming.BUNDLE_MIME) {
             playBundle(item)
+            return
+        }
+
+        // The screen's own HDMI input (LiveInput). Before the remote-URL branch below: it carries a
+        // remote_url (hdmi://<port>) but there is nothing to stream. No input on this device — the
+        // server should never have sent it, but a box can lose one — is a fault like a dead stream.
+        if (com.remotedisplay.player.player.LiveInput.isLiveInput(item.mimeType)) {
+            if (!mediaPlayer.playLiveInput(item.remoteUrl ?: "hdmi://", item.muted)) {
+                Log.w("MainActivity", "No HDMI input for ${item.remoteUrl} — skipping")
+                handler.post { playlistController.onVideoFault() }
+            }
+            wsService?.sendPlaybackState(item.contentId, 0f)
             return
         }
 
@@ -1568,6 +1704,37 @@ class MainActivity : AppCompatActivity() {
         zoneManager?.renderAssignments(assignments, config.serverUrl, contentCache, config.deviceId)
         zoneManager?.lastAssignmentSig = zoneAssignmentSig(assignments)
         zoneManager?.lastZoneSig = zoneGeometrySig(layoutZones)
+    }
+
+    /**
+     * The server-disciplined clock group sync and wall zones share. Before the service is bound (a
+     * cold boot restoring from cache) it falls back to the offset the service last persisted, so an
+     * offline reboot still lands on the same slot as the rest of the wall.
+     */
+    private fun syncedNowMs(): Long = wsService?.syncedNowMs() ?: (System.currentTimeMillis() + try {
+        getSharedPreferences("remote_display", MODE_PRIVATE).getLong("clock_offset_ms", 0L)
+    } catch (e: Throwable) { 0L })
+
+    /**
+     * Enter (or refresh) wall zones: the wall transform without the relay, the fullscreen player
+     * stopped, and every zone on the shared clock. Main thread. The renderer places the zones from a
+     * layout listener, so they land on the canvas the transform sized, not on a stale window.
+     */
+    private fun enterWallZones(wallObj: JSONObject, layoutZones: org.json.JSONArray, assignments: org.json.JSONArray) {
+        val cfg = parseWallConfig(wallObj).copy(canvasLayout = true)
+        val audio = wallObj.optJSONArray("audio_zones")?.let { a -> (0 until a.length()).map { a.optString(it, "") }.filter { it.isNotEmpty() } } ?: emptyList()
+        val first = wallZones?.isActive != true
+        wallController.apply(cfg)
+        if (first) {
+            hideStatus()
+            kiosk?.hide()
+            if (::mediaPlayer.isInitialized) mediaPlayer.stop()
+            playlistController.stop()
+            playerView.visibility = View.GONE
+            imageView.visibility = View.GONE
+        }
+        val key = WallZones.configKey(cfg.wallId, cfg.isLeader, cfg.rotation, cfg.screen, cfg.player, true, audio)
+        wallZones?.apply(layoutZones, assignments, key, cfg.screen, cfg.player, audio, config.serverUrl, config.deviceId, contentCache)
     }
 
     private fun showStatus(message: String) {
@@ -1805,6 +1972,26 @@ class MainActivity : AppCompatActivity() {
      * a scheduled off is lockNow() and therefore stops this Activity: anything owned here would
      * switch the panel off and then die with it, and the morning wake would never run.
      */
+    /**
+     * Undo what screen_on set so a lock STAYS dark: show-when-locked + turn-screen-on (and their
+     * pre-O_MR1 window flags). screen_on sets them again when the panel is woken on purpose. Must run
+     * on the main thread, BEFORE lockNow() — see WebSocketService.onBeforeBlank.
+     */
+    private fun releaseLockScreenWake() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setShowWhenLocked(false)
+                setTurnScreenOn(false)
+            }
+            @Suppress("DEPRECATION")
+            window.clearFlags(
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+            )
+        } catch (e: Throwable) { Log.w("MainActivity", "releaseLockScreenWake: ${e.message}") }
+    }
+
     private fun applyPowerWindowFlag(off: Boolean) {
         runOnUiThread {
             try {
@@ -2027,11 +2214,22 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         super.onStop()
         if (::mediaPlayer.isInitialized) mediaPlayer.onAppBackgrounded()
+        // The camera runs only while the player is on screen.
+        try { audience?.onStop() } catch (e: Throwable) { }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == com.remotedisplay.player.audience.AudienceController.REQUEST_CODE) {
+            try { audience?.onPermissionResult(grantResults.isNotEmpty() && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) }
+            catch (e: Throwable) { Log.w("MainActivity", "audience permission result: ${e.message}") }
+        }
     }
 
     override fun onStart() {
         super.onStart()
         if (::mediaPlayer.isInitialized) mediaPlayer.onAppForegrounded()
+        try { audience?.onStart() } catch (e: Throwable) { }
 
         // Clear the boot "Starting display…" prompt EVERY time the player becomes visible, not
         // just in onCreate.
@@ -2061,9 +2259,12 @@ class MainActivity : AppCompatActivity() {
         try { triggerSweep?.let { handler.removeCallbacks(it) } } catch (e: Throwable) { }
         try { triggerManager?.stop() } catch (e: Throwable) { }
         triggerManager = null
+        try { audience?.onDestroy() } catch (e: Throwable) { }
+        audience = null
         // Drop the window-flag callback so the service stops calling into a dead Activity. The
         // SCHEDULE keeps running — it is the service's, deliberately.
         try { wsService?.onPowerWindow = null } catch (e: Throwable) { }
+        try { wsService?.onBeforeBlank = null } catch (e: Throwable) { }
         remoteStreaming = false
         // #talk video: drop the bus listener (it holds `this`) and release the renderer.
         try { com.remotedisplay.player.remote.TalkVideoBus.listener = null } catch (e: Throwable) { }
@@ -2094,6 +2295,7 @@ class MainActivity : AppCompatActivity() {
         if (::groupSchedule.isInitialized) groupSchedule.shutdown()
         if (::downloadCoordinator.isInitialized) downloadCoordinator.shutdown() // cancel in-flight downloads (no orphan/leak)
         zoneManager?.cleanup()
+        wallZones?.stop()
         if (::pipOverlay.isInitialized) pipOverlay.clear(null) // #109: tear down overlay WebView
         if (::mediaPlayer.isInitialized) {
             stopScreenshotStreaming()
@@ -2129,5 +2331,11 @@ class MainActivity : AppCompatActivity() {
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
             )
         }
+    }
+
+    private companion object {
+        // The routine refresh lands every ~60s with an unchanged playlist; a sweep then has nothing
+        // new to decide, so it runs on a real change or at most this often.
+        const val CACHE_SWEEP_EVERY_MS = 30L * 60 * 1000
     }
 }

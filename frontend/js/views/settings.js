@@ -1,9 +1,17 @@
 import { api } from '../api.js';
+import { mountCanvaSettings } from '../components/canva-settings.js';
 import * as whatsNew from '../components/whats-new.js';
 import { showToast } from '../components/toast.js';
 import { getLanguage, setLanguage, getAvailableLanguages, t } from '../i18n.js';
 import { esc, isPlatformAdmin } from '../utils.js';
 import { resetBranding, applyAccent } from '../branding.js';
+import { mountCorporateSettings } from '../components/corporate-settings.js';
+import { mountStorageSettings } from '../components/storage-settings.js';
+import { mountM365Settings } from '../components/m365-settings.js';
+import { mountBiConnections } from '../components/bi-connections-settings.js';
+import { mountSocialConnections } from '../components/social-connections-settings.js';
+import { mountRoomSettings } from '../components/room-settings.js';
+import { formatRow, buyPack, usd } from '../components/ai-hosted-picker.js';
 
 export async function render(container) {
   const serverUrl = `${window.location.protocol}//${window.location.host}`;
@@ -84,6 +92,19 @@ export async function render(container) {
          is the most security-relevant setting a tenant has, so it is not shown to members who
          cannot change it. Instance-wide providers are the operator's business and are configured
          by environment, not here. -->
+    <!-- Head office (corporate) playlists and emergency alerts. Org owners and admins only;
+         components/corporate-settings.js fills it, and leaves it hidden for everyone else. -->
+    <div class="settings-section" id="corporateCard" style="display:none"></div>
+
+    <!-- Where media is stored (org owners/admins). Mounted only for them; the server enforces it. -->
+    <div class="settings-section" id="storageCard" style="display:none"></div>
+    <div class="settings-section" id="m365Card" style="display:none"></div>
+    <div class="settings-section" id="biCard" style="display:none"></div>
+    <div class="settings-section" id="socialConnCard" style="display:none"></div>
+
+    <div class="settings-section" id="canvaSettingsCard" style="display:none"></div>
+    <div class="settings-section" id="roomsCard" style="display:none"></div>
+
     <div class="settings-section" id="ssoCard" style="display:none">
       <h3>${t('sso.title')}</h3>
       <p style="color:var(--text-muted);font-size:12px;margin-bottom:8px">${t('sso.blurb')}</p>
@@ -91,8 +112,25 @@ export async function render(container) {
       <details id="ssoAddDetails" style="margin-top:12px">
         <summary style="cursor:pointer;font-size:13px">${t('sso.add')}</summary>
         <div style="margin-top:12px;display:grid;gap:10px;max-width:560px">
+          <div class="form-group"><label>${t('sso.f_protocol')}</label>
+            <select id="ssoKind" class="input">
+              <option value="oidc">${t('sso.protocol_oidc')}</option>
+              <option value="saml">${t('sso.protocol_saml')}</option>
+            </select></div>
           <div class="form-group"><label>${t('sso.f_name')}</label>
             <input type="text" id="ssoName" class="input" placeholder="Acme SSO"></div>
+          <div id="ssoSamlFields" style="display:none;gap:10px">
+            <div class="form-group"><label>${t('sso.f_saml_metadata')}</label>
+              <textarea id="ssoSamlMetadata" class="input" rows="4" spellcheck="false" style="font-family:monospace;font-size:11px"></textarea>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:4px">${t('sso.f_saml_metadata_hint')}</div></div>
+            <div class="form-group"><label>${t('sso.f_saml_entity_id')}</label>
+              <input type="text" id="ssoSamlEntityId" class="input" placeholder="https://sts.windows.net/…/"></div>
+            <div class="form-group"><label>${t('sso.f_saml_sso_url')}</label>
+              <input type="url" id="ssoSamlSsoUrl" class="input" placeholder="https://login.example.com/saml2"></div>
+            <div class="form-group"><label>${t('sso.f_saml_cert')}</label>
+              <textarea id="ssoSamlCert" class="input" rows="3" spellcheck="false" style="font-family:monospace;font-size:11px" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+          </div>
+          <div id="ssoOidcFields" style="display:grid;gap:10px">
           <div class="form-group"><label>${t('sso.f_issuer')}</label>
             <input type="url" id="ssoIssuer" class="input" placeholder="https://login.example.com">
             <div style="font-size:11px;color:var(--text-muted);margin-top:4px">${t('sso.f_issuer_hint')}</div></div>
@@ -101,6 +139,7 @@ export async function render(container) {
           <div class="form-group"><label>${t('sso.f_client_secret')}</label>
             <input type="password" id="ssoClientSecret" class="input" autocomplete="new-password">
             <div style="font-size:11px;color:var(--text-muted);margin-top:4px">${t('sso.f_client_secret_hint')}</div></div>
+          </div>
           <div class="form-group"><label>${t('sso.f_domains')}</label>
             <input type="text" id="ssoDomains" class="input" placeholder="acme.com, acme.co.uk">
             <div style="font-size:11px;color:var(--text-muted);margin-top:4px">${t('sso.f_domains_hint')}</div></div>
@@ -239,8 +278,8 @@ export async function render(container) {
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="form-group"><label>${t('settings.brand_name')}</label><input type="text" id="wlBrandName" class="input" placeholder="ScreenTinker"></div>
           <div class="form-group"><label>${t('settings.logo_url')}</label><input type="text" id="wlLogoUrl" class="input" placeholder="https://..."></div>
-          <div class="form-group"><label>${t('settings.primary_color')}</label><input type="color" id="wlPrimaryColor" value="#3B82F6" style="width:100%;height:36px;border:none;cursor:pointer;border-radius:var(--radius)"></div>
-          <div class="form-group"><label>${t('settings.bg_color')}</label><input type="color" id="wlBgColor" value="#111827" style="width:100%;height:36px;border:none;cursor:pointer;border-radius:var(--radius)"></div>
+          <div class="form-group"><label>${t('settings.primary_color')}</label><input type="color" id="wlPrimaryColor" class="input" value="#3B82F6"></div>
+          <div class="form-group"><label>${t('settings.bg_color')}</label><input type="color" id="wlBgColor" class="input" value="#111827"></div>
           <div class="form-group"><label>${t('settings.custom_domain')}</label><input type="text" id="wlDomain" class="input" placeholder="signage.yourcompany.com"></div>
           <div class="form-group"><label>${t('settings.favicon_url')}</label><input type="text" id="wlFavicon" class="input" placeholder="https://..."></div>
         </div>
@@ -305,6 +344,13 @@ export async function render(container) {
       <div id="importStatus" style="display:none;margin-top:12px;padding:12px;border-radius:var(--radius);font-size:13px"></div>
     </div>
 
+    <!-- Hosted AI credits (org-scoped). Hidden entirely when the server has no platform image
+         provider configured, so a self-hosted install sees nothing new. -->
+    <div class="settings-section" id="aiCreditsSection" style="display:none">
+      <h3>AI credits</h3>
+      <div id="aiCreditsBody"><p style="color:var(--text-muted);font-size:13px">Loading…</p></div>
+    </div>
+
     <div class="settings-section">
       <h3>${t('settings.language')}</h3>
       <select id="langSelect" class="input" style="width:200px;background:var(--bg-input)">
@@ -337,11 +383,47 @@ export async function render(container) {
     .then((notes) => { if (notes) whatsNew.renderHistory(document.getElementById('whatsNewHistory'), notes); })
     .catch(() => { /* About must render with or without it */ });
 
+  loadAiCredits();
+
   if (isAdmin) {
     loadWhiteLabel();
     loadTelemetry();
 
     loadSupportAccess();
+  }
+
+  // Hosted AI credits: balance, what is included this month, usage by model, and pack purchase.
+  async function loadAiCredits() {
+    const section = document.getElementById('aiCreditsSection');
+    const body = document.getElementById('aiCreditsBody');
+    if (!section || !body) return;
+    let st, use;
+    try { [st, use] = await Promise.all([api.aiHostedStatus(), api.aiHostedUsage()]); } catch { return; }
+    if (!st || !st.enabled) return;   // hosted AI off: the BYO path is unchanged and nothing shows
+    section.style.display = '';
+    const q = new URLSearchParams((location.hash.split('?')[1]) || '');
+    const banner = q.get('credits') === 'success'
+      ? '<p style="color:var(--success, #22c55e);font-size:13px">Payment received — credits appear as soon as Stripe confirms it (usually seconds). Refresh if they have not.</p>'
+      : q.get('credits') === 'cancelled' ? '<p style="color:var(--text-muted);font-size:13px">Purchase cancelled — nothing was charged.</p>' : '';
+    const rows = (use.usage || []).map((u) => `<tr><td>${esc(formatRow({ ...u, credits: u.credits, charge_usd: u.credits / 100 }).split(' · ').slice(0, 2).join(' · '))}</td><td>${esc(String(u.images))}</td><td>${esc(String(u.credits))}</td><td>${esc(usd(u.credits / 100))}</td></tr>`).join('');
+    const buy = st.can_buy
+      ? (st.checkout_available
+        ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">${st.packs.map((p) => `<button class="btn btn-secondary btn-sm" data-pack="${esc(p.id)}">Buy ${esc(p.credits.toLocaleString())} credits · ${esc(usd(p.usd))}</button>`).join('')}</div>`
+        : '<p style="font-size:12px;color:var(--text-muted);margin-top:12px">Online purchase is not set up on this server — contact your administrator to add credits.</p>')
+      : '<p style="font-size:12px;color:var(--text-muted);margin-top:12px">An organization admin can buy more credits.</p>';
+    body.innerHTML = `${banner}
+      <p style="color:var(--text-muted);font-size:12px;margin-bottom:12px">ScreenTinker-hosted image generation. You choose the model for every image and pay 2× that model's provider cost (1 credit = $0.01). Each month includes credits worth 10% of your screen bill; included credits expire at month end, purchased credits never do. Your own AI endpoint never uses credits.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:12px">
+        <div><div style="font-size:11px;color:var(--text-muted)">Balance</div><div style="font-size:20px;font-weight:600">${esc(String(st.balance))}</div></div>
+        <div><div style="font-size:11px;color:var(--text-muted)">Included remaining (${esc(st.period)})</div><div style="font-size:20px;font-weight:600">${esc(String(st.included_remaining))} <span style="font-size:12px;font-weight:400;color:var(--text-muted)">of ${esc(String(st.included_this_month))}</span></div></div>
+        <div><div style="font-size:11px;color:var(--text-muted)">Purchased remaining</div><div style="font-size:20px;font-weight:600">${esc(String(st.purchased_remaining))}</div></div>
+      </div>
+      <p style="font-weight:500;margin:12px 0 6px">This month's usage</p>
+      ${rows ? `<div class="table-wrap"><table class="corp-table"><thead><tr><th>Model</th><th>Images</th><th>Credits</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table></div>`
+        : '<p style="color:var(--text-muted);font-size:13px">No hosted images generated yet this month.</p>'}
+      ${buy}
+      ${st.rate_card ? `<p style="font-size:11px;margin-top:12px;color:${st.rate_card.stale ? 'var(--danger, #e05252)' : 'var(--text-muted)'}">Platform admin: rate card last verified ${esc(st.rate_card.verified_at)} (${esc(String(st.rate_card.age_days))} days ago)${st.rate_card.stale ? ' — re-check provider prices and update config/ai-rate-card.js' : ''}.</p>` : ''}`;
+    body.querySelectorAll('[data-pack]').forEach((b) => b.addEventListener('click', () => buyPack(b.dataset.pack)));
   }
 
   // Support access (server/lib/support-access). The customer half — request code, open requests,
@@ -373,10 +455,10 @@ export async function render(container) {
 
     box.innerHTML = `
       <p style="font-weight:500;margin:12px 0 6px">${t('support.sessions_title')}</p>
-      ${st.grants.length ? `<table class="table" style="width:100%"><thead><tr><th>${t('support.col_org')}</th><th>${t('support.col_reason')}</th><th>${t('support.col_first_used')}</th><th>${t('support.col_expires')}</th><th></th></tr></thead><tbody>${grants}</tbody></table>`
+      ${st.grants.length ? `<div class="table-wrap"><table class="corp-table"><thead><tr><th>${t('support.col_org')}</th><th>${t('support.col_reason')}</th><th>${t('support.col_first_used')}</th><th>${t('support.col_expires')}</th><th></th></tr></thead><tbody>${grants}</tbody></table></div>`
         : `<p style="color:var(--text-muted);font-size:13px">${t('support.no_sessions')}</p>`}
       ${st.requests.length ? `<p style="font-weight:500;margin:16px 0 6px">${t('support.requests_title')}</p>
-        <table class="table" style="width:100%"><thead><tr><th>${t('support.col_code')}</th><th>${t('support.col_requested_by')}</th><th>${t('support.col_expires')}</th><th></th></tr></thead><tbody>${requests}</tbody></table>` : ''}`;
+        <div class="table-wrap"><table class="corp-table"><thead><tr><th>${t('support.col_code')}</th><th>${t('support.col_requested_by')}</th><th>${t('support.col_expires')}</th><th></th></tr></thead><tbody>${requests}</tbody></table></div>` : ''}`;
 
     box.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
       try { await api.delete(`/auth/support/grant/${encodeURIComponent(b.dataset.revoke)}`); showToast(t('support.toast_revoked'), 'success'); loadSupportAccess(); }
@@ -1062,7 +1144,8 @@ export async function render(container) {
           <div>
             <strong>${esc(p.name)}</strong>
             ${p.enabled ? '' : `<span style="font-size:11px;color:var(--text-muted)"> — ${esc(t('sso.disabled'))}</span>`}
-            <div style="font-size:12px;color:var(--text-muted);margin-top:2px">${esc(p.issuer)}</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-top:2px">${esc(p.kind === 'saml' ? `${t('sso.protocol_saml')} · ${p.idp_entity_id}` : p.issuer)}</div>
+            ${p.kind === 'saml' && p.cert ? `<div style="font-size:12px;color:var(--text-muted)">${esc(t('sso.saml_cert_label'))}: ${esc(p.cert.subject)} — ${esc(t('sso.saml_cert_expires'))} ${esc(p.cert.valid_to)}</div>` : ''}
             <div style="font-size:12px;color:var(--text-muted)">${esc(t('sso.domains_label'))}: ${esc(p.email_domains || '—')}</div>
             ${((p.domains || []).some((d) => !d.verified) || (p.domains || []).length === 0)
               ? `<div style="font-size:12px;color:var(--warning,#b45309);margin-top:2px">⚠️ ${esc(t('sso.unverified_warning'))}</div>`
@@ -1081,10 +1164,18 @@ export async function render(container) {
         </div>
         <!-- The admin has to paste this into their identity provider, and it must match character
              for character, so it is shown rather than described. -->
+        ${p.kind === 'saml' ? `
+        <div style="margin-top:8px;font-size:12px">
+          <div style="font-weight:600;margin-bottom:4px">${esc(t('sso.saml_sp_heading'))}</div>
+          ${[['sso.saml_sp_entity_id', p.sp_entity_id], ['sso.saml_acs_url', p.acs_url], ['sso.saml_metadata_url', p.metadata_url]].map(([k, v]) => `
+          <div style="color:var(--text-muted);margin-top:4px">${esc(t(k))}</div>
+          <code style="display:block;word-break:break-all;padding:6px;background:var(--bg-secondary);border-radius:4px">${esc(v)}</code>`).join('')}
+          <div style="color:var(--text-muted);margin-top:6px">${esc(t('sso.saml_nameid_hint'))}</div>
+        </div>` : `
         <div style="margin-top:8px;font-size:12px">
           <div style="color:var(--text-muted)">${esc(t('sso.callback_label'))}</div>
           <code style="display:block;word-break:break-all;padding:6px;background:var(--bg-secondary);border-radius:4px">${esc(origin + p.callback_url)}</code>
-        </div>
+        </div>`}
 
         <!-- Editing is per provider, because an organization may have several (one per domain, or
              one per identity provider after a merger) and they are configured independently. -->
@@ -1121,6 +1212,18 @@ export async function render(container) {
           <div style="display:grid;gap:10px;max-width:560px">
             <div class="form-group"><label>${esc(t('sso.f_name'))}</label>
               <input type="text" class="input" data-f="name" value="${esc(p.name)}"></div>
+            ${p.kind === 'saml' ? `
+            <div class="form-group"><label>${esc(t('sso.f_saml_metadata'))}</label>
+              <textarea class="input" data-f="metadata_xml" rows="3" spellcheck="false" style="font-family:monospace;font-size:11px"></textarea>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:4px">${esc(t('sso.f_saml_metadata_edit_hint'))}</div></div>
+            <div class="form-group"><label>${esc(t('sso.f_saml_entity_id'))}</label>
+              <input type="text" class="input" data-f="idp_entity_id" value="${esc(p.idp_entity_id)}"></div>
+            <div class="form-group"><label>${esc(t('sso.f_saml_sso_url'))}</label>
+              <input type="url" class="input" data-f="sso_url" value="${esc(p.sso_url || '')}"></div>
+            <div class="form-group"><label>${esc(t('sso.f_saml_cert'))}</label>
+              <textarea class="input" data-f="cert" rows="3" spellcheck="false" style="font-family:monospace;font-size:11px" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:4px">${esc(t('sso.f_saml_cert_edit_hint'))}</div></div>
+            ` : `
             <div class="form-group"><label>${esc(t('sso.f_issuer'))}</label>
               <input type="url" class="input" data-f="issuer" value="${esc(p.issuer)}"></div>
             <div class="form-group"><label>${esc(t('sso.f_client_id'))}</label>
@@ -1136,11 +1239,11 @@ export async function render(container) {
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-top:6px">
                 <input type="checkbox" data-f="clear_secret"> ${esc(t('sso.secret_clear'))}
               </label>` : ''}
-            </div>
+            </div>`}
             <div class="form-group"><label>${esc(t('sso.f_domains'))}</label>
               <input type="text" class="input" data-f="email_domains" value="${esc(p.email_domains)}"></div>
             <div style="display:flex;gap:6px">
-              <button class="btn btn-primary btn-sm" data-sso-save="${esc(p.id)}">${esc(t('sso.save'))}</button>
+              <button class="btn btn-primary btn-sm" data-sso-save="${esc(p.id)}" data-kind="${esc(p.kind || 'oidc')}">${esc(t('sso.save'))}</button>
               <button class="btn btn-secondary btn-sm" data-sso-cancel="${esc(p.id)}">${esc(t('sso.cancel'))}</button>
             </div>
           </div>
@@ -1284,6 +1387,8 @@ export async function render(container) {
             discovery: t('sso.check_discovery'),
             endpoints: t('sso.check_endpoints'),
             signing_keys: t('sso.check_signing_keys'),
+            certificate: t('sso.check_certificate'),
+            sso_url: t('sso.check_sso_url'),
           };
           const rows = (data.checks || []).map((c) => `
             <div>${c.ok ? '✅' : '❌'} ${esc(CHECK_LABELS[c.name] || c.name)} — <span style="color:var(--text-muted)">${esc(c.detail || '')}</span></div>`).join('');
@@ -1294,7 +1399,7 @@ export async function render(container) {
            * implied "SSO works" would send an admin away from the one thing still to check.
            */
           out.innerHTML = rows + (data.ok
-            ? `<div style="margin-top:6px;color:var(--text-muted)">${esc(t('sso.test_caveat'))}</div>`
+            ? `<div style="margin-top:6px;color:var(--text-muted)">${esc(data.acs_url ? t('sso.saml_test_caveat') : t('sso.test_caveat'))}</div>`
             : '');
         } catch {
           out.textContent = t('sso.test_failed');
@@ -1318,6 +1423,15 @@ export async function render(container) {
         const panel = document.getElementById(`ssoEdit-${btn.dataset.ssoSave}`);
         if (!panel) return;
         const val = (f) => panel.querySelector(`[data-f="${f}"]`)?.value?.trim() ?? '';
+        if (btn.dataset.kind === 'saml') {
+          // Blank metadata and certificate mean "keep what is stored", exactly like the OIDC secret.
+          const body = { name: val('name'), idp_entity_id: val('idp_entity_id'), sso_url: val('sso_url'), email_domains: val('email_domains') };
+          if (val('metadata_xml')) body.metadata_xml = val('metadata_xml');
+          if (val('cert')) body.cert = val('cert');
+          if (!body.name) { showToast(t('sso.saml_missing_fields'), 'error'); return; }
+          await ssoRequest('PUT', `/${btn.dataset.ssoSave}`, body);
+          return;
+        }
         const body = {
           name: val('name'),
           issuer: val('issuer'),
@@ -1375,7 +1489,29 @@ export async function render(container) {
     }
   }
 
+  const ssoKindEl = document.getElementById('ssoKind');
+  ssoKindEl?.addEventListener('change', () => {
+    const saml = ssoKindEl.value === 'saml';
+    document.getElementById('ssoSamlFields').style.display = saml ? 'grid' : 'none';
+    document.getElementById('ssoOidcFields').style.display = saml ? 'none' : 'grid';
+  });
   document.getElementById('ssoCreateBtn')?.addEventListener('click', async () => {
+    if (ssoKindEl?.value === 'saml') {
+      const v = (id) => document.getElementById(id).value.trim();
+      const payload = { kind: 'saml', name: v('ssoName'), email_domains: v('ssoDomains') };
+      if (v('ssoSamlMetadata')) payload.metadata_xml = v('ssoSamlMetadata');
+      else Object.assign(payload, { idp_entity_id: v('ssoSamlEntityId'), sso_url: v('ssoSamlSsoUrl'), cert: v('ssoSamlCert') });
+      if (!payload.name || (!payload.metadata_xml && (!payload.idp_entity_id || !payload.sso_url || !payload.cert))) {
+        showToast(t('sso.saml_missing_fields'), 'error');
+        return;
+      }
+      if (await ssoRequest('POST', '', payload)) {
+        ['ssoName', 'ssoDomains', 'ssoSamlMetadata', 'ssoSamlEntityId', 'ssoSamlSsoUrl', 'ssoSamlCert']
+          .forEach((id) => { document.getElementById(id).value = ''; });
+        document.getElementById('ssoAddDetails').open = false;
+      }
+      return;
+    }
     const payload = {
       name: document.getElementById('ssoName').value.trim(),
       issuer: document.getElementById('ssoIssuer').value.trim(),
@@ -1395,6 +1531,18 @@ export async function render(container) {
   });
 
   loadSso();
+  if (canManageOrgSecurity) mountCanvaSettings(document.getElementById('canvaSettingsCard'));
+  mountCorporateSettings(document.getElementById('corporateCard'));
+  // Org admins always; a workspace admin too, because the org may let workspaces choose their own
+  // storage — when it does not, the server answers 403 and the card stays hidden.
+  if (canManageOrgSecurity || user.current_workspace_role === 'workspace_admin') mountStorageSettings(document.getElementById('storageCard'));
+  // The server decides (can_manage): org owners and admins only.
+  if (canManageOrgSecurity) mountM365Settings(document.getElementById('m365Card'));
+  // BI connections belong to the organization; the card hides itself unless the server says can_manage.
+  if (canManageOrgSecurity) mountBiConnections(document.getElementById('biCard'));
+  if (canManageOrgSecurity) mountSocialConnections(document.getElementById('socialConnCard'));
+  // Meeting-room calendar connections: org owners and admins (the server agrees, and says can_manage).
+  if (canManageOrgSecurity) mountRoomSettings(document.getElementById('roomsCard'));
 
 
   document.getElementById('createTokenBtn')?.addEventListener('click', async () => {
@@ -1646,22 +1794,46 @@ async function loadWhiteLabel() {
     if (wl.hide_branding) document.getElementById('wlHideBranding').checked = true;
   } catch {}
 
+  /*
+   * ⚠️ custom_domain and custom_css are PLATFORM-ADMIN-ONLY on the server (routes/white-label.js
+   * 403s any non-empty value from anyone else, before writing anything). They used to be sent on
+   * every save, pre-filled from GET — so once the platform team had set either one, every later
+   * save by the workspace admin was refused outright and the brand name never changed. For
+   * everyone else they are shown read-only and LEFT OUT of the body (undefined = "don't touch").
+   */
+  const canSetDomainAndCss = isPlatformAdmin(user);
+  if (!canSetDomainAndCss) {
+    for (const id of ['wlDomain', 'wlCustomCss']) {
+      const f = document.getElementById(id);
+      if (f) { f.readOnly = true; f.title = t('settings.platform_admin_only'); }
+    }
+  }
+
   document.getElementById('saveWhiteLabelBtn')?.addEventListener('click', async () => {
     try {
-      await fetch('/api/white-label', {
+      const body = {
+        brand_name: document.getElementById('wlBrandName').value,
+        logo_url: document.getElementById('wlLogoUrl').value,
+        primary_color: document.getElementById('wlPrimaryColor').value,
+        bg_color: document.getElementById('wlBgColor').value,
+        favicon_url: document.getElementById('wlFavicon').value,
+        hide_branding: document.getElementById('wlHideBranding').checked ? 1 : 0,
+      };
+      if (canSetDomainAndCss) {
+        body.custom_domain = document.getElementById('wlDomain').value;
+        body.custom_css = document.getElementById('wlCustomCss').value;
+      }
+      const res = await fetch('/api/white-label', {
         method: 'POST',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          brand_name: document.getElementById('wlBrandName').value,
-          logo_url: document.getElementById('wlLogoUrl').value,
-          primary_color: document.getElementById('wlPrimaryColor').value,
-          bg_color: document.getElementById('wlBgColor').value,
-          custom_domain: document.getElementById('wlDomain').value,
-          favicon_url: document.getElementById('wlFavicon').value,
-          custom_css: document.getElementById('wlCustomCss').value,
-          hide_branding: document.getElementById('wlHideBranding').checked ? 1 : 0,
-        })
+        body: JSON.stringify(body),
       });
+      // ⚠️ fetch resolves on a 403 too. Without this a refused save (an editor, or the fields above)
+      // still said "Branding saved" while nothing at all had been written.
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || t('settings.toast.branding_save_failed'));
+      }
       await resetBranding();
       showToast(t('settings.toast.branding_saved'), 'success');
     } catch (err) {

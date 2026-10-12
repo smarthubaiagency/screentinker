@@ -16,7 +16,7 @@ const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const { db } = require('../db/database');
 const { requireScope } = require('../middleware/apiToken');
-const { accessContext } = require('../lib/tenancy');
+const { resourceAccess } = require('../lib/tenancy');
 const PowerWindow = require('../lib/power-window');
 const playerCapabilities = require('../lib/player-capabilities');
 const { powerScheduleForDevice, groupSchedulesForDevice, devicesAffectedBySchedule } = require('../lib/device-power-schedule');
@@ -29,7 +29,7 @@ const { powerScheduleForDevice, groupSchedulesForDevice, devicesAffectedBySchedu
 function requireFleetWrite(req, res, next) {
   if (!req.workspaceId) return res.status(403).json({ error: 'No workspace context' });
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(req.workspaceId);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) return res.status(403).json({ error: 'Access denied' });
   if (!ctx.actingAs && ctx.workspaceRole === 'workspace_viewer') {
     return res.status(403).json({ error: 'Read-only access' });
@@ -80,6 +80,29 @@ function validate(b, { partial = false } = {}) {
     if (typeof b.name === 'string' && b.name.length > 120) return 'name is too long';
   }
   return null;
+}
+
+/*
+ * CORPORATE (D13): a power schedule on a screen head office's playlist plays on is the
+ * organization's admins' to set. One named screen -> 403; a group -> allowed, and the response says
+ * how many of its screens ignore it (lib/device-power-schedule.js obeys only admin-set schedules
+ * there). Returns false when refused (response sent), else { mandated_members, admin }.
+ */
+function corporatePowerCheck(req, res, target) {
+  const corpGuard = require('../lib/corporate/guard');
+  const orgId = corpGuard.orgOfWorkspace(db, req.workspaceId);
+  const admin = corpGuard.isOrgAdmin(req, orgId) && !req.viaToken;
+  try {
+    if (target.deviceId) {
+      corpGuard.assertDeviceRouteControl(req, target.deviceId, 'set a power schedule on it');
+      return { mandated_members: 0, admin };
+    }
+    const members = db.prepare('SELECT device_id FROM device_group_members WHERE group_id = ?').all(target.groupId).map((r) => r.device_id);
+    return { mandated_members: admin ? 0 : members.filter((id) => corpGuard.activeMandateFor(db, id)).length, admin };
+  } catch (e) {
+    if (corpGuard.send(res, e, req)) return false;
+    throw e;
+  }
 }
 
 /** The target must exist IN THIS WORKSPACE — the check that makes cross-tenant addressing fail. */
@@ -217,6 +240,8 @@ router.post('/', requireScope('full'), requireFleetWrite, (req, res) => {
   if (bad) return res.status(400).json({ error: bad });
   const target = resolveTarget(req, b);
   if (target.error) return res.status(400).json({ error: target.error });
+  const corp = corporatePowerCheck(req, res, target);
+  if (!corp) return;
 
   const existing = db.prepare(
     `SELECT id FROM display_power_schedules
@@ -230,16 +255,16 @@ router.post('/', requireScope('full'), requireFleetWrite, (req, res) => {
 
   const id = uuidv4();
   db.prepare(
-    `INSERT INTO display_power_schedules (id, workspace_id, name, device_id, group_id, timezone, enabled, windows)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO display_power_schedules (id, workspace_id, name, device_id, group_id, timezone, enabled, windows, set_by_org_admin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id, req.workspaceId, (b.name || '').trim(), target.deviceId, target.groupId,
-    b.timezone || null, b.enabled === false ? 0 : 1, JSON.stringify(b.windows)
+    b.timezone || null, b.enabled === false ? 0 : 1, JSON.stringify(b.windows), corp.admin ? 1 : 0
   );
 
   pushSchedule(req, id);
   const row = db.prepare('SELECT * FROM display_power_schedules WHERE id = ?').get(id);
-  res.status(201).json({ schedule: shape(row) });
+  res.status(201).json({ schedule: shape(row), ...(corp.mandated_members ? { mandated_members: corp.mandated_members } : {}) });
 });
 
 router.put('/:id', requireScope('full'), requireFleetWrite, (req, res) => {
@@ -265,11 +290,13 @@ router.put('/:id', requireScope('full'), requireFleetWrite, (req, res) => {
     deviceId = target.deviceId;
     groupId = target.groupId;
   }
+  const corp = corporatePowerCheck(req, res, { deviceId, groupId });
+  if (!corp) return;
 
   db.prepare(
     `UPDATE display_power_schedules
         SET name = ?, device_id = ?, group_id = ?, timezone = ?, enabled = ?, windows = ?,
-            updated_at = CAST(strftime('%s','now') AS INTEGER)
+            set_by_org_admin = ?, updated_at = CAST(strftime('%s','now') AS INTEGER)
       WHERE id = ? AND workspace_id = ?`
   ).run(
     b.name !== undefined ? String(b.name || '').trim() : row.name,
@@ -277,12 +304,13 @@ router.put('/:id', requireScope('full'), requireFleetWrite, (req, res) => {
     b.timezone !== undefined ? (b.timezone || null) : row.timezone,
     b.enabled !== undefined ? (b.enabled ? 1 : 0) : row.enabled,
     b.windows !== undefined ? JSON.stringify(b.windows) : row.windows,
+    corp.admin ? 1 : 0,
     row.id, req.workspaceId
   );
 
   pushSchedule(req, row.id, before);
   const out = db.prepare('SELECT * FROM display_power_schedules WHERE id = ?').get(row.id);
-  res.json({ schedule: shape(out) });
+  res.json({ schedule: shape(out), ...(corp.mandated_members ? { mandated_members: corp.mandated_members } : {}) });
 });
 
 router.delete('/:id', requireScope('full'), requireFleetWrite, (req, res) => {

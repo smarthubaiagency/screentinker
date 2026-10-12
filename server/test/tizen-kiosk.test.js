@@ -694,3 +694,112 @@ test('REGRESSION #6: the page leaving by another path (resume / screen_on re-ren
   assert.equal(p.items.length, 3, 'parked update applied after the render');
   assert.equal(p.isHeld(), false);
 });
+
+// ───────────────────────────────────────────── emergency alerts cut in (interrupt: true)
+// QA: an alert card appeared only after the current item finished (#157 deferral, up to 60 s). The
+// server marks the card interrupt:true; a change to the SET of those applies at once, mid-item.
+const CARD = { widget_id: 'w-cap', widget_type: 'cap_alert', duration_sec: 60, sort_order: 0, interrupt: true };
+const IMG_A = { content_id: 'ca', mime_type: 'image/jpeg', duration_sec: 30, sort_order: 0, filename: 'a.jpg' };
+const IMG_B = { content_id: 'cb', mime_type: 'image/jpeg', duration_sec: 30, sort_order: 1, filename: 'b.jpg' };
+const IMG_C = { content_id: 'cc', mime_type: 'image/jpeg', duration_sec: 30, sort_order: 2, filename: 'c.jpg' };
+
+test('interrupt: the set comparison is on interrupt items only, by identity', () => {
+  const { p } = playerEnv();
+  assert.equal(p.interruptChanged([IMG_A], [CARD]), true, 'raised');
+  assert.equal(p.interruptChanged([CARD], [IMG_A, IMG_B]), true, 'cleared');
+  assert.equal(p.interruptChanged([CARD], [Object.assign({}, CARD, { duration_sec: 90 })]), false, 'the same alert re-sent');
+  assert.equal(p.interruptChanged([IMG_A], [IMG_B]), false, 'an ordinary edit');
+  assert.equal(p.interruptChanged([IMG_A], [Object.assign({}, CARD, { interrupt: undefined })]), false, 'the flag is the contract, not the widget');
+});
+
+test('interrupt: clearing an alert swaps at once, where an ordinary edit still defers (#157 unchanged)', () => {
+  // Ordinary: [A,B] playing A, edited to [B,C] -> A removed while live -> deferred.
+  let { p } = playerEnv();
+  p.load([IMG_A, IMG_B]);
+  p.load([IMG_B, IMG_C]);
+  assert.equal(p._deferredRotation, true, 'an ordinary edit keeps the deferral');
+  // Alert clear: [CARD] playing, the loop comes back with 2+ items -> would defer; must not.
+  ({ p } = playerEnv());
+  p.load([IMG_A, IMG_B]);
+  p.load([CARD]);
+  assert.equal(p.items[p.getIndex()].widget_id, 'w-cap', 'raised: the card is on screen now');
+  p.load([IMG_B, IMG_C]);
+  assert.equal(p._deferredRotation, false, 'cleared: not deferred');
+  assert.equal(p.items[p.getIndex()].content_id, 'cb', 'the loop is back immediately');
+});
+
+test('interrupt: an alert is never parked behind an interactive session; the session is ended', () => {
+  const { env, p, stage, s } = playerEnv();
+  p.load([WIDGET, IMAGE]);
+  frameOf(stage).fire('load');
+  tapIntoFrame(env, stage);
+  assert.equal(p.isHeld(), true);
+  p.load([IMAGE, Object.assign({}, IMAGE, { content_id: 'c2' })]);
+  assert.equal(p.items.length, 2, 'an ordinary update is still parked');
+  assert.equal(p.items[0].widget_id, 'w1');
+  p.load([CARD]);
+  assert.equal(p.isHeld(), false, 'the hold is dropped');
+  assert.equal(p.kiosk.isShowing(), false, 'the page is closed');
+  assert.equal(p.items[p.getIndex()].widget_id, 'w-cap', 'the card is on screen now');
+  assert.equal(s.calls.sessions.length, 1, 'the visitor\'s session is still recorded');
+  env.c.advance(1);
+  assert.equal(p.items[0].widget_id, 'w-cap', 'the dropped parked update never comes back over the card');
+});
+
+// ───────────────────────────────────────────── #157 deferral reads the OUTGOING playlist
+// load() replaced this.items with the incoming list and THEN asked "does the outgoing item ever
+// advance?" of this.items, so it measured the NEW list. The web player asks oldPlaylist.length <= 1.
+const onScreen = (stage) => {
+  const imgs = stage.querySelectorAll('img');
+  if (!imgs.length) return null;
+  const m = /\/(c[a-z])(?:[/?]|$)/.exec(imgs[imgs.length - 1].src);   // /api/content/<id>/...
+  return m ? m[1] : imgs[imgs.length - 1].src;
+};
+
+test('deferral: a ONE-item playlist replaced by a longer one swaps at once (no solo timer to wait for)', () => {
+  const { env, p, stage } = playerEnv();
+  p.load([IMG_A]);                                            // solo image: rendered `single`, no timer
+  assert.equal(onScreen(stage), 'ca');
+  p.load([IMG_B, IMG_C]);                                     // A replaced while live
+  assert.equal(p._deferredRotation, false, 'not deferred: the outgoing solo item never advances');
+  assert.equal(onScreen(stage), 'cb', 'the new playlist is on screen now, not after the 60 s deadline');
+  env.c.advance(30_001);
+  assert.equal(onScreen(stage), 'cc', 'and it rotates normally');
+});
+
+test('deferral: a playing MULTI-item list replaced by a one-item list is deferred, not cut mid-item', () => {
+  const { env, p, stage } = playerEnv();
+  p.load([IMG_A, IMG_B]);                                     // A playing, 30 s dwell armed
+  env.c.advance(10_000);
+  p.load([Object.assign({}, IMG_C, { sort_order: 0 })]);      // A removed while live; new list has one item
+  assert.equal(p._deferredRotation, true, 'deferred: A has a dwell timer that will advance');
+  assert.equal(onScreen(stage), 'ca', 'A keeps playing to the end of its dwell');
+  env.c.advance(20_001);                                      // A's dwell ends -> deferred rotation applied
+  assert.equal(p._deferredRotation, false);
+  assert.equal(onScreen(stage), 'cc', 'swapped at the natural advance');
+});
+
+test('deferral: an ordinary edit of a multi-item list still waits for the current item, then continues at the successor', () => {
+  const { env, p, stage } = playerEnv();
+  p.load([IMG_A, IMG_B]);
+  p.load([Object.assign({}, IMG_B, { sort_order: 0 }), Object.assign({}, IMG_C, { sort_order: 1 })]);
+  assert.equal(p._deferredRotation, true);
+  env.c.advance(29_000);
+  assert.equal(onScreen(stage), 'ca', 'A still up before its dwell ends');
+  env.c.advance(1_001);
+  assert.equal(onScreen(stage), 'cb', 'continues at the preserved successor B');
+});
+
+test('deferral: interrupt items cut in at once from a one-item and from a multi-item list', () => {
+  let { p, stage } = playerEnv();
+  p.load([IMG_A]);
+  p.load([CARD, Object.assign({}, IMG_B, { sort_order: 1 })]);
+  assert.equal(p._deferredRotation, false, 'one-item -> alert: not deferred');
+  assert.equal(p.items[p.getIndex()].widget_id, 'w-cap');
+  ({ p, stage } = playerEnv());
+  p.load([IMG_A, IMG_B]);
+  assert.equal(onScreen(stage), 'ca');
+  p.load([CARD]);                                             // multi -> one-item alert
+  assert.equal(p._deferredRotation, false, 'multi -> alert: not deferred');
+  assert.equal(p.items[p.getIndex()].widget_id, 'w-cap', 'the card is on screen now');
+});

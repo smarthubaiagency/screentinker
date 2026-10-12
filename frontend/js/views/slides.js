@@ -3,6 +3,7 @@ import { esc } from '../utils.js';
 import { showToast } from '../components/toast.js';
 import { t } from '../i18n.js';
 import { renderApprovalBar } from '../components/approval-actions.js';
+import { mountHostedPicker } from '../components/ai-hosted-picker.js';
 
 /*
  * The slide deck editor.
@@ -231,7 +232,9 @@ function newElement(kind) {
     ...(kind === 'date' ? { date_format: 'long', tz: '', locale: '' } : {}),
     // Default target a week out: a countdown to "now" reads as expired the moment it is added, and
     // the operator cannot tell whether it works.
-    ...(kind === 'countdown' ? { target: Date.now() + 7 * 86400000 } : {}),
+    // locale '' = the panel's own language for the units ("3 Tg." on a German screen). A countdown
+    // saved before that existed has no locale key at all and keeps its English "3d 4h 5m".
+    ...(kind === 'countdown' ? { target: Date.now() + 7 * 86400000, locale: '' } : {}),
     // ⚠️ Black modules, NOT style.color — a QR that inherits the usual white text colour is a
     // white square on a white panel. See kindConfig in lib/slide-render.js.
     ...(kind === 'qr' ? { qr_ec: 'M', qr_fg: '#000000', qr_bg: '#FFFFFF' } : {}),
@@ -571,6 +574,9 @@ function renderEditor(container) {
         </button>
         <span id="aiStatus" style="font-size:12px;color:var(--text-muted);margin-left:4px"></span>
       </div>
+      <!-- Hosted AI (ScreenTinker credits). Stays hidden unless the server has a platform image
+           provider configured; then "Generate background" follows whichever path is picked here. -->
+      <div id="aiHostedRow" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px"></div>
     </div>
     <div style="display:grid;grid-template-columns:42px minmax(0,1fr) 290px;gap:12px;align-items:start">
       <div class="settings-section" id="tools" style="padding:7px;display:flex;flex-direction:column;gap:5px"></div>
@@ -688,6 +694,8 @@ function renderEditor(container) {
   container.querySelector('#aiPrompt').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); aiGenerate(container); }
   });
+  hostedCtl = null;
+  mountHostedPicker(container.querySelector('#aiHostedRow')).then((ctl) => { hostedCtl = ctl; }).catch(() => {});
   container.querySelector('#aiCfgBtn').addEventListener('click', async () => {
     const { openAiSettingsModal } = await import('../components/ai-settings-modal.js');
     openAiSettingsModal();
@@ -801,6 +809,9 @@ function styleFor(e) {
  * for the same reason — nothing serves an SVG document from this origin.
  */
 const qrCache = new Map();
+// Tracked QR links for the QR element's picker, loaded once per page (null = not asked yet).
+let qrLinksCache = null;
+const qrShortUrl = (l) => `${location.origin}${l.path}`;
 const qrKey = (text, ec, fg, bg) => `${ec}|${fg}|${bg}|${text}`;
 
 async function qrDataUrl(text, ec, fg, bg) {
@@ -850,6 +861,26 @@ function paintQr(host, e, text) {
  * the server silently drops — which is the worse failure, because the operator sees their choice
  * accepted and the wall ignores it.
  */
+// Countdown units by language (day, hour, minute, second) — the UNITS table of LIVE_SCRIPT.
+const COUNTDOWN_UNITS = {
+  en: ['d', 'h', 'm', 's'],
+  de: ['\u00a0Tg.', '\u00a0Std.', '\u00a0Min.', '\u00a0Sek.'],
+  es: ['d', 'h', 'min', 's'],
+  fr: ['j', 'h', 'min', 's'],
+  hi: ['\u00a0\u0926\u093f\u0928', '\u00a0\u0918\u0902\u0970', '\u00a0\u092e\u093f\u0970', '\u00a0\u0938\u0947\u0970'],
+  it: ['g', 'h', 'min', 's'],
+  ja: ['\u65e5', '\u6642\u9593', '\u5206', '\u79d2'],
+  nl: ['d', 'u', 'm', 's'],
+  pt: ['d', 'h', 'min', 's'],
+  zh: ['\u5929', '\u5c0f\u65f6', '\u5206', '\u79d2']
+};
+function countdownUnits(locale) {
+  // undefined/null: a countdown from before translated units — English, as it always was.
+  if (locale === undefined || locale === null) return COUNTDOWN_UNITS.en;
+  const l = String(locale || (typeof navigator !== 'undefined' && navigator.language) || 'en').toLowerCase().split('-')[0];
+  return Object.prototype.hasOwnProperty.call(COUNTDOWN_UNITS, l) ? COUNTDOWN_UNITS[l] : COUNTDOWN_UNITS.en;
+}
+
 function liveText(e, now) {
   if (e.kind === 'countdown') {
     const t = Number(e.target);
@@ -859,7 +890,8 @@ function liveText(e, now) {
     const sec = Math.floor(ms / 1000);
     const d = Math.floor(sec / 86400); const h = Math.floor((sec % 86400) / 3600);
     const m = Math.floor((sec % 3600) / 60); const ss = sec % 60;
-    return d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m ${ss}s` : `${m}m ${ss}s`;
+    const u = countdownUnits(e.locale);
+    return d > 0 ? `${d}${u[0]} ${h}${u[1]} ${m}${u[2]}` : h > 0 ? `${h}${u[1]} ${m}${u[2]} ${ss}${u[3]}` : `${m}${u[2]} ${ss}${u[3]}`;
   }
   let o;
   if (e.kind === 'clock') {
@@ -1297,7 +1329,12 @@ function renderProps(container) {
   if (state.tab === 'content') {
     host.innerHTML =
       (e.kind === 'qr'
-        ? row('Encodes', `<textarea class="input" id="pText" rows="2" style="resize:vertical">${esc(s.fields[e.slot] || '')}</textarea>`)
+        ? row('Tracked link', `<select class="input" id="pQrLink"><option value="">Not tracked</option>${(qrLinksCache || []).map((l) =>
+              `<option value="${esc(l.id)}" ${s.fields[e.slot] === qrShortUrl(l) ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select>`)
+          + `<p style="font-size:11.5px;color:var(--text-muted);grid-column:1/-1;margin:0">
+               Pick a link from QR codes to count scans. The code then holds its short address, so the
+               link's destination can change later without changing this slide.</p>`
+          + row('Encodes', `<textarea class="input" id="pText" rows="2" style="resize:vertical">${esc(s.fields[e.slot] || '')}</textarea>`)
           + `<p style="font-size:11.5px;color:var(--text-muted);grid-column:1/-1;margin:0">
                A URL, phone number or plain text. The code is drawn on the server, so it works with
                no network at the panel.</p>`
@@ -1323,6 +1360,7 @@ function renderProps(container) {
           + row('Language', `<input class="input" id="pLoc" placeholder="the panel's own" value="${esc(e.locale || '')}">`)
         : e.kind === 'countdown'
         ? row('Counts down to', `<input type="datetime-local" class="input" id="pTarget" value="${esc(localInput(e.target))}">`)
+          + row('Language', `<input class="input" id="pLoc" placeholder="${e.locale == null ? 'English (3d 4h 5m)' : "the panel's own"}" value="${esc(e.locale || '')}">`)
           + row('Then shows', `<textarea class="input" id="pText" rows="2" style="resize:vertical">${esc(s.fields[e.slot] || '')}</textarea>`)
           + `<p style="font-size:11.5px;color:var(--text-muted);grid-column:1/-1;margin:0">
                The message replaces the counter once the moment passes, so the slide keeps working
@@ -1412,6 +1450,20 @@ function renderProps(container) {
       return el;
     };
     bindCfg('#pQrEc', (v) => { e.qr_ec = v; });
+    // A tracked link fills the encoded text with its short address (views/qr-codes.js).
+    const qrLinkSel = host.querySelector('#pQrLink');
+    if (qrLinkSel) qrLinkSel.onchange = () => {
+      const l = (qrLinksCache || []).find((x) => x.id === qrLinkSel.value);
+      if (!l) return;
+      s.fields[e.slot] = qrShortUrl(l);
+      const textEl = host.querySelector('#pText');
+      if (textEl) textEl.value = s.fields[e.slot];
+      touchValue(container);
+    };
+    if (e.kind === 'qr' && qrLinksCache === null) {
+      qrLinksCache = [];
+      api.get('/qr-links').then((rows) => { qrLinksCache = Array.isArray(rows) ? rows : []; if (qrLinksCache.length) renderProps(container); }).catch(() => {});
+    }
     bindCfg('#pFit', (v) => { e.fit = v; });
     bindCfg('#pQrFg', (v) => { e.qr_fg = v; });
     bindCfg('#pQrBg', (v) => { e.qr_bg = v; });
@@ -1788,6 +1840,12 @@ async function publish(container) {
 let aiBusy = false;
 let aiBgBusy = false;   // an image generation costs money per click; never let two run
 let aiLayerBusy = false; // and this one is up to FIVE generations per click
+/*
+ * The hosted-images picker for the open editor, or null (hosted AI off / not loaded yet). Only the
+ * single-image background uses it: layered generation is several images plus a text-model plan,
+ * and stays on the workspace's own endpoints in this version.
+ */
+let hostedCtl = null;
 
 /*
  * Generate a background PICTURE for the slide you are on.
@@ -1829,7 +1887,14 @@ async function aiGenerateBackground(container) {
      * crops to a centre band, which is exactly the complaint that made xAI's aspect_ratio matter
      * in the first place — repeating it locally would be worse, because here we know the answer.
      */
-    const out = await api.aiGenerateBackground(prompt, aspectPixels());
+    let out;
+    if (hostedCtl && hostedCtl.isHosted()) {
+      // Confirms the exact cost first; null = the user declined or was sent to buy credits.
+      out = await hostedCtl.generate(prompt, aspectPixels());
+      if (!out) { say(''); return; }
+    } else {
+      out = await api.aiGenerateBackground(prompt, aspectPixels());
+    }
     if (!out || !out.content_id) throw new Error('no image came back');
     const idx = state.deck.doc.slides.indexOf(target);
     if (idx < 0) { say('That slide is gone — nothing changed.', true); return; }
@@ -1860,7 +1925,7 @@ async function aiGenerateBackground(container) {
      * two symptoms, and the half-committed state made it look like two separate bugs.
      */
     paintAll(container);
-    say('Background applied.');
+    say(out.credits_spent ? `Background applied — ${out.credits_spent} credits spent, ${out.balance} left.` : 'Background applied.');
   } catch (e) {
     say(String((e && e.message) || e).slice(0, 200), true);
   } finally {

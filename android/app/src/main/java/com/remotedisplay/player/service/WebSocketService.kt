@@ -22,6 +22,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.remotedisplay.player.MainActivity
 import com.remotedisplay.player.RemoteDisplayApp
+import com.remotedisplay.player.data.DeletedDeviceWipe
 import com.remotedisplay.player.data.OfflinePlayQueue
 import com.remotedisplay.player.data.ServerConfig
 import com.remotedisplay.player.telemetry.DeviceInfo
@@ -454,6 +455,20 @@ class WebSocketService : Service() {
                     kioskFlushInFlight = false
                     flushKioskSessions()
                     flushKioskErrors()
+                    audienceFlushInFlight = false
+                    flushAudience()
+                }
+
+                // Audience counts the server has (or refused for good): drop them from the queue.
+                safeOn("device:audience-ack") { args ->
+                    val data = args.firstOrNull() as? JSONObject ?: return@safeOn
+                    val ids = data.optJSONArray("ids") ?: JSONArray()
+                    val list = (0 until ids.length()).map { ids.optString(it, "") }.filter { it.isNotEmpty() }
+                    com.remotedisplay.player.audience.AudienceLog.ack(applicationContext, list)
+                    audienceFlushInFlight = false
+                    if (list.isNotEmpty() && com.remotedisplay.player.audience.AudienceLog.peek(applicationContext).isNotEmpty()) {
+                        handler.post { flushAudience() }
+                    }
                 }
 
                 // #473 v2: the server stored these session ids (or already had them): drop them.
@@ -480,7 +495,17 @@ class WebSocketService : Service() {
                     (args.firstOrNull() as? JSONObject)?.let { ingestClockSample(it.optLong("server_ms", 0L), it.optLong("client_ms", 0L)) }
                 }
 
-                safeOn("device:unpaired") { handleServerRejection("device:unpaired (removed on server)") }
+                safeOn("device:unpaired") { args ->
+                    // Deleted by an operator: its downloads belong to nobody now (DeletedDeviceWipe
+                    // says why not_found never gets here). Done in the service, not MainActivity, so
+                    // it happens even when no Activity is attached to hear about it.
+                    if (DeletedDeviceWipe.isDeletion(args.firstOrNull())) {
+                        val keep = lastTriggerContentIds + DeletedDeviceWipe.triggerContentIds(config.cachedPlaylist)
+                        config.cachedPlaylist = ""
+                        DeletedDeviceWipe.wipe(DeletedDeviceWipe.dirsUnder(filesDir), keep)
+                    }
+                    handleServerRejection("device:unpaired (removed on server)")
+                }
 
                 /*
                  * ⚠️ HONOUR device:throttled INSTEAD OF RECONNECTING INTO IT (#314).
@@ -562,6 +587,9 @@ class WebSocketService : Service() {
                         return@safeOn
                     }
                     Log.i("WebSocketService", "Playlist update received, assignments=${data.optJSONArray("assignments")?.length() ?: "null"}")
+                    // Remembered for DeletedDeviceWipe: the stored offline payload is only written
+                    // when it has assignments, so a trigger-only screen's triggers are not in it.
+                    data.optJSONArray("triggers")?.let { lastTriggerContentIds = DeletedDeviceWipe.triggerContentIds(it) }
                     /*
                      * ⚠️ The power schedule is adopted HERE, in the service, and not in the
                      * Activity's onPlaylistUpdate. The Activity may be stopped or destroyed — it
@@ -892,6 +920,9 @@ class WebSocketService : Service() {
      * thrashed the socket). While awaitingRepair, ALL registration is suppressed except the single
      * scheduled retry, so the screen is stable — no register/reject/register churn.
      */
+    /** Content ids the last payload's triggers referenced; kept by the delete wipe. */
+    @Volatile private var lastTriggerContentIds: Set<String> = emptySet()
+
     private fun handleServerRejection(reason: String) {
         lastRejectionReason = reason
         val settleSec = parseSettleSeconds(reason)
@@ -995,14 +1026,20 @@ class WebSocketService : Service() {
 
     @Volatile private var lastRefreshAt = 0L
 
-    fun requestPlaylistRefresh() {
+    /**
+     * [force] skips the throttle. Only for MainActivity's catch-up on bind: the payload sent when a
+     * screen is paired arrives while ProvisioningActivity is showing, before MainActivity listens,
+     * so without a fresh one the screen waited for the next 60s heartbeat pull. That cost little
+     * while a re-paired screen still had its files, and a minute of nothing once a delete wiped them.
+     */
+    fun requestPlaylistRefresh(force: Boolean = false) {
         if (socket?.connected() != true || config.deviceId.isEmpty()) return
         // #234 follow-up: this emits a FULL device:register (7+ server statements + the identity
         // path + a playlist rebuild), and PlaylistController.next() calls it on every item advance.
         // A 10-second image therefore re-registered six times a minute. The heartbeat already pulls
         // a fresh playlist every 60s, so the per-item call bought nothing and cost a great deal.
         val now = System.currentTimeMillis()
-        if (!RefreshThrottle.shouldRefresh(lastRefreshAt, now)) return
+        if (!force && !RefreshThrottle.shouldRefresh(lastRefreshAt, now)) return
         lastRefreshAt = now
         Log.i("WebSocketService", "Requesting playlist refresh")
         try {
@@ -1082,6 +1119,17 @@ class WebSocketService : Service() {
      * with no Activity at all. Null means "no UI attached", which is a normal state mid-window.
      */
     var onPowerWindow: ((off: Boolean) -> Unit)? = null
+    /**
+     * Called (on the main thread) right before the panel is blanked, by schedule or by an operator.
+     * The Activity drops its "show when locked" + "turn screen on" settings here.
+     *
+     * ⚠️ WITHOUT THIS A SCHEDULED OFF LASTS HALF A SECOND. screen_on sets setShowWhenLocked(true) +
+     * setTurnScreenOn(true) and nothing cleared them, so once a panel had been woken that way (the
+     * Screen On button, a relaunch, a schedule's own "on" edge), lockNow() blanked it and the
+     * player's window — still asking to turn the screen on when shown — lit it straight back up.
+     * Reported on a device-owner Android 15 panel with an all-day schedule.
+     */
+    var onBeforeBlank: (() -> Unit)? = null
 
     /**
      * Make the panel dark — the ONE implementation, shared by the remote screen_off command and the
@@ -1089,6 +1137,7 @@ class WebSocketService : Service() {
      * the divergence would only ever show up on hardware nobody has in front of them.
      */
     private fun blankPanel() {
+        try { onBeforeBlank?.invoke() } catch (e: Throwable) { Log.w("WebSocketService", "before blank: ${e.message}") }
         try {
             if (!com.remotedisplay.player.admin.STPolicy(this@WebSocketService).lockNow()) {
                 PowerAccessibilityService.instance?.lockScreen()
@@ -1132,8 +1181,14 @@ class WebSocketService : Service() {
      * and it re-applies the correct state in onCreate.
      */
     private fun applyScheduledPower(off: Boolean) {
-        handler.post { try { onPowerWindow?.invoke(off) } catch (e: Throwable) { Log.w("WebSocketService", "power window flag: ${e.message}") } }
-        if (off) blankPanel() else wakePanel(bringToFront = true)
+        // The window flag FIRST, then the lock: posting it meant lockNow() ran while the window was
+        // still holding FLAG_KEEP_SCREEN_ON. Run inline on the main thread (the tick and restore()
+        // are already on it); from anywhere else, post the whole sequence so the order holds.
+        val apply = {
+            try { onPowerWindow?.invoke(off) } catch (e: Throwable) { Log.w("WebSocketService", "power window flag: ${e.message}") }
+            if (off) blankPanel() else wakePanel(bringToFront = true)
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) apply() else handler.post { apply() }
         // An endpoint bound to screen_on/screen_off is how a building system learns the sign went
         // dark. Fired from the SCHEDULE too, not only from an operator's button — the scheduled
         // edge is the one that happens every night with nobody watching.
@@ -1246,6 +1301,32 @@ class WebSocketService : Service() {
         android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
     }
 
+    /*
+     * ⚠️ THE SCREEN'S HDMI INPUT CANNOT BE CAPTURED (player/LiveInput.kt): it is a hardware video
+     * plane — `screencap` exits 1 while it is up, and a view capture reads black where it sits. So
+     * while one is on screen the capture comes from the player's own window with a card painted over
+     * each input; this full-frame card is the fallback when that capture is unavailable, never a
+     * black frame that looks like a dead panel. Set by MainActivity.
+     */
+    var isShowingLiveInput: (() -> Boolean)? = null
+
+    private val liveInputFrame: String by lazy {
+        val bmp = android.graphics.Bitmap.createBitmap(640, 360, android.graphics.Bitmap.Config.ARGB_8888)
+        val c = android.graphics.Canvas(bmp)
+        c.drawColor(android.graphics.Color.rgb(17, 17, 17))
+        val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.rgb(221, 221, 221); textAlign = android.graphics.Paint.Align.CENTER
+            textSize = 34f; isFakeBoldText = true
+        }
+        c.drawText("Live HDMI input", 320f, 170f, p)
+        p.textSize = 20f; p.isFakeBoldText = false; p.color = android.graphics.Color.rgb(150, 150, 150)
+        c.drawText("Playing on this screen. It can\u2019t be captured.", 320f, 210f, p)
+        val out = java.io.ByteArrayOutputStream()
+        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 60, out)
+        bmp.recycle()
+        android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+    }
+
     /** The tier the NEXT capture would use. Reported in telemetry so the dashboard can say why a
      *  screenshot shows only the playlist. Must stay in step with captureScreen() below. */
     fun currentCaptureMode(): CaptureMode = CaptureMode.current(onCaptureScreenshot != null)
@@ -1266,6 +1347,12 @@ class WebSocketService : Service() {
 
     private fun captureScreen(): String? {
         if (privacyOn()) return blankFrame
+        if (try { isShowingLiveInput?.invoke() == true } catch (_: Throwable) { false }) {
+            // MediaProjection and accessibility both fail on the HDMI plane, so go straight to the
+            // player's own window: it draws everything real and paints a card over each input
+            // (ScreenshotCapture). The full-frame card is only for when even that is unavailable.
+            return try { onCaptureScreenshot?.invoke() } catch (_: Throwable) { null } ?: liveInputFrame
+        }
         // Priority 1: MediaProjection (system-wide, works in background) — needs operator consent.
         if (ScreenCaptureService.isReady) {
             val result = ScreenCaptureService.captureScreen(40)
@@ -1705,6 +1792,27 @@ class WebSocketService : Service() {
             socket?.emit("device:connectivity-report", data)
             Log.i("WebSocketService", "connectivity-report offline_ms=$offlineMs link_lost=$linkLost internet_ok=$internetOk cold_start=$coldStart ip_changed=$ipChanged")
         } catch (e: Throwable) { Log.w("WebSocketService", "emitConnectivityReport: ${e.message}") }
+    }
+
+    // ── Audience counting: per-minute counts, queued until acked (audience/AudienceController.kt) ──
+    @Volatile private var audienceFlushInFlight = false
+
+    fun flushAudience() {
+        if (audienceFlushInFlight || socket?.connected() != true || config.deviceId.isEmpty()) return
+        val batch = com.remotedisplay.player.audience.AudienceLog.peek(applicationContext)
+        if (batch.isEmpty()) return
+        audienceFlushInFlight = true
+        try {
+            socket?.emit("device:audience", JSONObject().apply {
+                put("device_id", config.deviceId)
+                put("buckets", JSONArray().apply { batch.forEach { put(it.toJson()) } })
+            })
+            // An older server never acks: stop waiting after a while so a later flush can retry.
+            handler.postDelayed({ audienceFlushInFlight = false }, 30_000)
+        } catch (e: Throwable) {
+            audienceFlushInFlight = false
+            Log.w("WebSocketService", "flushAudience: ${e.message}")
+        }
     }
 
     // ── #473 v2: interactive web pages ──────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import { api } from '../api.js';
 import { showToast } from '../components/toast.js';
 import { esc } from '../utils.js';
 import { t, tn } from '../i18n.js';
+import { chip } from '../components/corporate-ui.js';
 
 /*
  * Triggers — externally-fired interrupt content. docs/triggers-design.md.
@@ -12,7 +13,7 @@ import { t, tn } from '../i18n.js';
  * database that will never fire anywhere.
  */
 
-let cache = { triggers: [], playlists: [], devices: [], groups: [] };
+let cache = { triggers: [], playlists: [], devices: [], groups: [], headOffice: null, hqAlerts: 0 };
 
 function modeLabel(m) {
   return m === 'until_cleared' ? t('trigger.mode_until_cleared') : t('trigger.mode_once');
@@ -37,7 +38,7 @@ function targetName(tr) {
 
 function assignmentSummary(tr) {
   const a = tr.assignments || [];
-  if (!a.length) return `<span class="badge badge-warn">${esc(t('trigger.unassigned'))}</span>`;
+  if (!a.length) return `<span class="corp-chip corp-chip-hq">${esc(t('trigger.unassigned'))}</span>`;
   const names = a.map((x) => {
     const list = x.target_type === 'device' ? cache.devices : cache.groups;
     const hit = list.find(i => i.id === x.target_id);
@@ -52,16 +53,16 @@ function rowHtml(tr) {
     <tr data-id="${esc(tr.id)}">
       <td>
         <strong>${esc(tr.name)}</strong>
-        ${tr.enabled ? '' : `<span class="badge">${esc(t('trigger.disabled'))}</span>`}
+        ${tr.enabled ? '' : `<span class="corp-chip corp-chip-muted">${esc(t('trigger.disabled'))}</span>`}
       </td>
       <td><code>${esc(tr.match_token)}</code>${tr.clear_token ? ` / <code>${esc(tr.clear_token)}</code>` : ''}</td>
       <td>${esc(targetName(tr))}</td>
-      <td>${esc(modeLabel(tr.mode))}${risk ? ` <span class="badge badge-warn" title="${esc(t('trigger.lease_risk'))}">${esc(t('trigger.no_lease'))}</span>` : ''}</td>
+      <td>${esc(modeLabel(tr.mode))}${risk ? ` <span class="corp-chip corp-chip-hq" title="${esc(t('trigger.lease_risk'))}">${esc(t('trigger.no_lease'))}</span>` : ''}</td>
       <td>${tr.source_http ? 'HTTP' : ''}${tr.source_http && tr.source_udp ? ' + ' : ''}${tr.source_udp ? 'UDP' : ''}</td>
       <td>${tr.priority}</td>
       <td>${assignmentSummary(tr)}</td>
-      <td class="actions">
-        <button class="btn btn-sm" data-act="edit">${esc(t('common.edit'))}</button>
+      <td class="corp-actions-cell">
+        <button class="btn btn-secondary btn-sm" data-act="edit">${esc(t('common.edit'))}</button>
         <button class="btn btn-sm btn-danger" data-act="del">${esc(t('common.delete'))}</button>
       </td>
     </tr>`;
@@ -94,7 +95,7 @@ function formHtml(tr) {
       <label class="check">
         <input type="checkbox" data-assign="${type}:${esc(x.id)}"
                ${assigned.has(`${type}:${x.id}`) ? 'checked' : ''}> ${esc(x.name)}
-      </label>`).join('') || `<p class="muted">${esc(t('trigger.none_available'))}</p>`;
+      </label>`).join('') || `<p class="corp-help">${esc(t('trigger.none_available'))}</p>`;
 
   /*
    * ⚠️ `.modal-overlay`, NOT `.modal-backdrop`. This dialog spent its whole life using a class name
@@ -301,9 +302,33 @@ function openForm(app, tr) {
   });
 }
 
+/*
+ * Head office on the Triggers page (spec §7.6, §5.3): its emergency alerts that reach this
+ * workspace's screens, read-only with a red "Emergency · Head office" badge and no codes; and, when
+ * head office limits store triggers on the screens its playlist plays on, the rule in one line. In
+ * the head office workspace itself, where the alerts live, a pointer to where they are managed.
+ */
+function headOfficeHtml() {
+  const h = cache.headOffice || {};
+  const parts = [];
+  const p = h.store_trigger_policy;
+  if (p && p.policy === 'leased') parts.push(`<div class="corp-notice">${esc(t('corp.trig.policy_note_leased', { n: Math.round((p.cap_sec || 300) / 60) }))}</div>`);
+  if (p && p.policy === 'off') parts.push(`<div class="corp-notice">${esc(t('corp.trig.policy_note_off'))}</div>`);
+  if (cache.hqAlerts) parts.push(`<div class="corp-notice">${esc(tn('corp.trig.hq_alerts', cache.hqAlerts))} <a href="#/corporate/emergency">${esc(t('corp.em.title'))}</a></div>`);
+  if ((h.emergency || []).length) {
+    parts.push(`<div class="corp-card"><div class="corp-card-head"><strong class="corp-card-title">${esc(t('corp.trig.hq_title'))}</strong></div>
+      <div class="corp-help" style="margin-bottom:6px">${esc(t('corp.trig.hq_help'))}</div>
+      ${h.emergency.map((e) => `<div class="corp-row" style="padding:4px 0">${chip(t('corp.badge.emergency'), 'emergency')} <strong>${esc(e.name)}</strong>
+        ${e.live ? chip(t('corp.em.live'), 'emergency') : e.enabled ? '' : chip(t('corp.em.off'), 'muted')}
+        <span class="corp-help">${esc(e.mode === 'once' ? t('corp.em.mode_once_short') : t('corp.em.mode_until_short'))}</span></div>`).join('')}
+    </div>`);
+  }
+  return parts.join('');
+}
+
 export async function render(app) {
-  app.innerHTML = `<div class="view"><h1>${esc(t('nav.triggers'))}</h1>
-    <p class="muted">${esc(t('trigger.intro'))}</p><div id="trigBody"></div></div>`;
+  app.innerHTML = `<div class="page-header"><div><h1>${esc(t('nav.triggers'))}</h1>
+    <div class="subtitle">${esc(t('trigger.intro'))}</div></div></div><div id="trigBody"></div>`;
   const body = document.getElementById('trigBody');
 
   try {
@@ -311,24 +336,29 @@ export async function render(app) {
       api.get('/triggers'), api.get('/playlists'), api.get('/devices'), api.get('/groups'),
     ]);
     cache = {
-      triggers: trg.triggers || [],
+      // Head office emergency alerts (kind 'emergency') are listed by the API but managed only under
+      // Corporate → Emergency; this editor would offer an Edit/Delete the server refuses.
+      triggers: (trg.triggers || []).filter((x) => x && x.kind !== 'emergency'),
+      hqAlerts: (trg.triggers || []).filter((x) => x && x.kind === 'emergency').length,
+      headOffice: trg.head_office || null,
       playlists: Array.isArray(pls) ? pls : (pls.playlists || []),
       devices: Array.isArray(devs) ? devs : (devs.devices || []),
       groups: Array.isArray(grps) ? grps : (grps.groups || []),
     };
   } catch (e) {
-    body.innerHTML = `<p class="error">${esc((e && e.message) || t('common.error'))}</p>`;
+    body.innerHTML = `<p class="corp-notice corp-notice-danger">${esc((e && e.message) || t('common.error'))}</p>`;
     return;
   }
 
   const risky = cache.triggers.filter(leaseRisk).length;
   body.innerHTML = `
-    <div class="toolbar">
+    ${headOfficeHtml()}
+    <div class="corp-toolbar">
       <button class="btn btn-primary" id="tgNew">${esc(t('trigger.new'))}</button>
     </div>
-    ${risky ? `<div class="banner banner-warn">${esc(t('trigger.lease_risk_banner'))}</div>` : ''}
+    ${risky ? `<div class="corp-notice corp-notice-warn">${esc(t('trigger.lease_risk_banner'))}</div>` : ''}
     ${cache.triggers.length ? `
-    <table class="table">
+    <div class="table-wrap"><table class="corp-table">
       <thead><tr>
         <th>${esc(t('trigger.name'))}</th><th>${esc(t('trigger.tokens'))}</th>
         <th>${esc(t('trigger.target'))}</th><th>${esc(t('trigger.mode'))}</th>
@@ -336,7 +366,7 @@ export async function render(app) {
         <th>${esc(t('trigger.assigned'))}</th><th></th>
       </tr></thead>
       <tbody>${cache.triggers.map(rowHtml).join('')}</tbody>
-    </table>` : `<p class="muted">${esc(t('trigger.empty'))}</p>`}`;
+    </table></div>` : `<div class="corp-empty">${esc(t('trigger.empty'))}</div>`}`;
 
   document.getElementById('tgNew').addEventListener('click', () => openForm(app, null));
   body.querySelectorAll('tr[data-id]').forEach((row) => {

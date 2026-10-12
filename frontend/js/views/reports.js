@@ -113,13 +113,13 @@ export async function render(container) {
           </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px">
-          <div class="settings-section" style="margin:0">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:20px;margin-bottom:24px">
+          <div class="settings-section" style="margin:0;min-width:0">
             <h3 style="font-size:14px;margin-bottom:12px">${t('report.plays_per_day')}</h3>
             <div id="dailyChart" style="height:200px;display:flex;align-items:flex-end;gap:2px"></div>
           </div>
 
-          <div class="settings-section" style="margin:0">
+          <div class="settings-section" style="margin:0;min-width:0">
             <h3 style="font-size:14px;margin-bottom:12px">${t('report.plays_by_hour')}</h3>
             <div id="hourlyChart" style="height:200px;display:flex;align-items:flex-end;gap:1px"></div>
           </div>
@@ -133,17 +133,15 @@ export async function render(container) {
               <th style="padding:8px;text-align:left;color:var(--text-muted)">${t('report.col.content')}</th>
               <th style="padding:8px;text-align:right;color:var(--text-muted)">${t('report.col.plays')}</th>
               <th style="padding:8px;text-align:right;color:var(--text-muted)">${t('report.col.total_hours')}</th>
-              <th style="padding:8px;text-align:right;color:var(--text-muted)">${t('report.col.completion')}</th>
             </tr></thead>
             <tbody>
               ${summary.by_content.map(c => `
                 <tr style="border-bottom:1px solid var(--border)">
-                  <td style="padding:8px">${c.content_name || t('common.unknown')}</td>
+                  <td style="padding:8px">${esc(c.content_name || t('common.unknown'))}</td>
                   <td style="padding:8px;text-align:right">${c.plays}</td>
                   <td style="padding:8px;text-align:right">${(c.total_seconds / 3600).toFixed(1)}</td>
-                  <td style="padding:8px;text-align:right">${c.plays > 0 ? Math.round((c.completed_plays / c.plays) * 100) : 0}%</td>
                 </tr>
-              `).join('') || `<tr><td colspan="4" style="padding:16px;text-align:center;color:var(--text-muted)">${t('report.no_data')}</td></tr>`}
+              `).join('') || `<tr><td colspan="3" style="padding:16px;text-align:center;color:var(--text-muted)">${t('report.no_data')}</td></tr>`}
             </tbody>
           </table>
           </div>
@@ -161,7 +159,7 @@ export async function render(container) {
             <tbody>
               ${summary.by_device.map(d => `
                 <tr style="border-bottom:1px solid var(--border)">
-                  <td style="padding:8px">${d.device_name}</td>
+                  <td style="padding:8px">${esc(d.device_name || '')}</td>
                   <td style="padding:8px;text-align:right">${d.plays}</td>
                   <td style="padding:8px;text-align:right">${(d.total_seconds / 3600).toFixed(1)}</td>
                 </tr>
@@ -214,7 +212,7 @@ async function renderKioskSessions(deviceId, start, end) {
         <div class="info-card"><div class="info-card-label">${t('report.kiosk.avg_pages')}</div><div class="info-card-value small">${esc(String(k.overall.avg_pages))}</div></div>
       </div>
       <h3 style="font-size:13px;margin-bottom:8px">${t('report.kiosk.per_day')}</h3>
-      <div id="kioskDailyChart" style="margin-bottom:16px"></div>
+      <div id="kioskDailyChart" style="height:200px;display:flex;align-items:flex-end;gap:2px;margin-bottom:16px"></div>
       <div class="table-wrap">
       <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:520px">
         <thead><tr style="border-bottom:1px solid var(--border)">
@@ -358,7 +356,7 @@ async function loadUptime() {
           ${r.incidents.slice(0, 50).map((i) => `
             <tr style="border-bottom:1px solid var(--border)">
               <td style="${TDs}">${esc(i.deviceName || i.deviceId)}</td>
-              <td style="${TDs}"><span class="badge" title="${esc(i.originNodeId)}" style="font-family:monospace">${esc(String(i.originNodeId).slice(0, 8))}</span></td>
+              <td style="${TDs}"><span class="corp-chip" title="${esc(i.originNodeId)}" style="font-family:monospace">${esc(String(i.originNodeId).slice(0, 8))}</span></td>
               <td style="${TDs}">${esc(String(i.alertType || '').replace(/[_-]/g, ' '))}</td>
               <td style="${TDs}">${esc(new Date(i.openedAt * 1000).toLocaleString())}</td>
               <td style="${TDs}">${i.ongoing ? '<strong>still down</strong>' : esc(mins(i.downSeconds))}</td>

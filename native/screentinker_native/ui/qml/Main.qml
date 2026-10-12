@@ -78,6 +78,7 @@ Window {
                     width: stageRoot.width * modelData.w / 100
                     height: stageRoot.height * modelData.h / 100
                     z: modelData.z
+                    fill: modelData.bg || ""
                     volume: stage.volume
                     forceMute: stage.muted
                     Component.onCompleted: win.registerSurface(surfaceId, this)
@@ -120,6 +121,42 @@ Window {
         anchors.fill: parent
         color: "black"
         visible: stage.blank
+    }
+
+    // ---- audience counting is on (system/audience.py): a small camera icon, top right as the
+    // audience sees it (so inside the same rotation as the content), drawn — no image asset ----
+    Item {
+        readonly property bool swapped: stage.rotation === 90 || stage.rotation === 270
+        width: swapped ? parent.height : parent.width
+        height: swapped ? parent.width : parent.height
+        anchors.centerIn: parent
+        rotation: stage.rotation
+        visible: stage.audienceIndicator
+
+        Item {
+            readonly property real u: Math.max(20, Math.min(parent.width, parent.height) * 0.028)
+            width: u * 1.4; height: u
+            anchors.top: parent.top; anchors.right: parent.right
+            anchors.margins: u * 0.5
+            opacity: 0.55
+            Rectangle {   // body
+                anchors.bottom: parent.bottom
+                width: parent.width; height: parent.height * 0.78
+                radius: parent.height * 0.14
+                color: "white"
+            }
+            Rectangle {   // viewfinder bump
+                x: parent.width * 0.32; width: parent.width * 0.36; height: parent.height * 0.3
+                radius: height * 0.3
+                color: "white"
+            }
+            Rectangle {   // lens
+                width: parent.height * 0.48; height: width; radius: width / 2
+                x: (parent.width - width) / 2; y: parent.height * 0.22 + (parent.height * 0.78 - height) / 2
+                color: "black"
+                Rectangle { anchors.centerIn: parent; width: parent.width * 0.55; height: width; radius: width / 2; color: "white" }
+            }
+        }
     }
 
     StatusScreen { anchors.fill: parent; visible: stage.statusVisible }

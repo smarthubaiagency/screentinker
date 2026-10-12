@@ -80,8 +80,12 @@ function smartItemsState(db, row) {
 }
 
 function capturePlaylist(db, row) {
-  const items = db.prepare(`SELECT id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec
-                              FROM playlist_items WHERE playlist_id = ? ORDER BY sort_order ASC, id ASC`).all(row.id)
+  // slot_id (a corporate local slot placement) only when set — with its name, so a restore can say
+  // which slot it could not bring back — and only where the column exists (hand-built fixtures).
+  const hasSlots = require('./corporate/schema-probe').hasColumn(db, 'playlist_items', 'slot_id');
+  const items = db.prepare(`SELECT pi.id, pi.content_id, pi.widget_id, pi.child_playlist_id, pi.zone_id, pi.sort_order, pi.duration_sec, pi.muted, pi.play_from, pi.play_until, pi.enabled, pi.log_play, pi.fit_mode, pi.play_when, pi.weight, pi.repeat_every_sec
+                                   ${hasSlots ? ', pi.slot_id, (SELECT s.name FROM corporate_slots s WHERE s.id = pi.slot_id) AS slot_name' : ''}
+                              FROM playlist_items pi WHERE pi.playlist_id = ? ORDER BY pi.sort_order ASC, pi.id ASC`).all(row.id)
     .map((it) => ({
       content_id: it.content_id || null, widget_id: it.widget_id || null, child_playlist_id: it.child_playlist_id || null,
       zone_id: it.zone_id || null, sort_order: it.sort_order, duration_sec: it.duration_sec, muted: it.muted ? 1 : 0,
@@ -90,6 +94,7 @@ function capturePlaylist(db, row) {
       fit_mode: it.fit_mode || null, play_when: it.play_when || null, weight: it.weight || 1,
       // Only when set, so capturing an unchanged pre-feature playlist yields the same state as before.
       ...(it.repeat_every_sec ? { repeat_every_sec: it.repeat_every_sec } : {}),
+      ...(it.slot_id ? { slot_id: it.slot_id, slot_name: it.slot_name || null } : {}),
       schedules: scheduleBlocksFor(db, it.id),
     }));
   const state = { name: row.name, description: row.description || '', playback_order: row.playback_order || 'sequential', items };
@@ -297,7 +302,17 @@ function historyDir() { return path.join(config.contentDir, HISTORY_DIR); }
 function retainContentFile(db, contentId, relPath, tag) {
   if (!relPath) return null;
   const src = path.join(config.contentDir, path.basename(String(relPath)));
-  if (!fs.existsSync(src)) return null;
+  if (!fs.existsSync(src)) {
+    /*
+     * The live copy is in a storage backend (lib/storage), not on this disk. Retaining it is a
+     * re-label, not a copy: its location rows become `history` under a ref this revision names, and
+     * the object stays exactly where it is — referenced, so nothing deletes it until retention lets
+     * the ref go. Returns null when there is no remote copy either, as before.
+     */
+    const row = db.prepare('SELECT filepath, thumbnail_path FROM content WHERE id = ?').get(contentId) || {};
+    const kind = relPath === row.thumbnail_path && relPath !== row.filepath ? 'thumb' : 'asset';
+    return require('./storage/locations').retainRemote(contentId, kind, tag, relPath);
+  }
   const dir = path.join(historyDir(), contentId);
   fs.mkdirSync(dir, { recursive: true });
   const dest = path.join(dir, `${tag}__${path.basename(src)}`);
@@ -333,9 +348,38 @@ function disposeDraftFiles(db, contentId, draft, live) {
   }
 }
 
+/*
+ * ⚠️ DELETING A RESOURCE DELETES ITS HISTORY, SUBMISSIONS FIRST. submissions.revision_id is
+ * `NOT NULL REFERENCES revisions(id)` with NO ACTION and foreign_keys is ON, so deleting the
+ * revisions of anything that was ever submitted for approval throws "FOREIGN KEY constraint
+ * failed". DELETE /api/content/:id did exactly that inside a try/catch(_){} that also held the
+ * .history removal: the error was swallowed, the rows survived, revision-retention keeps any
+ * revision a submission names (and every .history file such a revision names), and the "deleted"
+ * media stayed on disk for good while the route answered success. Every deletion path goes
+ * through these two helpers so the order is decided once.
+ */
+function deleteHistoryRows(db, resourceType, resourceId) {
+  db.prepare('DELETE FROM submissions WHERE resource_type = ? AND resource_id = ?').run(resourceType, resourceId);
+  db.prepare('DELETE FROM revisions WHERE resource_type = ? AND resource_id = ?').run(resourceType, resourceId);
+}
+
+// Content ids are uuids; the check keeps a malformed one from ever naming .history itself or
+// anything outside it.
+const RETAINED_DIR_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+/** Remove <contentDir>/.history/<contentId>/ (the retained copies of a DELETED content row). */
+function removeRetainedFiles(contentId) {
+  const id = String(contentId || '');
+  if (!RETAINED_DIR_ID_RE.test(id)) return false;
+  fs.rmSync(path.join(historyDir(), id), { recursive: true, force: true });
+  return true;
+}
+
 /** Absolute path for a revision's retained file, or the live file when the ref IS the live one. */
 function resolveFileRef(ref) {
   if (!ref) return null;
+  // A copy retained in a storage backend has no local path; see refExists / storage/locations.
+  if (require('./storage/locations').isStorageRef(ref)) return null;
   const clean = String(ref).replace(/\\/g, '/');
   const abs = clean.startsWith(HISTORY_DIR + '/')
     ? path.join(historyDir(), clean.slice(HISTORY_DIR.length + 1).split('/').map((s) => path.basename(s)).join(path.sep))
@@ -343,6 +387,32 @@ function resolveFileRef(ref) {
   const base = path.resolve(config.contentDir);
   if (!path.resolve(abs).startsWith(base + path.sep)) return null;
   return fs.existsSync(abs) ? abs : null;
+}
+
+/** Is this revision's retained file still available, wherever it is stored? */
+function refExists(ref) {
+  if (!ref) return false;
+  const loc = require('./storage/locations');
+  return loc.isStorageRef(ref) ? loc.refExists(ref) : !!resolveFileRef(ref);
+}
+
+/**
+ * Fetch a revision's retained copies into contentDir when they live in a storage backend, so the
+ * restore below (synchronous, local-file based) can use them. Returns { file, thumb } absolute
+ * temp paths (null where the ref is local or absent); the restore copies and the caller deletes.
+ */
+async function materializeRefs(db, rev) {
+  const loc = require('./storage/locations');
+  const out = { file: null, thumb: null };
+  for (const [ref, k] of [[rev.file_ref, 'file'], [rev.thumb_ref, 'thumb']]) {
+    if (!ref || !loc.isStorageRef(ref)) continue;
+    const locs = loc.orderForRead(loc.historyLocations(ref));
+    if (!locs.length) continue;
+    const dest = path.join(config.contentDir, `.restore-${crypto.randomBytes(6).toString('hex')}${path.extname(String(ref))}`);
+    try { await loc.downloadTo({ id: rev.resource_id }, 'history', dest, { locations: locs }); out[k] = dest; }
+    catch (e) { try { fs.unlinkSync(dest); } catch (_) {} }
+  }
+  return out;
 }
 
 // ─── redaction ───────────────────────────────────────────────────────────────────────────────
@@ -409,7 +479,7 @@ function diffStates(type, a, b) {
 
 // ─── restore: write an old state into the DRAFT and record it ────────────────────────────────
 
-function restoreToDraft(db, { type, id, revisionId, actor }) {
+function restoreToDraft(db, { type, id, revisionId, actor, materialized = null }) {
   const rev = db.prepare('SELECT * FROM revisions WHERE id = ? AND resource_type = ? AND resource_id = ?').get(revisionId, type, id);
   if (!rev) { const e = new Error('Revision not found'); e.status = 404; throw e; }
   const state = parseJson(rev.state, null);
@@ -418,11 +488,15 @@ function restoreToDraft(db, { type, id, revisionId, actor }) {
   const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id);
   if (!row) { const e = new Error('Resource not found'); e.status = 404; throw e; }
   const now = nowSec();
+  const dropped = [];   // local slots a playlist revision could not bring back
 
   if (type === 'content') {
     // The bytes must still exist, or this is a rename pretending to be a restore.
-    const abs = rev.file_ref ? resolveFileRef(rev.file_ref) : null;
-    if (rev.file_ref && !abs) { const e = new Error('The media for this revision is no longer retained, so it cannot be restored'); e.status = 409; throw e; }
+    const abs = rev.file_ref ? ((materialized && materialized.file) || resolveFileRef(rev.file_ref)) : null;
+    // A revision whose file IS the live file (bytes unchanged since) needs no copy — and for an item
+    // whose bytes are in a storage backend there is no local file to find (lib/storage).
+    const isLiveFile = rev.file_ref && rev.file_ref === row.filepath && require('./storage/locations').hasExplicitLocations(id);
+    if (rev.file_ref && !abs && !isLiveFile) { const e = new Error('The media for this revision is no longer retained, so it cannot be restored'); e.status = 409; throw e; }
     let pendingPath = null;
     if (abs) {
       const ext = path.extname(abs);
@@ -430,7 +504,7 @@ function restoreToDraft(db, { type, id, revisionId, actor }) {
       fs.copyFileSync(abs, path.join(config.contentDir, pendingPath));
     }
     let thumbPath = null;
-    const thumbAbs = rev.thumb_ref ? resolveFileRef(rev.thumb_ref) : null;
+    const thumbAbs = rev.thumb_ref ? ((materialized && materialized.thumb) || resolveFileRef(rev.thumb_ref)) : null;
     if (thumbAbs) {
       thumbPath = `thumb_restore-${rev.rev_no}-${crypto.randomBytes(6).toString('hex')}${path.extname(thumbAbs)}`;
       fs.copyFileSync(thumbAbs, path.join(config.contentDir, thumbPath));
@@ -448,13 +522,27 @@ function restoreToDraft(db, { type, id, revisionId, actor }) {
     };
     db.prepare('UPDATE content SET draft_json = ? WHERE id = ?').run(JSON.stringify(draft), id);
   } else if (type === 'playlist') {
+    const hasSlots = require('./corporate/schema-probe').hasColumn(db, 'playlist_items', 'slot_id');
     const txn = db.transaction(() => {
       db.prepare('DELETE FROM playlist_items WHERE playlist_id = ?').run(id);
-      const ins = db.prepare('INSERT INTO playlist_items (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      // ⚠️ slot_id is restored too, or a corporate revision brings its local slots back as all-NULL
+      // ghost items (spec §6.1-6).
+      const ins = db.prepare(`INSERT INTO playlist_items (playlist_id, content_id, widget_id, child_playlist_id, zone_id, sort_order, duration_sec, muted, play_from, play_until, enabled, log_play, fit_mode, play_when, weight, repeat_every_sec${hasSlots ? ', slot_id' : ''}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${hasSlots ? ', ?' : ''})`);
       // A smart revision's items are its matches at the time, not rows to recreate.
       for (const it of (state.smart_rules ? [] : (state.items || []))) {
+        /*
+         * A slot placement comes back only while its slot still exists in THIS playlist: a slot that
+         * was removed and then hard-deleted by the sweep (or one belonging elsewhere) is reported in
+         * `dropped` instead of being silently skipped by the FK catch below. A retired one is
+         * un-retired — with its stores' content still attached.
+         */
+        if (it.slot_id) {
+          const slot = hasSlots ? db.prepare('SELECT id, playlist_id FROM corporate_slots WHERE id = ?').get(it.slot_id) : null;
+          if (!slot || slot.playlist_id !== id) { dropped.push({ slot_id: it.slot_id, slot_name: it.slot_name || null }); continue; }
+          db.prepare('UPDATE corporate_slots SET retired_at = NULL WHERE id = ?').run(it.slot_id);
+        }
         try {
-          const r = ins.run(id, it.content_id || null, it.widget_id || null, it.child_playlist_id || null, it.zone_id || null, it.sort_order, it.duration_sec, it.muted ? 1 : 0, it.play_from || null, it.play_until || null, it.enabled === 0 ? 0 : 1, it.log_play === 0 ? 0 : 1, it.fit_mode || null, it.play_when || null, it.weight || 1, it.repeat_every_sec || null);
+          const r = ins.run(id, it.content_id || null, it.widget_id || null, it.child_playlist_id || null, it.zone_id || null, it.sort_order, it.duration_sec, it.muted ? 1 : 0, it.play_from || null, it.play_until || null, it.enabled === 0 ? 0 : 1, it.log_play === 0 ? 0 : 1, it.fit_mode || null, it.play_when || null, it.weight || 1, it.repeat_every_sec || null, ...(hasSlots ? [it.slot_id || null] : []));
           for (const b of it.schedules || []) {
             const cols = Object.keys(b);
             if (!cols.length) continue;
@@ -480,7 +568,7 @@ function restoreToDraft(db, { type, id, revisionId, actor }) {
   }
 
   const created = recordCurrent(db, type, id, { actor: { ...actor, kind: actor && actor.kind || 'restore' }, summary: `Restored from revision #${rev.rev_no}`, force: true });
-  return { revision: created, restoredFrom: rev };
+  return { revision: created, restoredFrom: rev, dropped };
 }
 
 /** Does this resource have a draft that is not what players see? */
@@ -524,5 +612,5 @@ function lastPublished(db, type, id) {
 module.exports = { CONTENT_DRAFT_FIELDS, CONTENT_PLAYBACK_FIELDS, disposeDraftFiles,
   RESOURCE_TYPES, TABLE, HISTORY_DIR,
   captureState, captureLiveState, hashState, stable, record, recordCurrent, recordMissingIn, markPublished, baselineAll,
-  retainContentFile, resolveFileRef, historyDir, redactState, diffStates, restoreToDraft, hasDraft, list, get, latest, lastPublished, parseJson,
+  retainContentFile, resolveFileRef, refExists, materializeRefs, historyDir, deleteHistoryRows, removeRetainedFiles, redactState, diffStates, restoreToDraft, hasDraft, list, get, latest, lastPublished, parseJson,
 };

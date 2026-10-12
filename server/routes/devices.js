@@ -3,18 +3,24 @@ const router = express.Router();
 const { db } = require('../db/database');
 const config = require('../config');
 const enrolKey = require('../lib/enrol-key');   // #313
+const viewAccess = require('../lib/view-access');   // view-only display access
+const secretbox = require('../lib/secretbox');
+const { canAdminWorkspace } = require('../lib/permissions');
+const { logActivity, getClientIp } = require('../services/activity');
 const { resolveDevicePlaylist, resolvedLayoutId } = require('../lib/resolve-device-playlist');
 const { PLATFORM_ROLES, ELEVATED_ROLES, isPlatformStaff } = require('../middleware/auth');
 // Phase 2.2a: workspace-aware access. accessContext returns { workspaceRole, actingAs }
 // or null based on the caller's reach into a specific workspace.
-const { accessContext } = require('../lib/tenancy');
+const { resourceAccess } = require('../lib/tenancy');
 // requireScope gates by API-token scope; the workspace WRITE gate is checkDeviceOwnership, which
 // already rejects workspace_viewer — the same check requireFleetWrite performs in routes/triggers.js.
 const { requireScope } = require('../middleware/apiToken');
-const { ALLOWED_COMMANDS, LOCAL_API_COMMANDS, deliverCommand, validateCommand } = require('../lib/device-command');
+const { ALLOWED_COMMANDS, LOCAL_API_COMMANDS, deliverCommand, validateCommand, requireCommandScope } = require('../lib/device-command');
 const { stripDeviceSecrets, stripDeviceSecretsForList, stripSecretsForTokens } = require('../lib/device-sanitize');
 const { layoutZones, orphanCountsByDevice } = require('../lib/zone-validate');
 const deviceSettings = require('../lib/device-settings'); // #150 delete+re-pair settings preservation
+const { normalizeTags, parseTags } = require('../lib/content-tags');
+const groupRules = require('../lib/device-group-rules');
 const playerCapabilities = require('../lib/player-capabilities');
 
 // List devices in the caller's current workspace.
@@ -27,6 +33,8 @@ router.get('/', (req, res) => {
   if (!req.workspaceId) return res.json([]);
   const limit = Math.min(parseInt(req.query.limit) || 100, 500);
   const offset = parseInt(req.query.offset) || 0;
+  // ?tag=lobby narrows the list to screens carrying that tag (normalised like the stored ones).
+  const tagFilter = req.query.tag ? ((normalizeTags([String(req.query.tag)]) || [])[0] || '\u0000') : null;
   const devices = db.prepare(`
     SELECT d.*,
       t.battery_level, t.battery_charging, t.storage_free_mb, t.storage_total_mb,
@@ -47,12 +55,14 @@ router.get('/', (req, res) => {
       ON sc.device_id = latest.device_id AND sc.captured_at = latest.max_at
     ) s ON d.id = s.device_id
     WHERE d.workspace_id = ?
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END) WHERE value = ?))
     ORDER BY d.sort_order ASC, d.created_at ASC
     LIMIT ? OFFSET ?
-  `).all(req.workspaceId, limit, offset);
+  `).all(req.workspaceId, tagFilter, tagFilter, limit, offset);
   // #zone-orphan: lightweight per-device count of playlist items whose zone_id isn't in
   // the device's active layout, so the dashboard can flag screens that need attention.
   const orphanCounts = orphanCountsByDevice(devices.map(d => d.id));
+  const groupIds = groupIdsByDevice(devices.map(d => d.id));
   // The RESOLVED capability set, the same shape GET /:id returns. The raw column shipped here
   // before: a JSON *string* ('[]') or null, which every consumer would have had to parse — and
   // `Array.isArray("[]")` is false, so the dashboard's `can()` helper reads a device that declared
@@ -62,13 +72,36 @@ router.get('/', (req, res) => {
   res.json(devices.map(d => ({
     ...stripDeviceSecretsForList(d),
     capabilities: playerCapabilities.capabilitiesFor(d),
-    // #467: which player family this is (android | web | tizen | brightsign | vega | linux | windows),
+    // #467: which player family this is (android | web | tizen | brightsign | vega | linux | windows | roku …),
     // so the Displays page can tell an APK player — the only kind the served APK applies to —
     // from the rest without re-deriving the precedence rules client-side.
     platform_family: playerCapabilities.platformFamily(d),
     orphan_count: orphanCounts[d.id] || 0,
+    tags: parseTags(d.tags),
+    group_ids: groupIds[d.id] || [],
   })));
 });
+
+/*
+ * The device groups each screen belongs to, as { deviceId: [groupId, ...] }, ordered by group name.
+ *
+ * ⚠️ NOT devices.team_id. That column is a TEAM (the old sharing unit), and the MCP tools reported it
+ * as `group_id` — so an agent asked "which group is the lobby screen in" answered with a team id that
+ * no group endpoint recognises. Membership lives in device_group_members, and a screen can be in
+ * several groups, so it is a list.
+ */
+function groupIdsByDevice(deviceIds) {
+  const out = {};
+  if (!deviceIds.length) return out;
+  const rows = db.prepare(`
+    SELECT m.device_id, m.group_id FROM device_group_members m
+    JOIN device_groups g ON g.id = m.group_id
+    WHERE m.device_id IN (${deviceIds.map(() => '?').join(',')})
+    ORDER BY g.name ASC, g.id ASC
+  `).all(...deviceIds);
+  for (const r of rows) (out[r.device_id] = out[r.device_id] || []).push(r.group_id);
+  return out;
+}
 
 // #106: reorder display tiles (cosmetic, within-section). Writes devices.sort_order
 // = position in the given id array. Workspace-scoped: the UPDATE matches WHERE
@@ -90,6 +123,122 @@ router.post('/reorder', (req, res) => {
   });
   tx();
   res.json({ success: true });
+});
+
+// Move screens to another workspace of the same organization (lib/device-move.js says what goes
+// with them and what stays). Admin of every source workspace AND the target (an org admin is);
+// JWT only. Runs inside the corporate membership guard: a head office mandate gained, lost or
+// swapped needs an org admin, and store triggers newly hidden under head office need
+// acknowledge_impact (409 CORPORATE_STORE_TRIGGERS_IMPACT, nothing moved).
+function moveRequest(req, res, body) {
+  const moveLib = require('../lib/device-move');
+  const v = moveLib.validate(db, req, body || {});
+  if (v.error) { res.status(v.status).json({ error: v.error, ...(v.code ? { code: v.code } : {}) }); return null; }
+  return v;
+}
+
+function moveOpts(v) { return { bring: v.bring, crossOrg: v.crossOrg, ownerId: v.ownerId, actorId: v.actorId }; }
+
+// The impact list both the preview and a refused move return: what head office would hide in the
+// new workspace first, then the old store's triggers the screens leave behind.
+function moveImpact(sim) { return [...(sim.hidden || []), ...(sim.leaving || [])]; }
+
+router.get('/move-workspace/preview', (req, res) => {
+  const v = moveRequest(req, res, { device_ids: String(req.query.device_ids || '').split(',').filter(Boolean), workspace_id: req.query.workspace_id,
+    bring_playlist: req.query.bring_playlist });
+  if (!v) return;
+  const moveLib = require('../lib/device-move');
+  const corpGuard = require('../lib/corporate/guard');
+  const budget = moveLib.bringBudget(db, v);
+  const sim = corpGuard.guarded(req, res, () => moveLib.simulate(db, req, v.devices, v.target, moveOpts(v)));
+  if (!sim) return;
+  res.json({
+    workspace_id: v.target.id, workspace_name: v.target.name, ...sim, impact: moveImpact(sim),
+    bring_playlist: v.bring,
+    other_organization: v.crossOrg ? { id: v.targetOrg.id, name: v.targetOrg.name } : null,
+    plan_warning: moveLib.planWarning(db, v),
+    storage_refusal: budget ? { code: budget.code, error: budget.error } : null,
+  });
+});
+
+router.post('/move-workspace', (req, res) => {
+  const v = moveRequest(req, res, req.body);
+  if (!v) return;
+  const { devices, target } = v;
+  if (!devices.length) return res.json({ success: true, moved: [], workspace_id: target.id });
+  const moveLib = require('../lib/device-move');
+  const corpGuard = require('../lib/corporate/guard');
+  const impactLib = require('../lib/corporate/impact');
+  // ⚠️ Never take a screen off a store's triggers silently: the triggers it leaves behind, and those
+  // head office would hide in the new workspace, are listed and need acknowledge_impact.
+  // ⚠️ Another organization is said out loud and confirmed on its own, before anything else: the
+  // screen (and whatever is copied with it) changes tenant.
+  if (v.crossOrg && !(req.body && (req.body.acknowledge_other_org === true || req.body.acknowledge_other_org === 1))) {
+    return res.status(409).json({
+      code: 'MOVE_OTHER_ORG_CONFIRM', organization: { id: v.targetOrg.id, name: v.targetOrg.name },
+      error: `This moves ${devices.length === 1 ? 'the screen' : 'these screens'} to another organization ("${v.targetOrg.name}"). Confirm to go ahead.`,
+    });
+  }
+  const budget = moveLib.bringBudget(db, v);
+  if (budget) return res.status(budget.status).json({ error: budget.error, code: budget.code });
+  const sim = corpGuard.guarded(req, res, () => moveLib.simulate(db, req, devices, target, moveOpts(v)));
+  if (!sim) return;
+  const impact = moveImpact(sim);
+  if (impact.length && !impactLib.acknowledged(req)) {
+    const n = impact.length;
+    const code = sim.hidden.length ? 'CORPORATE_STORE_TRIGGERS_IMPACT' : 'DEVICE_MOVE_TRIGGERS_IMPACT';
+    const error = sim.hidden.length
+      ? corpGuard.MESSAGES.CORPORATE_STORE_TRIGGERS_IMPACT({ n })
+      : `After the move, ${n} store trigger${n === 1 ? '' : 's'} will no longer reach ${devices.length === 1 ? 'this screen' : 'these screens'}. Check the list, then confirm.`;
+    return res.status(409).json({ error, code, impact });
+  }
+  const fileOps = [];
+  const moved = corpGuard.guarded(req, res, () => corpGuard.assertNoMandateLoss(req, devices.map((d) => d.id),
+    () => moveLib.moveDevices(db, devices, target.id, { ...moveOpts(v), fileOps }),
+    ({ name }) => `Moving this screen to "${target.name}" would change what it plays (head office's "${name || ''}"). Ask your organization admin to do it.`,
+    { cause: 'move' }));
+  if (!moved) return;
+  // Committed: now the files that are copied rather than shared (fonts).
+  if (fileOps.length) require('../lib/device-bring').runFileOps(fileOps);
+  const after = req.corpMembershipImpact || { store_triggers_hidden: [], store_triggers_showing_again: 0 };
+  if (sim.leaving.length) {
+    // The old store hears which of its triggers no longer reach the screens it gave away.
+    const byWs = new Map();
+    for (const t of sim.leaving) { if (!byWs.has(t.workspace_id)) byWs.set(t.workspace_id, []); byWs.get(t.workspace_id).push({ id: t.trigger_id, name: t.name }); }
+    for (const [wsId, triggers] of byWs) {
+      require('../lib/audit').audit('device.move_workspace.triggers_left', { userId: req.user.id, workspaceId: wsId, ip: req.ip || null,
+        details: { to_workspace_id: target.id, device_ids: moved.map((m) => m.device_id), triggers } });
+    }
+  }
+
+  const { audit } = require('../lib/audit');
+  const io = req.app.get('io');
+  const { workspaceRoom, emitToWorkspace } = require('../lib/socket-rooms');
+  for (const m of moved) {
+    const details = { device_id: m.device_id, from_workspace_id: m.from_workspace_id, to_workspace_id: target.id, dropped: m.dropped,
+      ...(m.brought ? { brought: { playlist_name: m.brought.playlist_name, copied: m.brought.copied, playlist_id: m.brought.playlist_id } } : {}),
+      ...(v.crossOrg ? { other_organization: { from: v.fromOrgIds, to: target.organization_id }, new_owner_id: v.ownerId } : {}) };
+    // Both stores' activity feeds say where the screen went, so neither wonders where it is.
+    audit('device.move_workspace', { userId: req.user.id, workspaceId: m.from_workspace_id, deviceId: m.device_id, ip: req.ip || null, details });
+    audit('device.move_workspace', { userId: req.user.id, workspaceId: target.id, deviceId: m.device_id, ip: req.ip || null, details });
+    if (io) {
+      try {
+        emitToWorkspace(io.of('/dashboard'), workspaceRoom(m.from_workspace_id), 'dashboard:device-removed', { device_id: m.device_id });
+        const row = db.prepare('SELECT * FROM devices WHERE id = ?').get(m.device_id);
+        if (row) emitToWorkspace(io.of('/dashboard'), workspaceRoom(target.id), 'dashboard:device-added', stripDeviceSecrets(row));
+        const { buildPlaylistPayload } = require('../ws/deviceSocket');
+        require('../lib/command-queue').queueOrEmitPlaylistUpdate(io.of('/device'), m.device_id, buildPlaylistPayload);
+      } catch (e) { console.warn(`[move-workspace] notify failed for ${m.device_id}: ${e && e.message}`); }
+    }
+  }
+  // In its new workspace the screen joins whichever dynamic groups its tags and name match there.
+  for (const m of moved) groupRules.reconcileDeviceAsSystem(db, io, m.device_id);
+  res.json({
+    success: true, workspace_id: target.id, moved,
+    store_triggers_hidden: after.store_triggers_hidden || [],
+    store_triggers_left_behind: sim.leaving,
+    store_triggers_showing_again: after.store_triggers_showing_again || 0,
+  });
 });
 
 // List unclaimed provisioning devices (admin only).
@@ -116,6 +265,19 @@ router.get('/removed', (req, res) => {
   res.json(deviceSettings.listRemoved(req.workspaceId));
 });
 
+/*
+ * Place search for a screen's location (Open-Meteo geocoding, keyless, through the weather source's
+ * allowlisted and SSRF-guarded fetch). Workspace members only; returns names and coordinates.
+ */
+router.get('/geocode', async (req, res) => {
+  if (!req.workspaceId) return res.status(403).json({ error: 'No workspace context' });
+  try {
+    res.json(await require('../lib/local-conditions').searchPlaces(req.query.q, req.query.lang || 'en'));
+  } catch (e) {
+    res.status(502).json({ error: 'Place search is unavailable right now.' });
+  }
+});
+
 // Get single device with telemetry history
 router.get('/:id', (req, res) => {
   const device = db.prepare('SELECT d.*, u.email as owner_email, u.name as owner_name FROM devices d LEFT JOIN users u ON d.user_id = u.id WHERE d.id = ?').get(req.params.id);
@@ -125,7 +287,7 @@ router.get('/:id', (req, res) => {
   // to the device's workspace.
   if (!device.workspace_id) return res.status(403).json({ error: 'Device not assigned to a workspace' });
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(device.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) return res.status(403).json({ error: 'Access denied' });
   if (ctx.workspaceRole) device._workspaceRole = ctx.workspaceRole; // Pass to frontend
   if (ctx.actingAs) device._actingAs = true;
@@ -166,6 +328,79 @@ router.get('/:id', (req, res) => {
                      ORDER BY g.priority DESC, g.created_at ASC, g.id ASC LIMIT 1`)
           .get(req.params.id, resolved.playlist_id)?.name || null
       : null;
+
+  /*
+   * CORPORATE: head office's playlist plays here (or head office turned the screen off). The UI
+   * shows a locked badge and the playlist NAME — not a link, for users who cannot open head
+   * office's workspace (it would 404).
+   *
+   * The slot sections (spec §7.9): every local slot of head office's playlist with the content this
+   * screen gets for it — the nearest level, published or still a draft — so the device page knows
+   * BEFORE adding where "Add content" will land (no 409 round trip), and `items`, this screen's loop
+   * tagged by origin (corporate items are locked; slot items say which level they came from).
+   */
+  if (resolved.source === 'corporate') {
+    const m = require('../lib/corporate/resolve').mandateFor(db, req.params.id);
+    const corpGuard = require('../lib/corporate/guard');
+    device.corporate = m ? {
+      playlist_id: m.playlist_id || null,
+      playlist_name: m.playlist_name || null,
+      dark: !!m.dark,
+      layout_id: m.layout_id || null,
+      mandate: { id: m.id, target_kind: m.target_kind, target_label: corpGuard.targetLabel(db, m) },
+      can_change: corpGuard.isOrgAdmin(req, m.organization_id) && !req.viaToken,
+      // The device controls only org admins may use here (D13), so the page can show a lock and the
+      // reason on the control itself instead of letting the command bounce. The server still refuses.
+      controls_locked: corpGuard.isControlledFor(req, req.params.id),
+      gated_commands: Object.keys(corpGuard.GATED_COMMANDS),
+      slots: [],
+      items: [],
+    } : null;
+    if (m && m.playlist_id) {
+      try {
+        const fillsLib = require('../lib/corporate/fills');
+        const corpResolve = require('../lib/corporate/resolve');
+        const markers = corpResolve.publishedMarkers(db, m.playlist_id);
+        const playing = corpResolve.fillsForDevice(db, req.params.id, m.playlist_id);
+        for (const slot of fillsLib.liveSlots(db, m.playlist_id)) {
+          const near = fillsLib.nearestFill(db, req.params.id, slot);
+          const marker = markers.get(slot.id);
+          device.corporate.slots.push({
+            id: slot.id, name: slot.name, help_text: slot.help_text || null,
+            limits: (marker && marker.limits) || fillsLib.limitsOfRow(slot),
+            has_fallback: !!(marker && marker.fallback),
+            fill: near ? { ...fillsLib.describeFill(db, near, slot), fill_state: near.fill_state, playing: !!(playing.get(slot.id) && playing.get(slot.id).fillId === near.id) } : null,
+            own: !!(near && (near.scope_kind === 'device' || near.scope_kind === 'wall')),
+          });
+        }
+        const ex = require('../lib/corporate/composition').explain(db, m.playlist_id, playing);
+        device.corporate.items = ex.items.map((a) => ({
+          content_id: a.content_id || null, widget_id: a.widget_id || null, filename: a.filename || a.widget_name || null,
+          mime_type: a.mime_type || null, duration_sec: a.duration_sec || null,
+          origin: a.__tag ? a.__tag.kind : 'corporate', slot_id: a.__tag ? a.__tag.slot_id : null,
+          locked: !a.__tag || a.__tag.kind !== 'slot',
+        }));
+      } catch (e) { console.warn(`[corporate] device slot block failed for ${req.params.id}: ${e && e.message}`); }
+    }
+  }
+
+  /*
+   * Head office's emergency alerts that reach this screen (org switch on, screen in scope). While any
+   * does, the trigger listener, ports, secret and clear-all token are org-admin-only (§5.2), and a
+   * screen whose listeners are off cannot be reached at all — the trigger panel says both.
+   */
+  try {
+    const em = require('../lib/corporate/emergency');
+    const locking = em.lockingTriggers(db, req.params.id);
+    if (locking.length) {
+      const corpGuard = require('../lib/corporate/guard');
+      device.head_office_triggers = {
+        alerts: locking.map((t) => ({ id: t.id, name: t.name })),
+        settings_locked: !corpGuard.isOrgAdmin(req, corpGuard.orgOfDevice(db, req.params.id)) || !!req.viaToken,
+        listeners_off: !device.triggers_accept_http && !device.triggers_accept_udp,
+      };
+    }
+  } catch (_) { /* no emergency tables: nothing to say */ }
 
   let assignments = [];
   let playlist_status = null;
@@ -237,8 +472,20 @@ router.get('/:id', (req, res) => {
   // that never reported one, or whose block is unreadable — the card simply does not render.
   const edid = require('../lib/edid').parseEdid(device.hardware_edid);
 
-  res.json({ ...stripDeviceSecrets(device), capabilities, edid, telemetry, screenshot, assignments, active_layout_zones, playlist_status, playlist_has_published, uptimeData, statusLog, deviceEvents });
+  res.json({ ...stripDeviceSecrets(device), tags: parseTags(device.tags), group_ids: groupIdsByDevice([device.id])[device.id] || [], local_weather: require('../lib/local-conditions').readingFor(device), capabilities, edid, telemetry, screenshot, assignments, active_layout_zones, playlist_status, playlist_has_published, uptimeData, statusLog, deviceEvents });
 });
+
+/*
+ * CORPORATE (D13): a gated device control on a screen head office's playlist plays on — answered
+ * 403 CORPORATE_DEVICE_CONTROL for anyone but the organization's admins. Returns true when refused.
+ */
+function corpDeviceRouteRefused(req, res, actionLabel) {
+  const corpGuard = require('../lib/corporate/guard');
+  try { corpGuard.assertDeviceRouteControl(req, req.params.id, actionLabel); return false; } catch (e) {
+    if (corpGuard.send(res, e, req)) return true;
+    throw e;
+  }
+}
 
 // Helper: check device write access via the workspace the device belongs to.
 // Phase 2.2a: replaces user_id + team_members check. Allows: platform_admin,
@@ -249,7 +496,7 @@ function checkDeviceOwnership(req, res) {
   if (!device) { res.status(404).json({ error: 'Device not found' }); return null; }
   if (!device.workspace_id) { res.status(403).json({ error: 'Device not assigned to a workspace' }); return null; }
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(device.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   // ctx.actingAs covers platform_admin and org_owner/admin paths (always writable).
   // Direct workspace members: workspace_viewer is read-only.
@@ -272,13 +519,32 @@ router.get('/:id/preview-payload', (req, res) => {
   if (!device) return res.status(404).json({ error: 'Device not found' });
   if (!device.workspace_id) return res.status(403).json({ error: 'Device not assigned to a workspace' });
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(device.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) return res.status(403).json({ error: 'Access denied' });
   // Unchecked on purpose: this is the dashboard's "what would it play" preview, not a delivery
   // channel. The gated buildPlaylistPayload would render a suspended card for a blocked screen.
   const { buildPlaylistPayloadUnchecked } = require('../ws/deviceSocket');
   const payload = buildPlaylistPayloadUnchecked(req.params.id);
   payload.wall_config = null; // v1: wall members preview full-frame (no socket-free follower freeze)
+  /*
+   * ⚠️ Secrets out of a PREVIEW (spec §5.2). This is a read route a workspace viewer and an API
+   * token can call, and the payload carries what lets a LAN host change the screen:
+   *   - head office emergency alert codes go only to the organization's admins — a store that knows
+   *     the clear code and its screen's secret could clear the alert during an emergency;
+   *   - the trigger and local-API secrets go to no viewer and no token (an editor still sees the
+   *     trigger secret where it is set, the device's own trigger panel).
+   */
+  try {
+    const corpGuard = require('../lib/corporate/guard');
+    if (Array.isArray(payload.triggers) && payload.triggers.some((t) => t && t.kind === 'emergency')
+        && (req.viaToken || !corpGuard.isOrgAdmin(req, corpGuard.orgOfWorkspace(db, device.workspace_id)))) {
+      payload.triggers = payload.triggers.map((t) => (t && t.kind === 'emergency' ? { ...t, match_token: null, clear_token: null } : t));
+    }
+  } catch (_) { /* never fail a preview over this */ }
+  if (req.viaToken || (!ctx.actingAs && ctx.workspaceRole === 'workspace_viewer')) {
+    if (payload.trigger_config) payload.trigger_config = { ...payload.trigger_config, secret: null };
+    if (payload.local_api) payload.local_api = { ...payload.local_api, secret: null };
+  }
   res.json(payload);
 });
 
@@ -322,14 +588,32 @@ router.delete('/:id/playlist', (req, res) => {
     }
   } catch (e) { /* silent — the DB is the source of truth, the push is best-effort */ }
 
-  res.json({ success: true });
+  // Clearing a shadowed override is harmless; say that head office's playlist still plays here.
+  const stillMandated = !!require('../lib/corporate/guard').activeMandateFor(db, req.params.id);
+  res.json({ success: true, ...(stillMandated ? { still_mandated: true } : {}) });
 });
 
 router.put('/:id', (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
 
-  const { name, notes, timezone, orientation, background_color, default_content_id, layout_id, ota_enabled, ota_beta, reboot_schedule, live_video_enabled } = req.body;
+  const { name, notes, timezone, orientation, background_color, default_content_id, layout_id, ota_enabled, ota_beta, reboot_schedule, live_video_enabled, tags, screen_profile } = req.body;
+  // Where the screen is (lib/local-conditions.js). Both coordinates or neither; both null clears.
+  let locUpdate = null;
+  if (req.body.latitude !== undefined || req.body.longitude !== undefined || req.body.location_label !== undefined) {
+    const clear = req.body.latitude === null && req.body.longitude === null;
+    const lat = Number(req.body.latitude), lon = Number(req.body.longitude);
+    if (!clear && (req.body.latitude !== undefined || req.body.longitude !== undefined)
+        && !(Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180)) {
+      return res.status(400).json({ error: 'latitude and longitude must both be given, as -90..90 and -180..180 (or both null to clear)' });
+    }
+    locUpdate = {
+      ...(req.body.latitude !== undefined || req.body.longitude !== undefined ? { latitude: clear ? null : lat, longitude: clear ? null : lon } : {}),
+      ...(req.body.location_label !== undefined ? { location_label: req.body.location_label ? String(req.body.location_label).replace(/[\u0000-\u001f<>]/g, '').slice(0, 120) : null } : {}),
+    };
+  }
+  const normTags = normalizeTags(tags);
+  if (normTags === false) return res.status(400).json({ error: 'tags must be an array of labels or a comma-separated string' });
   // #150: validate orientation against the known enum (previously accepted any string, which
   // let a bad value reach the player -> unknown rotation falls back to landscape silently).
   // #325: a CSS colour that reaches the player's inline style, so it is constrained to a hex
@@ -358,6 +642,11 @@ router.put('/:id', (req, res) => {
   // PUT /api/layouts/device/:id). Validate it's a template or in the device's
   // workspace; null clears it (fullscreen).
   if (layout_id !== undefined) {
+    // CORPORATE: head office's mandate decides a mandated screen's layout (refused, not a silent no-op).
+    try { require('../lib/corporate/guard').assertNotMandated(req, req.params.id); } catch (e) {
+      if (require('../lib/corporate/guard').send(res, e, req)) return;
+      throw e;
+    }
     if (layout_id !== null) {
       const layout = db.prepare('SELECT id FROM layouts WHERE id = ? AND (is_template = 1 OR workspace_id = ?)').get(layout_id, device.workspace_id);
       if (!layout) return res.status(400).json({ error: 'layout_id not found in this workspace' });
@@ -391,12 +680,62 @@ router.put('/:id', (req, res) => {
     updates.push('reboot_schedule = ?'); values.push(val);
     updates.push('reboot_last_date = ?'); values.push(null);
   }
+  if (normTags !== undefined) { updates.push('tags = ?'); values.push(JSON.stringify(normTags)); }
+  if (locUpdate) for (const [k, v] of Object.entries(locUpdate)) { updates.push(`${k} = ?`); values.push(v); }
+  if (screen_profile !== undefined) {
+    // Only an embedded (server-rendered) panel has a render profile. Anything else would silently
+    // keep it and ignore it, so refuse rather than store a setting nothing reads.
+    if (device.client_type !== 'embedded') {
+      return res.status(400).json({ error: 'screen_profile applies to embedded displays only' });
+    }
+    let profileVal = null;
+    if (screen_profile !== null && screen_profile !== '') {
+      const { parseProfile } = require('../lib/embedded-profiles');
+      const parsed = parseProfile(screen_profile);
+      if (!parsed) {
+        return res.status(400).json({ error: 'Invalid screen_profile' });
+      }
+      profileVal = typeof screen_profile === 'object' ? JSON.stringify(screen_profile) : String(screen_profile);
+    }
+    updates.push('screen_profile = ?'); values.push(profileVal);
+  }
+  /*
+   * Tags, name and timezone are what dynamic groups match on, so this edit can move the screen into
+   * or out of groups. Planned against the NEW values, then written together with the membership
+   * under the corporate guard, as this operator: a change that would alter which head office
+   * playlist the screen plays is refused exactly like dragging it out of the group by hand, and
+   * nothing is written.
+   */
+  const dynOverrides = {};
+  if (normTags !== undefined) dynOverrides.tags = JSON.stringify(normTags);
+  if (name !== undefined) dynOverrides.name = name;
+  if (timezone !== undefined) dynOverrides.timezone = timezone;
+  const dynOps = Object.keys(dynOverrides).length ? groupRules.planDevice(db, req.params.id, dynOverrides) : [];
   if (updates.length > 0) {
     values.push(req.params.id);
-    db.prepare(`UPDATE devices SET ${updates.join(', ')}, updated_at = strftime('%s','now') WHERE id = ?`).run(...values);
+    const write = () => {
+      db.prepare(`UPDATE devices SET ${updates.join(', ')}, updated_at = strftime('%s','now') WHERE id = ?`).run(...values);
+      if (dynOps.length) groupRules.applyOps(db, dynOps);
+      return true;
+    };
+    if (dynOps.length) {
+      const corpGuard = require('../lib/corporate/guard');
+      const ok = corpGuard.guarded(req, res, () => corpGuard.assertNoMandateLoss(req, [req.params.id], write,
+        (c) => `This change would move the screen ${dynOps[0].op === 'add' ? 'into' : 'out of'} the group "${dynOps[0].group.name}", which changes what it plays (head office's "${c.name}"). Ask your organization admin to do it.`));
+      if (!ok) return;
+      groupRules.pushTo(req.app.get('io'), groupRules.devicesToPush(db, dynOps));
+    } else {
+      write();
+    }
+    // Allowed on a head office screen, and recorded so head office can see who changed it.
+    if (orientation !== undefined || timezone !== undefined) {
+      require('../lib/corporate/guard').auditMandatedAction(req, device, orientation !== undefined ? 'orientation' : 'timezone');
+    }
   }
 
   const updated = db.prepare('SELECT * FROM devices WHERE id = ?').get(req.params.id);
+  updated.tags = parseTags(updated.tags);
+  if (dynOps.length) updated.groups_changed = dynOps.map((o) => ({ group_id: o.group.id, name: o.group.name, op: o.op }));
   // ⚠️ stripDeviceSecrets only removes device_token. GET /:id additionally calls
   // stripSecretsForTokens; these two echo paths did not, so a token got the trigger secret
   // back from a rename — the escalation lib/device-sanitize.js exists to prevent.
@@ -442,11 +781,12 @@ router.put('/:id', (req, res) => {
  * mesh write channel re-enters this node's own HTTP API precisely so that a remote request passes
  * the same guards a local one does. Without an HTTP surface there was nothing for it to re-enter.
  *
- * Guarded exactly as the group route is: requireScope('full') for API tokens (a fleet-affecting
- * action is not an ordinary write), checkDeviceOwnership for the workspace, the shared command
- * allowlist, and the panel's own declared capabilities.
+ * Guarded exactly as the group route is: requireCommandScope for API tokens (`full`, except the
+ * five undoable commands a `write` token may send — lib/device-command.js WRITE_SCOPE_COMMANDS),
+ * checkDeviceOwnership for the workspace, the shared command allowlist, and the panel's own
+ * declared capabilities.
  */
-router.post('/:id/command', requireScope('full'), (req, res) => {
+router.post('/:id/command', requireCommandScope, (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
 
@@ -460,6 +800,10 @@ router.post('/:id/command', requireScope('full'), (req, res) => {
   if (!deviceNs) return res.status(503).json({ error: 'The realtime layer is not available.' });
 
   const r = deliverCommand(deviceNs, device, type, payload);
+  if (r.status === 'refused') {
+    // A screen head office's playlist plays on: this command is for the organization's admins.
+    return res.status(403).json({ error: r.error, code: r.code, corporate: r.corporate });
+  }
   if (r.status === 'unsupported') {
     // Named rather than generic: "this panel cannot do that" is actionable, "failed" is not.
     return res.status(400).json({ error: 'That screen cannot do that', capability: r.capability });
@@ -468,9 +812,24 @@ router.post('/:id/command', requireScope('full'), (req, res) => {
   res.json({ success: true, status: r.status, device_id: device.id, ...(r.id ? { id: r.id } : {}) });
 });
 
+/*
+ * HEAD OFFICE EMERGENCY ALERTS (spec §5.2, D13): once an organization switches emergency alerts on,
+ * a screen in an enabled alert's scope has its trigger listener, ports, secret and clear-all token
+ * managed by the organization's admins only — a store must not be able to quietly make itself
+ * unreachable. Returns true when refused (403 CORPORATE_DEVICE_CONTROL).
+ */
+function emergencyTriggerSettingsRefused(req, res) {
+  const corpGuard = require('../lib/corporate/guard');
+  try { require('../lib/corporate/emergency').assertTriggerSettingsWritable(req, req.params.id); return false; } catch (e) {
+    if (corpGuard.send(res, e, req)) return true;
+    throw e;
+  }
+}
+
 router.post('/:id/trigger-config', requireScope('full'), (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
+  if (emergencyTriggerSettingsRefused(req, res)) return;
   const b = req.body || {};
   const sets = [];
   const vals = {};
@@ -533,6 +892,11 @@ router.post('/:id/trigger-config', requireScope('full'), (req, res) => {
             + 'resolved before per-trigger tokens, so it would silently shadow it',
         });
       }
+      // …and head office's emergency alerts, org-wide (they live in the head office workspace, so the
+      // query above never sees them). Both directions are checked: lib/corporate/emergency.js
+      // tokenClash refuses an alert token equal to an in-scope screen's clear-all.
+      const emClash = require('../lib/corporate/emergency').clearAllClash(db, device.id, t);
+      if (emClash) return res.status(400).json({ error: emClash, code: 'CORPORATE_EMERGENCY_TOKEN' });
       sets.push('trigger_clear_all_token = @clear_all_token'); vals.clear_all_token = t;
     }
   }
@@ -584,6 +948,7 @@ router.post('/:id/trigger-config', requireScope('full'), (req, res) => {
 router.post('/:id/trigger-secret', requireScope('full'), (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
+  if (emergencyTriggerSettingsRefused(req, res)) return;
   const b = req.body || {};
   let secret;
   if (b.rotate || b.secret === undefined) {
@@ -641,6 +1006,7 @@ router.post('/:id/trigger-secret', requireScope('full'), (req, res) => {
 router.post('/:id/local-api', requireScope('full'), (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
+  if (corpDeviceRouteRefused(req, res, 'change its local control settings')) return;
   const b = req.body || {};
   if (b.enabled === undefined) return res.status(400).json({ error: 'enabled is required' });
   const enabled = !!b.enabled;
@@ -701,6 +1067,7 @@ router.post('/:id/local-api', requireScope('full'), (req, res) => {
 router.post('/:id/local-api-secret', requireScope('full'), (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
+  if (corpDeviceRouteRefused(req, res, 'change its local control settings')) return;
   const b = req.body || {};
   let secret;
   if (b.rotate || b.secret === undefined) {
@@ -824,9 +1191,112 @@ router.delete('/:id/enrol-key', requireScope('full'), (req, res) => {
   res.json({ success: true, id: req.params.id, enrol_key: null });
 });
 
+/*
+ * View-only access (lib/view-access.js): let people WATCH this display from a browser without pairing
+ * anything. Off by default. Only the display's workspace admins (and org owners/admins, platform
+ * admins) may see or change it — editors may not: a share link reaches people outside the workspace,
+ * and that is an admin's decision. Never through an API token: the link is a credential for a person
+ * to hold, not an integration's.
+ *
+ * Every change is written to the activity log with what changed (never the token itself).
+ */
+function viewAdminDevice(req, res) {
+  if (req.viaToken) { res.status(403).json({ error: 'View-only access is managed from the dashboard, not with an API token' }); return null; }
+  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(req.params.id);
+  if (!device) { res.status(404).json({ error: 'Device not found' }); return null; }
+  const ws = device.workspace_id && db.prepare('SELECT * FROM workspaces WHERE id = ?').get(device.workspace_id);
+  if (!ws || !resourceAccess(req, ws)) { res.status(403).json({ error: 'Access denied' }); return null; }
+  if (!canAdminWorkspace(db, req.user, ws)) { res.status(403).json({ error: 'Only workspace admins can change view-only access' }); return null; }
+  return device;
+}
+
+function viewState(req, device) {
+  const origin = `${req.protocol}://${req.get('host')}`;
+  const token = device.view_token_enc ? secretbox.decrypt(device.view_token_enc) : null;
+  const cidrs = viewAccess.parseStoredCidrs(device.view_cidrs);
+  return {
+    available: !!config.viewOnlyEnabled,
+    enabled: !!device.view_enabled,
+    share_url: token ? `${origin}/view/${token}` : null,
+    cidrs,
+    network_url: cidrs.length ? `${origin}/view/screen/${device.id}` : null,
+    trusted_proxies_configured: (config.viewTrustedProxies || []).length > 0,
+  };
+}
+
+function logView(req, device, action, detail) {
+  try { logActivity(req.user.id, action, detail, device.id, getClientIp(req), device.workspace_id); } catch (_) { /* never fail the change over its log line */ }
+}
+
+// Anyone who can read the display learns whether it is on (so the page can say so); only an admin
+// gets the link and the networks.
+router.get('/:id/view', (req, res) => {
+  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(req.params.id);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+  const ws = device.workspace_id && db.prepare('SELECT * FROM workspaces WHERE id = ?').get(device.workspace_id);
+  if (!ws || !resourceAccess(req, ws)) return res.status(403).json({ error: 'Access denied' });
+  const admin = !req.viaToken && canAdminWorkspace(db, req.user, ws);
+  if (!admin) return res.json({ available: !!config.viewOnlyEnabled, enabled: !!device.view_enabled, can_admin: false });
+  res.json({ ...viewState(req, device), can_admin: true });
+});
+
+// { enabled?: boolean, cidrs?: string[] | string }. Turning it on the first time mints the link.
+router.put('/:id/view', (req, res) => {
+  const device = viewAdminDevice(req, res);
+  if (!device) return;
+  if (!config.viewOnlyEnabled) return res.status(409).json({ error: 'View-only access is turned off on this server' });
+  const body = req.body || {};
+  const sets = [];
+  const args = [];
+  const changes = [];
+  if (body.enabled !== undefined) {
+    const on = body.enabled === true || body.enabled === 1 || body.enabled === '1' || body.enabled === 'true';
+    if (on !== !!device.view_enabled) {
+      sets.push('view_enabled = ?'); args.push(on ? 1 : 0);
+      changes.push(on ? 'view:enabled' : 'view:disabled');
+    }
+    if (on && !device.view_token_hash) {
+      const t = viewAccess.mintToken();
+      sets.push('view_token_hash = ?', 'view_token_enc = ?'); args.push(t.hash, t.enc);
+      changes.push('view:link_created');
+    }
+  }
+  if (body.cidrs !== undefined) {
+    const n = viewAccess.normaliseCidrs(body.cidrs);
+    if (n.error) return res.status(400).json({ error: n.error, invalid: n.invalid || [] });
+    const before = viewAccess.parseStoredCidrs(device.view_cidrs);
+    if (JSON.stringify(before) !== JSON.stringify(n.cidrs)) {
+      sets.push('view_cidrs = ?'); args.push(n.cidrs.length ? JSON.stringify(n.cidrs) : null);
+      changes.push(`view:networks ${n.cidrs.length ? n.cidrs.join(', ') : '(none)'}`);
+    }
+  }
+  if (sets.length) {
+    db.prepare(`UPDATE devices SET ${sets.join(', ')}, updated_at = strftime('%s','now') WHERE id = ?`).run(...args, device.id);
+    for (const c of changes) {
+      const [action, ...rest] = c.split(' ');
+      logView(req, device, action, `${device.name || device.id}${rest.length ? ': ' + rest.join(' ') : ''}`);
+    }
+  }
+  const fresh = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
+  res.json({ ...viewState(req, fresh), can_admin: true });
+});
+
+// New link; the old one stops working at once (open viewers go dark on their next poll).
+router.post('/:id/view/regenerate', (req, res) => {
+  const device = viewAdminDevice(req, res);
+  if (!device) return;
+  if (!config.viewOnlyEnabled) return res.status(409).json({ error: 'View-only access is turned off on this server' });
+  const t = viewAccess.mintToken();
+  db.prepare("UPDATE devices SET view_token_hash = ?, view_token_enc = ?, updated_at = strftime('%s','now') WHERE id = ?").run(t.hash, t.enc, device.id);
+  logView(req, device, 'view:link_regenerated', `${device.name || device.id}${device.view_token_hash ? ': previous link revoked' : ''}`);
+  const fresh = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
+  res.json({ ...viewState(req, fresh), can_admin: true });
+});
+
 router.post('/:id/block', (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
+  if (corpDeviceRouteRefused(req, res, 'block it')) return;
   db.prepare("UPDATE devices SET blocked = 1, updated_at = strftime('%s','now') WHERE id = ?").run(req.params.id);
   // Mirror onto the saved settings so the block survives a delete + re-pair on purpose rather than
   // by accident of whatever the saved copy happened to hold.
@@ -879,8 +1349,13 @@ router.delete('/:id', (req, res) => {
   // of silently resetting to defaults. No-op if the device has no fingerprint link yet.
   try { deviceSettings.snapshot(req.params.id); } catch (e) { console.warn(`[#150] settings snapshot failed for ${req.params.id}: ${e.message}`); }
 
+  // Allowed on a head office screen (physical access is out of the threat model), but recorded.
+  require('../lib/corporate/guard').auditMandatedAction(req, device, 'delete');
+
   // Clean up related data (playlist is NOT deleted — may be shared with other devices)
   db.prepare('DELETE FROM schedules WHERE device_id = ?').run(req.params.id);
+  // Head office mandates / slot content / emergency scopes naming this screen (no FK cascades them).
+  require('../lib/corporate/cleanup').removeTargets(db, 'device', req.params.id);
   db.prepare('DELETE FROM screenshots WHERE device_id = ?').run(req.params.id);
   db.prepare('DELETE FROM device_telemetry WHERE device_id = ?').run(req.params.id);
   db.prepare('DELETE FROM video_wall_devices WHERE device_id = ?').run(req.params.id);
@@ -893,6 +1368,11 @@ router.delete('/:id', (req, res) => {
   if (io) {
     const { workspaceRoom, emitToWorkspace } = require('../lib/socket-rooms');
     emitToWorkspace(io.of('/dashboard'), workspaceRoom(device.workspace_id), 'dashboard:device-removed', { device_id: req.params.id });
+    // Tell the screen now. Without this a connected player only learned on its next register (a
+    // reconnect, or an app restart), and sat on its old content until then. `reason: 'deleted'` is
+    // what lets a player wipe its downloads: the not_found a register gets is also what a restored
+    // backup or an unreplicated edge says, so players must never wipe on that.
+    io.of('/device').to(req.params.id).emit('device:unpaired', { reason: 'deleted' });
   }
 
   res.json({ success: true });
@@ -911,7 +1391,7 @@ function checkDeviceRead(req, res) {
   if (!device) { res.status(404).json({ error: 'Device not found' }); return null; }
   if (!device.workspace_id) { res.status(403).json({ error: 'Device not assigned to a workspace' }); return null; }
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(device.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   device._workspace = ws;
   return device;

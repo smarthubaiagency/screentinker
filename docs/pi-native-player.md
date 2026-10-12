@@ -1,13 +1,25 @@
 # Raspberry Pi native player — server contract
 
-The native Pi player (`pi/`, Python + Qt, shipped as `screentinker-pi_<ver>_all.deb`) talks to the
+The native Pi player (`native/`, Python + PySide6, shipped as `screentinker-pi_<ver>_all.deb`) talks to the
 server exactly like the Android APK: Socket.IO on `<server>/device`, `device:register`, heartbeats,
 `device:command`. This page records only what is **new or different** for it. It is not the
 Chromium-kiosk install that `scripts/raspberry-pi-setup.sh` sets up — that one is a browser and
 registers as the web player.
 
-Status: server and dashboard side implemented on `feat/pi-native-player`; the device side is being
-built to this contract. Anything marked ❓ is a question for the device side.
+Install and run modes (`scripts/raspberry-pi-setup.sh --native URL [--native-mode lite|desktop]`):
+
+| mode | chosen when | runs as | log |
+|---|---|---|---|
+| `lite` | no display manager boots (`display-manager.service` absent, or default target not `graphical.target`) | `screentinker-pi.service`, user `screentinker`, eglfs/KMS on the display; `getty@tty1` disabled | `journalctl -u screentinker-pi` |
+| `desktop` | a display manager is enabled **and** the default target is `graphical.target` | `/etc/xdg/autostart` in the login session of the lightdm autologin user (else the sudo user); the service is disabled | `~/.local/state/screentinker-pi/player.log` |
+
+⚠️ The mode is NOT taken from installed packages: the Chromium-kiosk install puts `xserver-xorg` on
+Lite, and reading that as "desktop" left the service disabled while the kiosk's X server held the
+screen (`Could not set DRM mode … Permission denied`). The native install removes the kiosk's
+launchers (`screentinker-kiosk.service`, and `~/.config/autostart/screentinker.desktop` when it runs
+`screentinker-kiosk.sh`); the All-in-One server unit is left alone.
+
+Anything marked ❓ is a question for the device side.
 
 ## 1. Identity (`device:register`)
 
@@ -45,7 +57,7 @@ Unchanged wire format (`device:command {type, payload}`), gated by capability as
 | `shell {cmd}` | `system.shell` | one-shot; answer with `device:shell-result {cmd, output, exit}` (output capped at 8000 chars server-side) |
 | `install_apk {url}` | `system.install_apk` | the dashboard labels it "Install package (.deb URL)" for a Pi; the Pi hands the URL to dpkg |
 | `kiosk_lock` / `kiosk_unlock` / `lock_now` / `power_menu` | `system.kiosk` (stand-in for `system.device_owner`) | the dashboard shows these for a Pi that declares `system.kiosk` |
-| `set_time` / `set_timezone` | `system.time` | no dashboard control exists yet |
+| `set_time` / `set_timezone` | `system.time` | no dashboard control yet; pairing sends `set_timezone` (the pairing browser's zone) to a screen still on a default zone (UTC, Europe/London) with no override |
 | `set_server_url {url}` | `remote.set_server_url` | no enrol key is minted for `client_type 'pi'` (that is for browser players only) |
 
 ## 3. Interactive terminal (PTY) — `system.pty`
@@ -146,3 +158,10 @@ breaker. A package held by `block_uninstall` is un-held for the upgrade and held
 
 ⚠️ After `set_server_url`, the helper still verifies against the server in `/etc` (by design — the
 player's own state is not trusted); re-run `screentinker-pi setup <new-url>` on panels that move.
+
+## Audience counting (optional add-on)
+
+The player declares `audience.camera` only when the optional audience-counting add-on is installed
+and a USB webcam is present. The add-on is OpenCV and the YuNet face model, chosen at install time
+and off by default. It counts with the same rules and wire format as Android (`device:audience`,
+acked by `device:audience-ack`). See [audience-counting.md](audience-counting.md#the-add-on-for-raspberry-pi-and-windows).

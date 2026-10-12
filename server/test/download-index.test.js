@@ -25,6 +25,7 @@ const di = require('../lib/download-index');
 const GUIDE_DIR = path.join(__dirname, '..', '..', 'frontend', 'guides');
 const PLATFORM_GUIDES = [
   'windows-digital-signage.html',
+  'mac-ipad-digital-signage.html',
   'chromeos-digital-signage.html',
   'lg-webos-digital-signage.html',
   'brightsign-digital-signage.html',
@@ -76,6 +77,19 @@ test('Vega is listed but never offered as an install', () => {
     assert.equal(vega.available, false);
     assert.equal(vega.url, null, 'Vega must have no download URL in any state');
     assert.ok(vega.absent);
+  }
+});
+
+test('Roku is listed but never offered as a file', () => {
+  // A Roku app installs from the Roku Channel Store; a zip here could only be sideloaded in developer
+  // mode. The row stays, so a Roku owner finds the guide and its limits (no autostart above all).
+  for (const state of [{}, FULL]) {
+    const roku = di.entries(state).find((x) => x.id === 'roku');
+    assert.ok(roku, 'Roku row present');
+    assert.equal(roku.available, false);
+    assert.equal(roku.url, null, 'Roku must have no download URL in any state');
+    assert.equal(roku.guide, '/guides/roku-digital-signage.html');
+    assert.ok(roku.absent);
   }
 });
 

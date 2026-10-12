@@ -16,6 +16,10 @@ const BUILTIN_WIDGET_TYPES = Object.freeze([
   'directory-board',
   'directory-search',
   'diag-smoothness',
+  'menu-board',
+  'cloud-doc',
+  'bi-dashboard',
+  'room-display',
 ]);
 
 const RESERVED_WIDGET_TYPES = new Set([
@@ -24,6 +28,8 @@ const RESERVED_WIDGET_TYPES = new Set([
   'transition',
   // lib/templates: an installed template used in a workspace. Created only by /api/templates.
   'template',
+  // lib/cap/feeds.js: an emergency feed's hidden alert card. Created only with its feed.
+  'cap_alert',
 ]);
 
 // The built-in data sources (lib/data-sources/builtin-types.js). 'api' was the "coming soon"

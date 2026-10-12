@@ -40,11 +40,27 @@ const CAPABILITIES = [
    * player declares it and the deviceSocket strip keeps rtsp items off every other screen. In no
    * baseline (brand new). */
   'playback.rtsp',
+  /* The screen's own HDMI INPUT played as an item (mime video/hdmi-in, remote_url hdmi://<port>):
+   * a cable box or console plugged into a Fire TV Cube / Android TV box with HDMI in. Declared by
+   * the native Android player ONLY when it found an HDMI passthrough input on this device at
+   * runtime — most Android boxes have none, which is exactly why a static table could not know.
+   * In NO baseline; the deviceSocket strip keeps it off every other screen. */
+  'playback.hdmi_in',
   /* An uploaded HTML bundle (.wgt / .zip) played as a playlist item. Declared by a player that can
    * MOUNT one — today that means loading the server's flattened single-document render, which every
    * player with an iframe can do. It does NOT imply the player can unpack an archive locally, so it
    * says nothing about whether a bundle survives an outage; that is offline.cache's job. */
   'playback.bundle',
+  /* A HOLD item (mime application/x-st-hold, remote_url hold://blank | hold://freeze): show nothing
+   * new for the item's duration — blank, or freeze the previous frame. How a timeline across screens
+   * is written (see lib/hold-item.js). In NO baseline: an old player would skip it as an unknown
+   * type, shortening the timeline, so the deviceSocket strip keeps it off any screen that does not
+   * declare it. */
+  'playback.hold',
+  /* Zones on a VIDEO WALL: the wall's layout, in percent of the wall's player rect, each zone paced
+   * by the shared clock (lib/wall-layout.js). A wall member without it still plays the wall's
+   * playlist across the whole wall, so the dashboard names the panels that lack it. In NO baseline. */
+  'playback.wall_zones',
   /* A webpage widget with `interactive: true` played as a walk-up kiosk page (#473): touch reaches
    * the site, the playlist holds while a visitor uses it, and an idle reset wipes the session.
    * FULL support: the site loads TOP-LEVEL in a browser the player controls, so the navigation
@@ -135,6 +151,47 @@ const CAPABILITIES = [
    * In NO baseline — brand new, and a fielded player simply ignores the unknown command.
    */
   'net.http_request',
+  /*
+   * Audience counting (lib/audience.js): the player has a camera it can open and an on-device face
+   * detector, and will report COUNTS ONLY. Declared by a player that could count if asked — not a
+   * statement that it is counting; that is the org's switch, sent in the payload. In NO baseline.
+   */
+  'audience.camera',
+  /*
+   * A meeting-room display (lib/rooms) on this screen can be USED: the player hands the page its
+   * panel capability (the #panel fragment, ws/deviceSocket.js) and a person at the screen can press
+   * its buttons. The release sweep (lib/rooms/service.js sweepReleases) gives a room back only while
+   * a screen with this is showing it, because releasing a meeting nobody COULD check in to just loses
+   * a real booking. In NO baseline: a player older than room displays never passes the capability.
+   * Not declared by Tizen, webOS, BrightSign or Vega (docs/room-booking.md lists them read-only).
+   */
+  'room.panel',
+
+  /*
+   * The player has NO time-zone database of its own and asks the server for one: the playlist
+   * payload then carries `tz_table` (lib/tz-table.js) — the UTC offset spans of the screen's
+   * effective zone from a day ago to three days ahead — so schedules, power windows and the clock
+   * follow the zone set in the dashboard rather than whatever the box itself is set to. A Roku is
+   * the reason it exists: roDateTime only knows the device's own setting.
+   *
+   * ⚠️ It changes the PAYLOAD, so it is opt-in by declaration (and the roku baseline): every player
+   * that does not have it receives byte-for-byte what it received before. Not a command; never in
+   * COMMAND_CAPABILITY.
+   */
+  'clock.tz_table',
+  /*
+   * The player cannot run HTML at all and shows browser-only items (widgets, templates, slides, web
+   * pages, HTML bundles, menu boards…) as STILL FRAMES the server renders for it in headless
+   * Chromium: GET /api/player/raster (routes/player-raster.js). It is the door to that endpoint —
+   * the route refuses a device without it, because a render is the most expensive request a screen
+   * can make and no player that runs its own browser has any reason to ask for one.
+   *
+   * ⚠️ A frame is not the item. No animation, no video inside a page, no touch, and it is only as
+   * fresh as its refresh interval (X-ST-Refresh-In). playback.widget on a player with this means
+   * "the widget appears", nothing more. E-ink has its own renderer (/api/embedded) and never
+   * declares it.
+   */
+  'render.server_raster',
 
   // synchronisation
   'sync.clock', 'sync.native',
@@ -416,6 +473,106 @@ const BASELINE = {
     'system.restart_player',
     'sync.clock', 'offline.cache',
   ],
+  /*
+   * The NATIVE macOS player — the same engine again (native/screentinker_native, platform/macos),
+   * client_type 'mac', platform 'macOS/<version> (<model>)'. Exactly BASELINE.windows, for exactly its
+   * reason: no macOS build has been released, the player declares on every register, and only what
+   * the shared engine does by itself is assumed. And never system.self_update — a Mac does not update
+   * itself at all (platform/macos/ops.py withdraws it from its own declaration too).
+   */
+  macos: [
+    'playback.video', 'playback.image', 'playback.widget', 'playback.youtube',
+    'playback.zones', 'playback.transitions', 'playback.pip',
+    'playback.bundle', 'playback.slide_audio',
+    'audio.mute',
+    'display.rotation', 'display.brightness',
+    'remote.screenshot', 'remote.stream', 'remote.input',
+    'system.restart_player',
+    'sync.clock', 'offline.cache',
+  ],
+  /*
+   * The iPad/iPhone app (ios/): the web player, top-level in a WKWebView, platform 'ios'. BASELINE.web
+   * minus two things iOS takes away from a web view:
+   *   - audio.volume: HTMLMediaElement.volume is read-only (always 1) on iOS — the slider would be
+   *     dead. The player withdraws it from its own declaration as well (declaredCapabilities).
+   *   - offline.cache: a WKWebView runs service workers only for the "app-bound domains" an app lists
+   *     in its Info.plist at build time, and a customer's server cannot be listed in advance. The
+   *     player claims offline.cache only for a worker in control, so a row that declares never has it.
+   */
+  ios: [
+    'playback.video', 'playback.image', 'playback.widget', 'playback.youtube',
+    'playback.zones', 'playback.transitions', 'playback.pip',
+    'playback.bundle',
+    'playback.slide_audio',
+    'audio.mute',
+    'display.rotation',
+    'remote.screenshot', 'remote.stream', 'remote.input',
+    'system.restart_player',
+    'sync.clock',
+  ],
+  /*
+   * The Roku player (roku/, BrightScript + SceneGraph) — client_type 'roku', platform 'roku'. See
+   * docs/roku-player.md. A Roku app has no HTML engine, no web view and no JavaScript, so it plays
+   * video and images natively and everything else as a server-rendered frame.
+   *
+   * ⚠️ Same knowing exception as BASELINE.linux: no Roku build has been released, so there is no tag
+   * to derive this from, and the player declares on EVERY register, so a real row essentially never
+   * reads this list. It answers only for a row whose capabilities column is NULL for some other
+   * reason, and for that row the floor below is the least-wrong guess. Once a Roku build ships,
+   * re-derive it from that tag and delete this paragraph.
+   *
+   * IN, and why each is honest on any Roku:
+   *   - playback.video / playback.image: the native Video and Poster nodes (hardware decode).
+   *   - playback.widget / playback.bundle: they DO appear, as still frames from /api/player/raster —
+   *     render.server_raster is the capability that says how. Both rather than neither, because
+   *     without them an operator reads "this screen skips widgets", which is false.
+   *   - playback.zones: native zones, one cursor each. playback.transitions: a cross-fade between
+   *     two Poster nodes — the shader transitions are not run; the vocabulary has no finer name, and
+   *     no control is gated on it, so the entry describes rendering rather than offering a button.
+   *   - audio.mute: the Video node's own mute.
+   *   - system.restart_player: `refresh` tears the scene down and re-registers. ⚠️ `launch` rides on
+   *     the same capability (COMMAND_CAPABILITY) and on a Roku it can only mean the same thing: an
+   *     app that is receiving commands is already in the foreground, and nothing can bring a CLOSED
+   *     channel back from the server — a Roku app cannot autostart (docs/roku-player.md).
+   *   - clock.tz_table / render.server_raster: the server's side of a contract, not a device power —
+   *     safe to assume for any Roku, and without them an undeclared row would show the wrong
+   *     time and blank every widget.
+   *
+   * NOT, and why:
+   *   - playback.youtube: the YouTube player is an IFrame API; a Roku has no web view to run it in.
+   *   - playback.pip: one hardware video decoder is what a Roku app may count on; a second Video node
+   *     over the first is not something to promise.
+   *   - playback.slide_audio: the frame is a picture; the slide's voiceover/music bed is not played.
+   *   - playback.web_interactive(_framed): no browser, no touch.
+   *   - audio.volume: an app cannot set the TV's volume, and the Video node has no volume field.
+   *   - display.power: no app can switch the TV or its backlight. The player BLANKS the screen for a
+   *     power window instead (black + video stopped); if it also answers screen_off/screen_on with
+   *     that overlay it declares display.power for itself, as Tizen's overlay does — but the baseline
+   *     cannot assume a handler.
+   *   - display.rotation / display.brightness / display.resolution: not available to apps.
+   *   - remote.screenshot / remote.stream / remote.input / remote.talk / remote.mic: a Roku app
+   *     cannot capture the screen (no API), inject input, or open a microphone stream.
+   *   - system.reboot / system.self_update: no reboot API; channels are updated by the Roku store,
+   *     never by us (so this family is in no OTA rollout either — lib/ota-rollout.js FAMILIES).
+   *   - system.shell / pty / kiosk / time / install_apk / device_owner / brightness /
+   *     screen_timeout: none exists on Roku OS for an app.
+   *   - sync.clock / sync.native (and walls / group sync): not implemented.
+   *   - offline.cache: nothing in the player keeps media across an outage yet.
+   *   - playback.hls / playback.hold / display.power_schedule / remote.set_server_url /
+   *     net.http_request: "in NO baseline — brand new" by this file's own rule. The Roku declares
+   *     playback.hls (the Video node plays HLS) and display.power_schedule (it evaluates the window
+   *     itself against shared/power-window-vectors.json) for itself.
+   *   - playback.rtsp / playback.hdmi_in / audience.camera / room.panel: no such hardware or UI.
+   *     Triggers (the LAN-fired interrupts) are not implemented either; lib/corporate/emergency.js
+   *     says so per screen.
+   */
+  roku: [
+    'playback.video', 'playback.image', 'playback.widget', 'playback.bundle',
+    'playback.zones', 'playback.transitions',
+    'audio.mute',
+    'system.restart_player',
+    'clock.tz_table', 'render.server_raster',
+  ],
   // A browser tab. Deliberately the smallest set: it cannot reboot its host, rotate a panel, or
   // capture anything outside its own document.
   web: [
@@ -454,6 +611,10 @@ function platformFamily(device) {
   const platform = String((device && device.platform) || '').toLowerCase();
   const android = String((device && device.android_version) || '');
   const clientType = (device && device.client_type) || '';
+  // ⚠️ By what the device IS (set at pairing), never by whether it has a screen_profile: a profile
+  // is a setting, and a family inferred from a setting turns any screen with one into an e-ink panel
+  // — no controls, a different OTA family — ahead of every check below.
+  if (clientType === 'embedded' || platform.includes('embedded')) return 'embedded';
   if (platform.includes('brightsign')) return 'brightsign';
   if (platform.includes('tizen')) return 'tizen';
   // Before the Web/ Android test. A Vega stick's android_version is "Web/...", because the
@@ -461,6 +622,15 @@ function platformFamily(device) {
   // and would miss the CMA capture cap the shell turns on.
   if (platform.includes('vega')) return 'vega';
   if (clientType === 'wgt') return 'tizen';
+  /*
+   * The Roku player. ⚠️ BEFORE THE ANDROID FALLBACK below, which claims ANY non-empty, non-"Web/"
+   * android_version: a Roku build that ever put its OS string ("Roku OS 13.0") there would otherwise
+   * become an Android panel and be offered MediaProjection bootstraps and device-owner provisioning.
+   * Two signals, either sufficient, for the same reason client_type 'wgt' backs up platform for
+   * Tizen. Exact match on platform rather than includes(): 'roku' is a short string, and a
+   * substring test would claim anything that merely mentions it.
+   */
+  if (clientType === 'roku' || platform === 'roku' || platform.startsWith('roku/')) return 'roku';
   /*
    * The native Raspberry Pi player. ⚠️ MUST SIT BEFORE THE ANDROID TEST BELOW, which is a fallback
    * that claims ANY non-empty, non-"Web/" android_version. The Pi sends android_version '' today, so
@@ -475,6 +645,12 @@ function platformFamily(device) {
   // before the Android fallback — it sends android_version '' today, and a build that ever put its
   // OS string there must not become an Android panel.
   if (clientType === 'win' || platform.startsWith('windows/')) return 'windows';
+  // The native macOS player: the same engine, the same two signals, the same position ahead of the
+  // Android fallback.
+  if (clientType === 'mac' || platform.startsWith('macos/')) return 'macos';
+  // The iPad/iPhone app registers through the web player (android_version 'Web/…', client_type
+  // 'player'), so this must come before the browser fallback below — like Vega above.
+  if (platform === 'ios') return 'ios';
   // client_type 'apk' is the Android player; android_version that is NOT the web player's
   // "Web/..." shape is the older signal for the same thing.
   if ((device && device.client_type === 'apk') || (android && !android.startsWith('Web/'))) return 'android';
@@ -490,7 +666,22 @@ function platformFamily(device) {
 function capabilitiesFor(device) {
   const declared = parseDeclared(device && device.capabilities);
   if (declared) return declared;
-  return (BASELINE[platformFamily(device)] || BASELINE.web).slice();
+  const family = platformFamily(device);
+  if (family === 'embedded') {
+    const power = (device && device.power_source) || 'battery';
+    if (power === 'usb' || power === 'mains' || power === 'external') {
+      return [
+        'playback.image',
+        'system.reboot',
+        'offline.cache',
+      ];
+    }
+    return [
+      'playback.image',
+      'offline.cache',
+    ];
+  }
+  return (BASELINE[family] || BASELINE.web).slice();
 }
 
 /**

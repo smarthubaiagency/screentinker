@@ -148,6 +148,23 @@ test('partition: the public token surface is exactly the reviewed set (snapshot 
     // ⚠️ The FIRE path is NOT here — it is device-local, because a trigger that needs this server is
     // a trigger that fails with the WAN down. See docs/triggers-design.md.
     '/api/triggers',
+    // CAP emergency feeds, added deliberately: an integrator wires a site's alert feed from its own
+    // tooling. Every mutation is requireScope('full') + workspace admin (a feed can take over every
+    // screen in scope); reads are workspace-scoped like the siblings.
+    '/api/cap-feeds',
+    // Tracked QR links, added deliberately: workspace content (a name and a target URL) an integrator
+    // may create from their own tooling; reads are workspace-scoped, writes need the write scope.
+    // The public redirect /q/:code is not on this door at all.
+    '/api/qr-links',
+    /*
+     * Zapier, added deliberately: Zapier (and Make, n8n…) IS an API token. Reads (the auth test,
+     * polling, dropdowns) need read; subscribing and the data action need write (the door's own
+     * rule for a POST); the emergency, playlist and trigger actions need full AND a workspace admin,
+     * because they take over screens. Subscription target URLs are https, public addresses only
+     * (lib/ssrf-guard) and shown back by host only. Inbound hook URLs are NOT minted here — that is
+     * /api/automation, JWT only — and the inbound door /api/hooks/in is not on this door at all.
+     */
+    '/api/zapier',
     /*
      * Uploaded transitions, added deliberately. Same reasoning as fonts, already on this door: it is
      * workspace content an integrator may reasonably manage from their own tooling, and every route

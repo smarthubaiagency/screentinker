@@ -54,6 +54,8 @@ test('platform families are recognised from the same fields the rest of the prod
   assert.equal(caps.platformFamily({ client_type: 'apk' }), 'android');
   assert.equal(caps.platformFamily({ android_version: 'Android 12' }), 'android');
   assert.equal(caps.platformFamily({ android_version: 'Web/Safari' }), 'web');
+  assert.equal(caps.platformFamily({ client_type: 'roku' }), 'roku');
+  assert.equal(caps.platformFamily({ platform: 'roku', android_version: 'Roku OS 13' }), 'roku', 'never the Android fallback');
   assert.equal(caps.platformFamily({}), 'web', 'unknown falls back to the most limited set');
 });
 
@@ -136,3 +138,29 @@ test('the baseline describes a FIELDED player, not the one we are about to ship'
   assert.ok(caps.supports(tizen, 'remote.screenshot'), 'captureAndSend exists in the shipped player');
   assert.ok(caps.supports(tizen, 'remote.stream'), 'startStreaming exists in the shipped player');
 });
+
+test('embedded display capabilities adapt to power source', () => {
+  const batteryDev = { client_type: 'embedded', power_source: 'battery' };
+  assert.equal(caps.platformFamily(batteryDev), 'embedded');
+  assert.ok(caps.supports(batteryDev, 'playback.image'));
+  assert.ok(caps.supports(batteryDev, 'offline.cache'));
+  assert.equal(caps.supports(batteryDev, 'playback.pip'), false);
+  assert.equal(caps.supports(batteryDev, 'system.reboot'), false);
+  assert.equal(caps.supports(batteryDev, 'system.self_update'), false);
+  assert.equal(caps.supports(batteryDev, 'audio.volume'), false);
+
+  const usbDev = { client_type: 'embedded', power_source: 'usb' };
+  assert.ok(caps.supports(usbDev, 'playback.image'));
+  assert.ok(caps.supports(usbDev, 'offline.cache'));
+  assert.equal(caps.supports(usbDev, 'playback.pip'), false);
+  assert.ok(caps.supports(usbDev, 'system.reboot'));
+  assert.equal(caps.supports(usbDev, 'system.self_update'), false);
+  assert.equal(caps.supports(usbDev, 'audio.volume'), false);
+
+  // A screen_profile is a setting, not an identity: an Android screen that somehow carries one
+  // must stay an Android screen with its controls.
+  const androidWithProfile = { client_type: 'apk', android_version: '13', screen_profile: 'seeed-reterminal-sticky' };
+  assert.notEqual(caps.platformFamily(androidWithProfile), 'embedded');
+  assert.deepEqual(caps.capabilitiesFor(androidWithProfile), caps.capabilitiesFor({ client_type: 'apk', android_version: '13' }));
+});
+

@@ -7,10 +7,11 @@ const { clearInheritedCopy } = require('../lib/resolve-device-playlist');
 // userCanAccessWall helpers - the admin/team_members branches there were
 // dead code after the Phase 2.1 role rename (no users carry role='admin'
 // anymore; team_members is a vestigial table from the pre-workspace model).
-const { accessContext } = require('../lib/tenancy');
+const { resourceAccess } = require('../lib/tenancy');
 // #236: per-panel mounting rotation. Normalised on the way IN as well as out, so a bad value from a
 // scripted API caller is rejected at the door instead of persisting and confusing every later read.
 const { normalizeWallRotation } = require('../lib/wall-geometry');
+const { requireScope } = require('../middleware/apiToken');
 
 // Load a wall + access context. Returns the wall row or null after sending
 // 403/404. requireWrite=true also denies workspace_viewer.
@@ -19,7 +20,7 @@ function loadWallAccess(req, res, requireWrite) {
   if (!wall) { res.status(404).json({ error: 'Wall not found' }); return null; }
   if (!wall.workspace_id) { res.status(403).json({ error: 'Wall not assigned to a workspace' }); return null; }
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(wall.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   if (requireWrite && !ctx.actingAs && ctx.workspaceRole === 'workspace_viewer') {
     res.status(403).json({ error: 'Read-only access' }); return null;
@@ -106,7 +107,7 @@ router.get('/:id', requireWallRead, (req, res) => {
 router.post('/', (req, res) => {
   if (!req.workspaceId) return res.status(400).json({ error: 'No active workspace' });
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(req.workspaceId);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) return res.status(403).json({ error: 'Access denied' });
   if (!ctx.actingAs && ctx.workspaceRole === 'workspace_viewer') {
     return res.status(403).json({ error: 'Read-only access' });
@@ -135,6 +136,28 @@ router.post('/', (req, res) => {
   res.status(201).json(wall);
 });
 
+/*
+ * ⚠️ CORPORATE: a video wall head office's playlist plays on. Its members, geometry and playlist
+ * are the organization's admins' to change: a geometry edit can push a panel off the canvas without
+ * changing any mandate (so the mandate-loss guard cannot see it), and a membership change splits or
+ * moves the mandate. Returns the mandate (truthy) when the actor may NOT touch the wall.
+ */
+const corpGuard = require('../lib/corporate/guard');
+function wallLockedFor(req, wallId) {
+  const ids = db.prepare('SELECT device_id FROM video_wall_devices WHERE wall_id = ?').all(wallId).map((r) => r.device_id);
+  for (const id of ids) {
+    const m = corpGuard.activeMandateFor(db, id);
+    if (m && !corpGuard.isOrgAdmin(req, m.organization_id)) return m;
+  }
+  return null;
+}
+function refuseWall(req, res, wall) {
+  return corpGuard.send(res, corpGuard.err('CORPORATE_MEMBERSHIP', { text: `Head office manages the layout of the video wall "${wall.name}".` },
+    { wall_id: wall.id }), req);
+}
+const WALL_GEOMETRY = ['grid_cols', 'grid_rows', 'bezel_h_mm', 'bezel_v_mm', 'screen_w_mm', 'screen_h_mm',
+  'player_x', 'player_y', 'player_width', 'player_height'];
+
 // Update wall (name, grid, bezels, playlist, leader, sync_mode). Phase 2.2l:
 // closes pre-existing leaks where playlist_id / content_id / leader_device_id
 // were accepted without any cross-tenant check.
@@ -155,6 +178,14 @@ router.put('/:id', requireWallWrite, (req, res) => {
       return res.status(403).json({ error: 'Content is not in this workspace' });
     }
   }
+  // A wall layout: same rule as a device's (a template, or a layout in the wall's workspace).
+  if (req.body.layout_id) {
+    const l = db.prepare('SELECT is_template, workspace_id FROM layouts WHERE id = ?').get(req.body.layout_id);
+    if (!l) return res.status(404).json({ error: 'Layout not found' });
+    if (!l.is_template && l.workspace_id !== wall.workspace_id) {
+      return res.status(403).json({ error: 'Layout is not in this workspace' });
+    }
+  }
   if (req.body.leader_device_id) {
     const d = db.prepare('SELECT workspace_id FROM devices WHERE id = ?').get(req.body.leader_device_id);
     if (!d) return res.status(404).json({ error: 'Leader device not found' });
@@ -163,9 +194,17 @@ router.put('/:id', requireWallWrite, (req, res) => {
     }
   }
 
+  // CORPORATE: geometry and the wall's own playlist/content on a head office wall (see wallLockedFor).
+  if ((WALL_GEOMETRY.some((f) => req.body[f] !== undefined) || req.body.playlist_id !== undefined || req.body.content_id !== undefined
+      || req.body.layout_id !== undefined)
+      && wallLockedFor(req, wall.id)) {
+    return refuseWall(req, res, wall);
+  }
+
   const fields = ['name', 'grid_cols', 'grid_rows', 'bezel_h_mm', 'bezel_v_mm',
     'screen_w_mm', 'screen_h_mm', 'sync_mode', 'leader_device_id', 'content_id', 'playlist_id',
-    'player_x', 'player_y', 'player_width', 'player_height'];
+    'player_x', 'player_y', 'player_width', 'player_height', 'layout_id'];
+  if (req.body.layout_id === '') req.body.layout_id = null;
   const updates = [];
   const values = [];
   for (const f of fields) {
@@ -191,23 +230,51 @@ router.put('/:id', requireWallWrite, (req, res) => {
   res.json(loadWallWithDevices(req.params.id));
 });
 
+/*
+ * A command to the WHOLE wall, like a screen's: every panel gets it, and the reply counts per panel
+ * (same delivery and same per-panel capability check as a group command — a wall can mix players
+ * too, and a panel that cannot honour a reboot must not be counted as rebooted).
+ */
+router.post('/:id/command', requireScope('full'), requireWallWrite, (req, res) => {
+  const { ALLOWED_COMMANDS, deliverCommand, validateCommand } = require('../lib/device-command');
+  const { type, payload } = req.body || {};
+  if (!type) return res.status(400).json({ error: 'command type required' });
+  if (!ALLOWED_COMMANDS.includes(type)) return res.status(400).json({ error: 'invalid command type' });
+  const v = validateCommand(type, payload);
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  const devices = db.prepare(`SELECT d.* FROM devices d JOIN video_wall_devices vwd ON vwd.device_id = d.id WHERE vwd.wall_id = ?`).all(req.wall.id);
+  const deviceNs = req.app.get('io').of('/device');
+  const results = devices.map((device) => ({ device_id: device.id, name: device.name, ...deliverCommand(deviceNs, device, type, payload) }));
+  const count = (...st) => results.filter((r) => st.includes(r.status)).length;
+  const refused = count('refused');
+  res.json({ success: true, sent: count('sent', 'relayed'), offline: count('offline', 'queued'), unsupported: count('unsupported'),
+    ...(refused ? { refused } : {}), total: devices.length, results });
+});
+
 // Delete wall — clear playlists + wall_id on every former member (matches
 // group-dissolve semantics: leaving the wall returns devices to ungrouped).
 router.delete('/:id', requireWallWrite, (req, res) => {
   const wallWorkspaceId = req.wall.workspace_id; // capture before the DELETE
   const members = db.prepare('SELECT device_id FROM video_wall_devices WHERE wall_id = ?').all(req.params.id);
+  if (wallLockedFor(req, req.params.id)) return refuseWall(req, res, req.wall);
   const tx = db.transaction(() => {
     // Leaving the wall clears the INHERITED copy but never a device's own choice — see
     // clearInheritedCopy. wall_id going NULL is what actually ends the inheritance.
     db.prepare("UPDATE devices SET wall_id = NULL, playlist_id = CASE WHEN playlist_source = 'device' THEN playlist_id ELSE NULL END WHERE wall_id = ?").run(req.params.id);
     db.prepare('DELETE FROM video_walls WHERE id = ?').run(req.params.id);
+    require('../lib/corporate/cleanup').removeTargets(db, 'wall', req.params.id);
   });
-  tx();
+  // CORPORATE: and the ex-members' head office playlist must not change by this (org admins excepted).
+  const ok = corpGuard.guarded(req, res, () => corpGuard.assertNoMandateLoss(req, members.map((m) => m.device_id), () => { tx(); return true; },
+    () => `Deleting the video wall "${req.wall.name}" would change what its screens play (head office's playlist). Ask your organization admin to do it.`));
+  if (!ok) return;
 
   // Push fresh (now wall-less, playlist-less) payloads to ex-members so they
   // exit wall mode and clear content immediately.
   for (const m of members) pushWallPayloadToDevice(req, m.device_id);
   notifyDashboards(req, wallWorkspaceId);
+  // The wall is gone, so its screens are eligible for dynamic groups again.
+  for (const m of members) require('../lib/device-group-rules').reconcileDeviceAsSystem(db, req.app.get('io'), m.device_id);
 
   res.json({ success: true });
 });
@@ -232,6 +299,9 @@ router.put('/:id/devices', requireWallWrite, (req, res) => {
       return res.status(403).json({ error: `Device ${d.device_id} is not in this workspace` });
     }
   }
+
+  // CORPORATE: membership and geometry of a head office wall are the organization's admins'.
+  if (wallLockedFor(req, req.params.id)) return refuseWall(req, res, wall);
 
   const previous = db.prepare('SELECT device_id FROM video_wall_devices WHERE wall_id = ?').all(req.params.id);
   const previousIds = new Set(previous.map(p => p.device_id));
@@ -279,13 +349,20 @@ router.put('/:id/devices', requireWallWrite, (req, res) => {
       db.prepare('UPDATE video_walls SET leader_device_id = NULL WHERE id = ?').run(req.params.id);
     }
   });
-  tx();
+  // CORPORATE: joining (or leaving) the wall must not change any screen's head office playlist —
+  // a wall-level mandate gained, a group mandate lost by the implied group exit, in either direction.
+  const affected = [...new Set([...previousIds, ...incomingIds])];
+  const done = corpGuard.guarded(req, res, () => corpGuard.assertNoMandateLoss(req, affected, () => { tx(); return true; },
+    () => `Changing the screens of the video wall "${wall.name}" would change what they play (head office's playlist). Ask your organization admin to do it.`));
+  if (!done) return;
 
   // Push wall-aware payload to current members, and a wall-less payload to
   // ex-members so they exit wall mode.
   for (const id of removedIds) pushWallPayloadToDevice(req, id);
   pushToWallMembers(req, req.params.id);
   notifyDashboards(req, req.wall.workspace_id);
+  // A screen that left the wall is eligible for dynamic groups again (lib/device-group-rules.js).
+  for (const id of removedIds) require('../lib/device-group-rules').reconcileDeviceAsSystem(db, req.app.get('io'), id);
 
   res.json(loadWallWithDevices(req.params.id));
 });

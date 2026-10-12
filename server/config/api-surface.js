@@ -57,6 +57,17 @@ const PUBLIC_ROUTERS = [
   // on the device, because a trigger that needs this server is a trigger that fails with the WAN
   // down, which is the whole feature. See docs/triggers-design.md.
   { path: '/api/triggers',    mod: './routes/triggers' },
+  // CAP emergency feeds (lib/cap/feeds.js): an integrator wires a site's alert feed from its own tooling.
+  { path: '/api/cap-feeds',   mod: './routes/cap-feeds' },
+  // Tracked QR links (lib/qr-links.js): workspace content an integrator may create from their own tooling.
+  { path: '/api/qr-links',    mod: './routes/qr-links' },
+  /*
+   * Zapier (and any REST-hook client) — lib/automation. On the token door because Zapier IS an API
+   * token: it subscribes to events, polls them, and runs actions. Polling needs 'read'; subscribing
+   * and the data action need 'write'; emergency, trigger and playlist actions need 'full' (they
+   * take over screens). Hook URLs themselves are minted on /api/automation, which is JWT only.
+   */
+  { path: '/api/zapier',      mod: './routes/zapier' },
   /*
    * Display power schedules — the weekly BACKLIGHT clock. Public (token-reachable) for the same
    * reason as triggers: an integrator provisioning a site sets these from their own tooling, and
@@ -79,12 +90,67 @@ const PUBLIC_ROUTERS = [
 ];
 
 const JWT_ONLY_ROUTERS = [
+  /*
+   * Hosted AI images paid in org credits (docs/ai-credits.md). BEFORE /api/ai: Express walks mounts
+   * in order, and listing it after would run /api/ai's auth + tenancy first for every hosted call.
+   */
+  { path: '/api/ai/hosted',   mod: './routes/ai-hosted',    tenancy: true },
   { path: '/api/ai',          mod: './routes/ai',           tenancy: true },
   { path: '/api/provision',   mod: './routes/provisioning', tenancy: true },
   { path: '/api/teams',       mod: './routes/teams',        tenancy: true },
   { path: '/api/white-label', mod: './routes/white-label',  tenancy: true },
   { path: '/api/workspaces',  mod: './routes/workspaces' },
+  // Player rollouts (lib/ota-rollout.js). Before /api/admin: Express walks mounts in order.
+  { path: '/api/admin/ota-rollouts', mod: './routes/ota-rollouts' },
   { path: '/api/admin',       mod: './routes/admin' },
+  /*
+   * Storage profiles (docs/storage.md). JWT only: a profile holds cloud credentials and decides
+   * where every workspace in the org writes — not something an API token should reach.
+   */
+  { path: '/api/storage-profiles', mod: './routes/storage-profiles', tenancy: true },
+  /*
+   * Alert channels (lib/alert-channels.js). JWT only, for the same reason: a channel holds a Slack /
+   * Teams webhook URL or a PagerDuty routing key — credentials into someone else's systems.
+   */
+  { path: '/api/alert-channels', mod: './routes/alert-channels', tenancy: true },
+  /*
+   * Canva (lib/canva.js). JWT only: a Canva connection is a person's grant to read their designs,
+   * and the org integration holds a client secret. The OAuth callback is mounted on its own in
+   * server.js, because the browser comes back from canva.com without a bearer token.
+   */
+  { path: '/api/canva',       mod: './routes/canva',        tenancy: true },
+  /*
+   * Microsoft 365 app + SharePoint/OneDrive folder syncs (routes/m365.js). JWT only: the app is a
+   * credential into the customer's own tenant, configured from the dashboard.
+   */
+  { path: '/api/m365', mod: './routes/m365', tenancy: true },
+  /*
+   * BI connections (lib/bi/connections.js): an organization's Grafana / Power BI / Tableau
+   * credentials. JWT only for the same reason as alert channels — they reach into someone else's
+   * systems. The dashboard widget's public endpoints are on /api/widgets.
+   */
+  { path: '/api/bi-connections', mod: './routes/bi-connections', tenancy: true },
+  /*
+   * Automation (lib/automation): inbound hook URLs are credentials that can take over screens, so
+   * minting, rotating and test-firing them is a signed-in admin's act. JWT only.
+   */
+  { path: '/api/automation', mod: './routes/automation', tenancy: true },
+  /*
+   * Social walls (lib/social/*): an organization's social network credentials (secrets never
+   * returned) and a workspace's feeds and moderation queue. JWT only — no API token reaches them.
+   */
+  { path: '/api/social', mod: './routes/social', tenancy: true },
+  /*
+   * Meeting-room displays (lib/rooms). JWT only: a connection holds an organization's Microsoft 365
+   * client secret or Google service-account key, and a room may hold a private calendar address.
+   * The page-facing reads and actions are /api/room-panel, mounted separately in server.js.
+   */
+  { path: '/api/rooms', mod: './routes/rooms', tenancy: true },
+  /*
+   * Audience counting (lib/audience.js). JWT only: switching a screen's camera on is a privacy
+   * decision for an org owner or admin, never something an API token can do.
+   */
+  { path: '/api/audience',    mod: './routes/audience',     tenancy: true },
   /*
    * Plugin zip submissions from workspace editors. JWT-only: installing Node is not
    * something an API token should be able to queue. 404s when PLUGINS_ENABLED is unset.
@@ -99,6 +165,12 @@ const JWT_ONLY_ROUTERS = [
    */
   { path: '/api/admin/diagnostics', mod: './routes/diagnostics' },
   { path: '/api/tokens',      mod: './routes/tokens',       tenancy: true },
+  /*
+   * Corporate (head office) playlists, mandates and their settings. JWT-only (decision D12): a
+   * token acts as its owner with role 'user', and an org admin's token would otherwise be able to
+   * repoint every store's screens. Authoring is a signed-in human action.
+   */
+  { path: '/api/corporate',   mod: './routes/corporate',    tenancy: true },
 ];
 
 // #73: AGENCY_ROUTERS - capability-restricted ('agency' scope) surface. Mounted with

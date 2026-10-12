@@ -10,6 +10,7 @@ const bootDefer = require('../lib/boot-defer');   // 2.0.1 first-boot player def
 const enrolKey = require('../lib/enrol-key');     // #313 URL-carried display identity
 const liveness = require('../lib/liveness'); // v4 core pass: pure ack/liveness/identity helpers
 const commandQueue = require('../lib/command-queue');
+const nowPlaying = require('../lib/now-playing');
 const reconnectThrottle = require('../lib/reconnect-throttle');
 const contentAckLimiter = require('../lib/content-ack-limiter');
 const statusLogWriter = require('../lib/status-log-writer');
@@ -20,10 +21,11 @@ const flapLimiter = require('../lib/flap-limiter');
 const sessionSettle = require('../lib/session-settle');   // #148 patch2: eviction-storm debounce
 const { resolveIdentity } = require('../lib/device-identity');
 const { resolveSyncBackend } = require('../lib/sync-backend');
+// Corporate (head office): the group-sync key and its one definition of sync membership.
+const corpResolve = require('../lib/corporate/resolve');
 const capsLib = require('../lib/player-capabilities');
 const logCoalescer = require('../lib/log-coalescer');
 const loopLag = require('../services/loop-lag');
-const deviceSettings = require('../lib/device-settings'); // #150 delete+re-pair settings restore
 const incidentClassify = require('../lib/incident-classify'); // offline-cause log: disconnect-reason + connectivity classification
 const pluginHooks = require('../lib/plugins/hooks');
 const playerTermination = require('../lib/mesh/player-termination'); // scale-out C2: players on a replica
@@ -188,6 +190,9 @@ let lastScreenshots = {};
 // dashboard reflects it without a full re-register / playlist push). Older APKs omit newer fields.
 function applyDeviceInfo(deviceId, di) {
   const num = (v) => (typeof v === 'number' ? v : null);
+  // Pixel sizes are a player's own report and reach the dashboard's HTML: whole, plausible numbers
+  // or nothing. SQLite would otherwise keep a string in an INTEGER column as TEXT, markup and all.
+  const px = (v) => (Number.isInteger(v) && v > 0 && v <= 100000 ? v : null);
   // Upgrade incident: if the reported app_version differs from what we had stored, log it
   // (old → new) in the incident feed. Server-side, so it covers every client (Android/Tizen/web)
   // with no client change. Only when we HAD a prior version (a fresh pair isn't an "upgrade").
@@ -204,7 +209,7 @@ function applyDeviceInfo(deviceId, di) {
     ota_status = ?, ota_target_version = ?, ota_attempts = ?, tier = ?, foreign_device_owner = ?,
     can_write_settings = ?, accessibility_enabled = ?, overlay_granted = ?, capture_mode = ?,
     media_volume = ?, system_brightness = ?, window_brightness = ?, screen_off_timeout_ms = ?, ota_updated_at = strftime('%s','now') WHERE id = ?`)
-    .run(di.android_version, di.app_version, di.screen_width, di.screen_height, di.render_width ?? null, di.render_height ?? null,
+    .run(di.android_version, di.app_version, px(di.screen_width), px(di.screen_height), px(di.render_width), px(di.render_height),
       di.ota_status ?? 'none', di.ota_target_version ?? null, di.ota_attempts ?? 0,
       Number.isInteger(di.tier) ? di.tier : 0, di.foreign_device_owner ? 1 : 0,
       di.can_write_settings ? 1 : 0, di.accessibility_enabled ? 1 : 0, di.overlay_granted ? 1 : 0,
@@ -335,20 +340,20 @@ function logDeviceStatus(deviceId, status, reason, detail) {
 // platform + ip_address are selected for the sync-backend resolver, not for election: it decides
 // native-vs-ours from what the members ARE (BrightSign?) and where they are (one L2 network?).
 function groupSyncMembers(group) {
-  if (!group || !group.playlist_id) return [];
   /*
    * ⚠️ Membership is decided on the RESOLVED playlist. This used to read d.playlist_id, i.e. the
    * copy the old fan-out left on each device — so once group and wall playlists stopped being
    * copied down, every member would have failed this match and no group would ever have synced.
    * Five readers of that column lived here, none of them listed in the inheritance design doc;
    * they were found by grepping before the writers were changed, not after.
+   *
+   * ⚠️ And on the SYNC KEY, not the group's raw playlist id: when a head office mandate covers the
+   * group its members play the corporate playlist, which is what they must share. With no mandate
+   * the key IS group.playlist_id and the query is the one that was here. ONE helper serves all four
+   * readers (this, deviceSyncGroup, syncDecisionFor, groupSenderEligible) — see
+   * lib/corporate/resolve.js.
    */
-  return db.prepare(`
-    SELECT d.id, d.status, d.platform, d.ip_address FROM devices d
-    JOIN device_group_members dgm ON dgm.device_id = d.id
-    JOIN device_resolved_playlist r ON r.device_id = d.id
-    WHERE dgm.group_id = ? AND r.playlist_id = ? ORDER BY d.id
-  `).all(group.id, group.playlist_id);
+  return corpResolve.syncMembers(db, group, 'd.id, d.status, d.platform, d.ip_address');
 }
 
 // Elect the group's sync leader: the pinned leader if it's an online, playlist-matching member;
@@ -366,13 +371,8 @@ function resolveGroupLeader(group) {
 // The device's sync group: a sync-enabled group it belongs to (m2m) whose shared playlist THIS
 // device is on. Deterministic pick if it's somehow in several. Returns the group row or null.
 function deviceSyncGroup(deviceId, devicePlaylistId) {
-  if (!devicePlaylistId) return null;
-  return db.prepare(`
-    SELECT g.id, g.sync_enabled, g.playlist_id, g.leader_device_id, g.sync_backend
-    FROM device_groups g JOIN device_group_members dgm ON dgm.group_id = g.id
-    WHERE dgm.device_id = ? AND g.sync_enabled = 1 AND g.playlist_id = ?
-    ORDER BY g.name ASC, g.id ASC LIMIT 1
-  `).get(deviceId, devicePlaylistId) || null;
+  // Same sync key as groupSyncMembers; identical to the old query when no mandate exists.
+  return corpResolve.deviceSyncGroup(db, deviceId, devicePlaylistId);
 }
 
 // Build the group_sync block for a device, or null (the playlist-match guard lives in deviceSyncGroup).
@@ -424,7 +424,9 @@ function resolveGroupSync(device, deviceId) {
 // and only then, so the anti-flash reuse still holds for widgets nobody has touched.
 const widgetFactsOf = db.prepare(`
   SELECT w.updated_at AS rev,
+         w.widget_type AS type,
          w.config,
+         w.widget_type,
          w.workspace_id,
          COALESCE(o.widget_sandbox_isolation_disabled, 0) AS same_origin
   FROM widgets w
@@ -438,16 +440,30 @@ const widgetFactsOf = db.prepare(`
 // also max'd every '{{ds:' widget against the workspace-wide MAX(data_sources.updated_at), which
 // re-revved twenty unrelated room signs, and reloaded their WebViews, whenever one source was
 // renamed. The targeted bump is the whole mechanism now.
-function refreshWidgetRevs(assignments) {
+/*
+ * A meeting-room display's PANEL capability (lib/rooms/service.js panelToken), for this device only.
+ * It lets the page book and end meetings; the player puts it in the widget URL's fragment. Derived
+ * from the device's own token, so it is only ever sent here, over the device's authenticated socket.
+ */
+const panelDeviceOf = db.prepare('SELECT id, device_token FROM devices WHERE id = ?');
+function refreshWidgetRevs(assignments, deviceId = null) {
   if (!Array.isArray(assignments)) return;
+  let panelDevice;
   for (const a of assignments) {
     if (!a || !a.widget_id) continue;
     try {
       const facts = widgetFactsOf.get(a.widget_id);
       if (!facts) continue;
+      if (facts.type === 'room-display' && deviceId) {
+        if (panelDevice === undefined) panelDevice = panelDeviceOf.get(deviceId) || null;
+        const tok = require('../lib/rooms/service').panelToken(a.widget_id, panelDevice);
+        if (tok) a.widget_panel = tok;
+      }
       const rev = facts.rev ?? a.widget_rev ?? 0;
       a.widget_rev = rev;
-      a.widget_allow_same_origin = Number(facts.same_origin || 0) === 1;
+      // A cloud document is framed same-origin too: Google's embed breaks in an opaque origin, and its
+      // render document runs no script at all (lib/cloud-docs.js, enforced by its CSP).
+      a.widget_allow_same_origin = Number(facts.same_origin || 0) === 1 || facts.widget_type === 'cloud-doc';
       // #473: an interactive webpage is configured by its widget_config ON THE PLAYER (start URL,
       // idle timeout, allowed domains), so the config must be as fresh as the rev that tells the
       // player to remount — otherwise an edit reloads the page with the settings from the last
@@ -502,6 +518,37 @@ function refreshContentRevs(assignments) {
   }
 }
 
+/*
+ * Storage backends (lib/storage, docs/storage.md): `file_url` — an ABSOLUTE url for an item whose
+ * bytes are in a bucket: a presigned GET when this screen may fetch the bucket directly, else this
+ * server's /api/content/:id/file when APP_URL says what this server is called.
+ *
+ * ⚠️ ADDITIVE ONLY. `filepath` is untouched, so every player shipped before this keeps building
+ * /uploads/content/<filepath> — which the server answers from the bucket through its own proxy. A
+ * player that understands file_url may prefer it; none is required to. Plain local rows (no
+ * content_locations at all — every row on an install that never configured storage) get nothing,
+ * so their payloads are byte-identical to before. Never fatal: a payload without file_url plays.
+ */
+const hasStoredCopies = db.prepare('SELECT 1 FROM content_locations WHERE content_id = ? LIMIT 1');
+const contentRowForUrl = db.prepare('SELECT * FROM content WHERE id = ?');
+// Read only when an item actually has stored copies — not added to the payload's device SELECT,
+// which stays exactly the column list #336 pins.
+const deviceFetchFlags = db.prepare('SELECT workspace_id, storage_direct_fetch FROM devices WHERE id = ?');
+function stampFileUrls(items, deviceId) {
+  if (!Array.isArray(items) || !items.length) return;
+  let device;
+  for (const a of items) {
+    if (!a || !a.content_id || !a.filepath) continue;
+    try {
+      if (!hasStoredCopies.get(a.content_id)) continue;
+      if (device === undefined) device = deviceFetchFlags.get(deviceId) || null;
+      const pick = require('../lib/storage/locations').pickForPlayer(contentRowForUrl.get(a.content_id), 'asset', { device });
+      if (pick && pick.url) a.file_url = pick.url;
+      else delete a.file_url;
+    } catch (_) { /* keep the payload playable */ }
+  }
+}
+
 const { triggersForDevice, projectTrigger } = require('../lib/device-triggers');
 
 function buildPlaylistPayloadUnchecked(deviceId) {
@@ -527,7 +574,7 @@ function buildPlaylistPayloadUnchecked(deviceId) {
       d.triggers_accept_http, d.triggers_accept_udp, d.trigger_secret, d.trigger_http_port,
       d.trigger_udp_port, d.trigger_multicast_group, d.trigger_clear_all_token,
       d.local_api_enabled, d.local_api_secret,
-      d.default_content_id, d.workspace_id,
+      d.default_content_id, d.workspace_id, d.latitude, d.longitude,
       d.capabilities, d.platform, d.android_version, d.client_type
       FROM devices d JOIN device_resolved_playlist r ON r.device_id = d.id
       WHERE d.id = ?`).get(deviceId);
@@ -543,23 +590,141 @@ function buildPlaylistPayloadUnchecked(deviceId) {
    */
   const deviceSupportsHls = capsLib.supports(device, 'playback.hls');
   const deviceSupportsRtsp = capsLib.supports(device, 'playback.rtsp');
+  // HDMI IN (video/hdmi-in): only a player that found an input on THIS device declares it.
+  const deviceSupportsHdmiIn = capsLib.supports(device, 'playback.hdmi_in');
+  // A hold (lib/hold-item.js) is not live, but it rides the same strip for the same reason: a player
+  // that does not know it would skip it, and skipping a hold silently shortens a timeline.
+  const deviceSupportsHold = capsLib.supports(device, 'playback.hold');
   const dropLiveIfUnsupported = (items) => {
-    if (!Array.isArray(items) || (deviceSupportsHls && deviceSupportsRtsp)) return items;
+    if (!Array.isArray(items) || (deviceSupportsHls && deviceSupportsRtsp && deviceSupportsHdmiIn && deviceSupportsHold)) return items;
     return items.filter((a) => {
       if (!a) return true;
       if (a.mime_type === 'video/hls') return deviceSupportsHls;
       if (a.mime_type === 'video/rtsp') return deviceSupportsRtsp;
+      if (a.mime_type === 'video/hdmi-in') return deviceSupportsHdmiIn;
+      if (a.mime_type === 'application/x-st-hold') return deviceSupportsHold;
       return true;
     });
   };
 
   let assignments = [];
   let playback_order = 'sequential';
-  if (device?.playlist_id) {
-    const playlist = db.prepare('SELECT published_snapshot, published_playback_order FROM playlists WHERE id = ?').get(device.playlist_id);
+  /*
+   * ⚠️ CORPORATE: a head office mandate drives this screen (source 'corporate', with or without a
+   * playlist — a DARK mandate has none). Three things differ from an ordinary payload:
+   *   - every item is tagged with the workspace it came from (__origin_ws = head office), so
+   *     assemblePayload resolves play_when data sources and custom shaders in HEAD OFFICE's
+   *     workspace: a store data source with the same slug must never gate a corporate item
+   *     (critique H1). The tag is deleted before the payload leaves the server;
+   *   - default_content is null: a dark mandate, or an empty corporate loop, shows the player's own
+   *     idle screen — never store-chosen content (D6);
+   *   - the layout is already the mandate's (or none) — the view decides it;
+   *   - the items are this screen's COMPOSITION — head office's published playlist with the store's
+   *     slot content spliced in (lib/corporate/composition.js), cached per fill signature and
+   *     self-healing on every read. Each item already carries its own __origin_ws (head office's
+   *     items and fallbacks: HQ; slot items: the store's workspace).
+   */
+  const corporateSource = device?.playlist_source === 'corporate';
+  /*
+   * ⚠️ EMERGENCY "ACTIVATE NOW" (spec §5.6): while head office has an alert live and this screen is
+   * covered (in scope, org switch on, triggers enabled here), the BASE is the alert's playlist — no
+   * layout, no default content, no group sync, and no store trigger can overlay it (normal triggers
+   * are left out below). The wall canvas is kept so a wall shows the alert across all its screens.
+   * One Map.size test when nothing is live (lib/corporate/emergency-live.js).
+   */
+  let emergencyNow = null;
+  try { emergencyNow = require('../lib/corporate/emergency-live').activationFor(db, deviceId); } catch (e) {
+    console.warn(`[emergency] activation check failed for ${deviceId}: ${e && e.message}`);
+    emergencyNow = null;
+  }
+  /*
+   * CAP EMERGENCY FEEDS (lib/cap/feeds.js): a live public alert matching one of the workspace's
+   * feeds takes the screen the same way — the feed's playlist, or its generated alert card. Head
+   * office's own alert outranks it. One Map.size test when nothing is live anywhere.
+   */
+  let capNow = null;
+  if (!emergencyNow) {
+    try { capNow = require('../lib/cap/feeds').overrideFor(db, deviceId); } catch (e) {
+      console.warn(`[cap] override check failed for ${deviceId}: ${e && e.message}`);
+      capNow = null;
+    }
+  }
+  const overrideNow = emergencyNow || capNow;
+  /*
+   * AUTOMATION PLAYLIST OVERRIDE (lib/automation/overrides.js): "switch these screens to that
+   * playlist for N minutes", from an inbound hook or Zapier. Below both emergency paths, and never on
+   * a head office (corporate) playlist — automation is not a way round a locked playlist.
+   */
+  let hookNow = null;
+  if (!overrideNow && !corporateSource) {
+    try { hookNow = require('../lib/automation/overrides').overrideFor(db, deviceId); } catch (e) {
+      console.warn(`[automation] override check failed for ${deviceId}: ${e && e.message}`);
+      hookNow = null;
+    }
+  }
+  if (emergencyNow) {
+    const t = emergencyNow.trigger;
+    const pl = db.prepare('SELECT published_snapshot, published_playback_order FROM playlists WHERE id = ? AND workspace_id = ?')
+      .get(t.target_ref, t.workspace_id);
+    try { assignments = pl && pl.published_snapshot ? JSON.parse(pl.published_snapshot) : []; } catch (_) { assignments = []; }
+    if (!Array.isArray(assignments)) assignments = [];
+    // Head office's content: its data sources and shaders, never the store's (per-origin, §3.2).
+    for (const a of assignments) if (a && typeof a === 'object') a.__origin_ws = t.workspace_id;
+    // An emergency: activating or ending it cuts in on every player at once (see the strip below).
+    for (const a of assignments) if (a && typeof a === 'object') a.interrupt = true;
+    refreshWidgetRevs(assignments, deviceId);
+    refreshContentRevs(assignments);
+    assignments = dropLiveIfUnsupported(assignments);
+    playback_order = (pl && pl.published_playback_order) || 'sequential';
+  } else if (capNow) {
+    const feed = capNow.feed;
+    const pl = feed.playlist_id
+      ? db.prepare('SELECT published_snapshot, published_playback_order FROM playlists WHERE id = ? AND workspace_id = ?').get(feed.playlist_id, feed.workspace_id)
+      : null;
+    let items = [];
+    if (pl && pl.published_snapshot) { try { items = JSON.parse(pl.published_snapshot); } catch (_) { items = []; } }
+    // No playlist, or an empty/unpublished one: the card. An alert must never show nothing.
+    if (!Array.isArray(items) || !items.length) {
+      require('../lib/cap/feeds').ensureWidget(db, feed);
+      items = [require('../lib/cap/feeds').cardItem(feed)];
+      playback_order = 'sequential';
+    } else {
+      playback_order = (pl && pl.published_playback_order) || 'sequential';
+    }
+    for (const a of items) if (a && typeof a === 'object') a.__origin_ws = feed.workspace_id;
+    assignments = items;
+    refreshWidgetRevs(assignments, deviceId);
+    refreshContentRevs(assignments);
+    assignments = dropLiveIfUnsupported(assignments);
+  } else if (hookNow) {
+    assignments = hookNow.items;
+    for (const a of assignments) if (a && typeof a === 'object') a.__origin_ws = hookNow.override.workspace_id;
+    playback_order = hookNow.playback_order;
+    refreshWidgetRevs(assignments, deviceId);
+    refreshContentRevs(assignments);
+    assignments = dropLiveIfUnsupported(assignments);
+  } else if (corporateSource && device?.playlist_id) {
+    try {
+      const c = require('../lib/corporate/composition').compositionFor(db, deviceId, device.playlist_id);
+      assignments = c.items;
+      playback_order = c.playback_order || 'sequential';
+    } catch (e) {
+      // A composition fault must never cost a screen its playlist: head office's own snapshot (the
+      // fallback-only loop) is what it played before slots existed.
+      console.warn(`[corporate] composition failed for ${deviceId}: ${e && e.message}`);
+      const pl = db.prepare('SELECT published_snapshot, published_playback_order, workspace_id FROM playlists WHERE id = ?').get(device.playlist_id);
+      try { assignments = pl && pl.published_snapshot ? JSON.parse(pl.published_snapshot) : []; } catch (_) { assignments = []; }
+      for (const a of assignments) if (a && typeof a === 'object') a.__origin_ws = (pl && pl.workspace_id) || null;
+      if (pl && pl.published_playback_order) playback_order = pl.published_playback_order;
+    }
+    refreshWidgetRevs(assignments, deviceId);
+    refreshContentRevs(assignments);   // re-stamps a.mime_type, so strip live AFTER it
+    assignments = dropLiveIfUnsupported(assignments);
+  } else if (device?.playlist_id) {
+    const playlist = db.prepare('SELECT published_snapshot, published_playback_order, workspace_id FROM playlists WHERE id = ?').get(device.playlist_id);
     if (playlist?.published_snapshot) {
       try { assignments = JSON.parse(playlist.published_snapshot); } catch (e) { assignments = []; }
-      refreshWidgetRevs(assignments);
+      refreshWidgetRevs(assignments, deviceId);
       refreshContentRevs(assignments);   // re-stamps a.mime_type, so strip live AFTER it
       assignments = dropLiveIfUnsupported(assignments);
     }
@@ -575,7 +740,10 @@ function buildPlaylistPayloadUnchecked(deviceId) {
    */
   let triggers = [];
   try {
-    for (const t of triggersForDevice(db, deviceId)) {
+    // During an Activate-now alert only head office's emergency alerts stay armed (§5.6).
+    const rows = overrideNow ? triggersForDevice(db, deviceId, { emergencyOnly: true })
+      : triggersForDevice(db, deviceId, { mandated: corporateSource });
+    for (const t of rows) {
       let items = [];
       if (t.target_kind === 'playlist' && t.target_ref) {
         // ⚠️ Scoped to the tenant. triggersForDevice already constrains the TRIGGER row to the
@@ -588,7 +756,7 @@ function buildPlaylistPayloadUnchecked(deviceId) {
         ).get(t.target_ref, t.workspace_id);
         if (pl?.published_snapshot) {
           try { items = JSON.parse(pl.published_snapshot); } catch (e) { items = []; }
-          refreshWidgetRevs(items);
+          refreshWidgetRevs(items, deviceId);
           refreshContentRevs(items);
           items = dropLiveIfUnsupported(items);   // a trigger playlist can carry a live item too
         }
@@ -617,6 +785,17 @@ function buildPlaylistPayloadUnchecked(deviceId) {
     multicast_group: device?.trigger_multicast_group || null,
     clear_all_token: device?.trigger_clear_all_token || null,
   };
+  /*
+   * Belt for the emergency token namespace (§5.2): the clear-all token is checked BEFORE every
+   * trigger on the player, so one equal to an emergency alert's code would make the alert unfirable
+   * (or clear it) on this screen. The routes refuse that in both directions; a collision that
+   * predates the alert (or arrived by moving the screen into scope) is reported by coverage
+   * (`clear_all_collision`) — and the store's clear-all simply isn't sent while it lasts.
+   */
+  if (trigger_config.clear_all_token && triggers.some((t) => t && t.kind === 'emergency'
+      && (t.match_token === trigger_config.clear_all_token || t.clear_token === trigger_config.clear_all_token))) {
+    trigger_config.clear_all_token = null;
+  }
 
   /*
    * The inbound control door. ⚠️ A SIBLING OF trigger_config, NOT A FIELD IN IT, even though they
@@ -635,7 +814,7 @@ function buildPlaylistPayloadUnchecked(deviceId) {
   };
 
   let layout = null;
-  if (device?.layout_id) {
+  if (device?.layout_id && !overrideNow && !hookNow) {
     layout = db.prepare('SELECT * FROM layouts WHERE id = ?').get(device.layout_id);
     if (layout) {
       layout.zones = db.prepare('SELECT * FROM layout_zones WHERE layout_id = ? ORDER BY sort_order').all(layout.id);
@@ -703,6 +882,41 @@ function buildPlaylistPayloadUnchecked(deviceId) {
         // live wall on its side — a bad rotation degrades to "as drawn", not to "sideways".
         rotation: normalizeWallRotation(pos.rotation),
       };
+      /*
+       * Wall layout (lib/wall-layout.js): zones in percent of the PLAYER RECT, paced by the shared
+       * clock. It replaces the member's own layout, which was never drawn on a wall anyway (every
+       * player skips zones in wall mode) — `canvas_layout` is what tells a player the zones are on
+       * the wall and not on its own screen. An emergency keeps the plain canvas (no layout), and a
+       * head office mandate keeps the layout the mandate resolved, as on any other screen.
+       */
+      // A wall schedule's layout (devices.scheduled_layout_id — only wall schedules set it on a
+      // panel, see services/scheduler.js) is the wall's layout while it runs.
+      const scheduledWallLayout = db.prepare('SELECT scheduled_layout_id FROM devices WHERE id = ?').get(deviceId)?.scheduled_layout_id || null;
+      const wallLayoutId = scheduledWallLayout || wall.layout_id;
+      if (wallLayoutId && !overrideNow && !hookNow && !corporateSource) {
+        const wl = db.prepare('SELECT * FROM layouts WHERE id = ?').get(wallLayoutId);
+        if (wl) {
+          wl.zones = db.prepare('SELECT * FROM layout_zones WHERE layout_id = ? ORDER BY sort_order').all(wl.id);
+          const wallLayout = require('../lib/wall-layout');
+          if (wallLayout.isZonedLayout(wl)) {
+            layout = wl;
+            wall_config.canvas_layout = true;
+            // ONE panel plays each zone's sound — the one under the zone's centre — or a zone that
+            // spans three panels plays it three times, a few ms apart. Decided here because only the
+            // server knows every panel's rect; the player just obeys its list.
+            const screens = db.prepare('SELECT * FROM video_wall_devices WHERE wall_id = ?').all(wall.id).map((p) => ({
+              id: p.device_id,
+              rect: {
+                x: p.canvas_x ?? (p.grid_col * (baseW + bezelH)), y: p.canvas_y ?? (p.grid_row * (baseH + bezelV)),
+                w: p.canvas_width ?? baseW, h: p.canvas_height ?? baseH,
+              },
+            }));
+            wall_config.audio_zones = wl.zones
+              .filter((z) => wallLayout.zonePanels(z, playerRect, screens).audio === deviceId)
+              .map((z) => z.id);
+          }
+        }
+      }
     }
   }
 
@@ -714,7 +928,7 @@ function buildPlaylistPayloadUnchecked(deviceId) {
   const timezone = effectiveDeviceTz(device);
   // #group-sync: synchronized group playback (wall takes precedence — a wall member is never
   // also group-synced). Null unless the device is on a sync-enabled group's matching playlist.
-  const group_sync = wall_config ? null : resolveGroupSync(device, deviceId);
+  const group_sync = wall_config || overrideNow || hookNow ? null : resolveGroupSync(device, deviceId);
 
   // Device default / standby content: what a screen shows when it would otherwise be IDLE — no
   // playlist assigned, or a playlist whose every item is filtered out by its schedule (LED-wall
@@ -730,6 +944,9 @@ function buildPlaylistPayloadUnchecked(deviceId) {
       FROM content WHERE id = ?`).get(device.default_content_id);
     if (c) default_content = c;
   }
+  // ⚠️ CORPORATE (D6): a screen head office's playlist drives never shows store-chosen content — a
+  // dark mandate, or an empty corporate loop, falls to the player's own idle screen.
+  if (corporateSource || overrideNow) default_content = null;
 
   // #104: shared shape + zone-reset tail so the device payload and the dashboard
   // preview payload (GET /api/playlists/:id/preview-payload) can never drift.
@@ -738,7 +955,9 @@ function buildPlaylistPayloadUnchecked(deviceId) {
   // playing, and a missing schedule means "stay lit" everywhere in this feature.
   let power_schedule = null;
   try {
-    power_schedule = require('../lib/device-power-schedule').powerScheduleForDevice(db, deviceId);
+    // An emergency alert that is live here must not sit behind a dark backlight window: no schedule
+    // means "stay lit" on every player.
+    if (!overrideNow) power_schedule = require('../lib/device-power-schedule').powerScheduleForDevice(db, deviceId);
   } catch (e) {
     console.warn(`[power-schedule] resolve failed for ${deviceId}: ${e.message}`);
   }
@@ -751,7 +970,69 @@ function buildPlaylistPayloadUnchecked(deviceId) {
     console.warn(`[endpoints] resolve failed for ${deviceId}: ${e.message}`);
   }
 
-  return assemblePayload({ assignments, layout, orientation: device?.orientation || 'landscape', background_color: device?.background_color || null, workspace_id: device?.workspace_id || null, wall_config, group_sync, timezone, triggers, trigger_config, local_api, playback_order, default_content, power_schedule, endpoints: deviceEndpoints });
+  /*
+   * `interrupt` (an alert raised or cleared cuts in mid-item on every player) belongs to emergencies
+   * alone: the CAP alert card (lib/cap/feeds.js cardItem) and every item of a head office
+   * "activate now" alert (set above). Anything else carrying it, a stray field in a stored snapshot
+   * or an import, would let an ordinary playlist yank the screen, so it is stripped here, on the one
+   * path every device payload (solo, wall, group, corporate) leaves by.
+   */
+  for (const a of assignments) {
+    if (!a || typeof a !== 'object' || a.interrupt === undefined) continue;
+    const emergencyItem = a.interrupt === true && (emergencyNow || (capNow && a.widget_type === 'cap_alert'));
+    if (!emergencyItem) delete a.interrupt;
+  }
+  stampFileUrls(assignments, deviceId);
+  if (default_content) stampFileUrls([default_content], deviceId);
+
+  // Weather and area conditions are decided here, for this screen (lib/local-conditions.js).
+  assignments = require('../lib/local-conditions').filterItems(assignments, device);
+  const assembled = assemblePayload({ assignments, layout, orientation: device?.orientation || 'landscape', background_color: device?.background_color || null, workspace_id: device?.workspace_id || null, wall_config, group_sync, timezone, triggers, trigger_config, local_api, playback_order, default_content, power_schedule, endpoints: deviceEndpoints });
+  /*
+   * Audience counting (lib/audience.js). Top-level and outside the item list, so switching it on or
+   * off never restarts playback (#234). Rides EVERY payload, and null means OFF — so a screen that
+   * missed the change still stops counting on its next payload.
+   */
+  assembled.audience = require('../lib/audience').payloadConfig(deviceId);
+  /*
+   * The zone's UTC-offset table (lib/tz-table.js), for a player with no time-zone database of its
+   * own (the Roku) — so it evaluates schedules and power windows in the zone `timezone` names, not
+   * in whatever the box is set to.
+   *
+   * ⚠️ ONLY for a player that declares clock.tz_table (or whose baseline has it): every other
+   * player's payload stays byte-for-byte what it was. And ONLY when there IS an effective zone: a
+   * null `timezone` means "trust your own clock" on every player, and a UTC table would silently
+   * override that with the wrong answer for a screen that simply never reported a zone.
+   */
+  if (timezone && capsLib.supports(device, 'clock.tz_table')) {
+    assembled.tz_table = require('../lib/tz-table').tzTable(timezone);
+  }
+  /*
+   * Tables for the OTHER zones a clock widget on this screen names ("New York" on a Chicago lobby
+   * screen), so a player without a zone database can still tick that clock itself rather than show
+   * a frame whose seconds stand still. Keyed by zone; only zones that are real and differ from the
+   * screen's own; absent when there are none.
+   */
+  if (capsLib.supports(device, 'clock.tz_table')) {
+    const zones = new Set();
+    for (const it of Array.isArray(assembled.assignments) ? assembled.assignments : []) {
+      if (!it || it.widget_type !== 'clock') continue;
+      let cfg = it.widget_config;
+      if (typeof cfg === 'string') { try { cfg = JSON.parse(cfg); } catch { cfg = null; } }
+      const z = cfg && typeof cfg.timezone === 'string' ? cfg.timezone : '';
+      if (z && z !== timezone) zones.add(z);
+    }
+    if (zones.size) {
+      const tz = require('../lib/tz-table');
+      const tables = {};
+      for (const z of [...zones].slice(0, 16)) {
+        const t = tz.tzTable(z);
+        if (t && t.zone === z) tables[z] = t;   // an unknown zone comes back as UTC: leave it out
+      }
+      if (Object.keys(tables).length) assembled.tz_tables = tables;
+    }
+  }
+  return assembled;
 }
 
 // #104: the canonical player payload shape, shared by the device path
@@ -821,15 +1102,62 @@ function attachDataSourceBag(items, workspaceId) {
   }
 }
 
+/*
+ * Corporate per-origin helpers. A store screen playing head office's items must run head office's
+ * uploaded shaders (they live in the HQ workspace), and a store shader must never be swapped in for
+ * one of the same id. Origins come first, the device's workspace last, first match wins.
+ */
+function mergedShaderRegistry(origins, deviceWs) {
+  const merged = new Map();
+  for (const ws of [...origins, deviceWs]) {
+    const reg = customShaderRegistry(ws);
+    if (!reg) continue;
+    for (const [k, v] of reg) if (!merged.has(k)) merged.set(k, v);
+  }
+  return merged.size ? merged : null;
+}
+
+function perOriginShaderSources(items, deviceWs) {
+  const out = {};
+  const byWs = new Map();
+  for (const it of items) {
+    const ws = (it && it.__origin_ws) || deviceWs;
+    if (!byWs.has(ws)) byWs.set(ws, []);
+    byWs.get(ws).push(it);
+  }
+  for (const [ws, group] of byWs) {
+    const src = customShaderSources(ws, group);
+    if (src) for (const [k, v] of Object.entries(src)) if (!(k in out)) out[k] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function assemblePayload({ assignments, layout, orientation, background_color, workspace_id, wall_config, group_sync, timezone, triggers, trigger_config, local_api, playback_order, default_content, power_schedule, endpoints }) {
   let a = Array.isArray(assignments) ? assignments : [];
+  /*
+   * ⚠️ PER-ORIGIN, for corporate payloads. An item tagged __origin_ws (head office's content on a
+   * store screen) resolves its data source and custom shaders in the workspace it CAME FROM; an
+   * untagged item — every non-corporate payload — uses the device's workspace exactly as before.
+   * With no tags this whole block reduces to the single-workspace calls it replaced.
+   */
+  const origins = [...new Set(a.map((x) => (x && x.__origin_ws) || null).filter(Boolean))];
   // Transition widgets are normalized OUT here (the single device+preview chokepoint): each is dropped
   // from the visible list and its config attached as an opaque `transition` on the item it plays into.
   // Old players simply see no transition widget and ignore the field (hard cut) — no regression.
   // #320: the workspace's own uploaded shaders, consulted after the shipped manifest. Built here
   // rather than inside the resolver so the lookup stays a pure function of what it is given.
-  a = normalizeTransitions(a, customShaderRegistry(workspace_id));
-  attachDataSourceBag(a, workspace_id);
+  a = normalizeTransitions(a, origins.length ? mergedShaderRegistry(origins, workspace_id) : customShaderRegistry(workspace_id));
+  if (!origins.length) {
+    attachDataSourceBag(a, workspace_id);
+  } else {
+    // Each origin's items against that origin's data sources; untagged items against the device's.
+    for (const ws of [...origins, null]) {
+      const group = a.filter((x) => ((x && x.__origin_ws) || null) === ws);
+      if (group.length) attachDataSourceBag(group, ws || workspace_id);
+    }
+  }
+  const customShaders = origins.length ? perOriginShaderSources(a, workspace_id) : customShaderSources(workspace_id, a);
+  if (origins.length) a = a.map((x) => { if (x && x.__origin_ws !== undefined) { const { __origin_ws, ...rest } = x; return rest; } return x; });
   const zoneCount = layout?.zones?.length || 0;
   if (zoneCount < 2) a = a.map(x => (x && x.zone_id != null ? { ...x, zone_id: null } : x));
   return {
@@ -886,7 +1214,7 @@ function assemblePayload({ assignments, layout, orientation, background_color, w
     // playlist rather than fetched separately. Every player already resolves a shader as an id
     // to a source string, so merging these into that lookup is all any of them needs — no new
     // endpoint, no second round trip, and nothing sent for a workspace that uploaded nothing.
-    custom_shaders: customShaderSources(workspace_id, a),
+    custom_shaders: customShaders,
     playback_order: playback_order || 'sequential',
   };
 }
@@ -922,8 +1250,16 @@ function checkDeviceAccess(deviceId) {
     }
   }
 
-  // Check if over plan device limit (non-trial)
-  if (!plan.trial_started && plan.max_devices > 0) {
+  // Check if over plan device limit — for everyone EXCEPT a trial that is genuinely still running.
+  //
+  // ⚠️ Keyed on "the trial is running", NOT on `!plan.trial_started`. trial_started is stamped at
+  // signup and only expireTrial() ever cleared it, and expireTrial only fires for an account still
+  // on its trial plan with no subscription — so a trial that CONVERTED (paid, then downgraded or
+  // cancelled to Free) kept trial_started for ever and this branch never ran: 20 screens playing on
+  // a 2-screen Free plan. "Running" = inside the 14 days, still on the plan the trial granted, and
+  // nothing paid for; anything else is held to its plan like any other account.
+  const trialRunning = plan.trial_active && plan.plan_id === plan.trial_plan && !plan.stripe_subscription_id;
+  if (!trialRunning && plan.max_devices > 0) {
     const userDevices = db.prepare('SELECT id FROM devices WHERE user_id = ? ORDER BY created_at ASC').all(device.user_id);
     const deviceIndex = userDevices.findIndex(d => d.id === deviceId);
     if (deviceIndex >= plan.max_devices) {
@@ -983,16 +1319,20 @@ function insertProvisioningRow({ id, pairing_code, token, ip, device_info, attac
  * token minting, same fingerprint bookkeeping as the local path; the pairing code is what the
  * operator will claim in a dashboard. Returns what the replica hands the screen ONCE.
  */
-function provisionViaReplica({ pairing_code, device_info, fingerprint, hw_fingerprint, ip, nodeId }) {
+function provisionViaReplica({ pairing_code, device_info, fingerprint, hw_fingerprint, ip, nodeId, capabilities }) {
   const id = uuidv4();
   const token = generateDeviceToken();
   insertProvisioningRow({ id, pairing_code, token, ip, device_info, attachedNodeId: nodeId });
+  // As on the direct path: what the screen declares, before anyone pairs it. parseDeclared drops
+  // anything this server doesn't know; an older replica sends none, and the baseline stays.
+  applyCapabilities(id, { capabilities });
   if (fingerprint) {
     try {
       db.prepare("INSERT INTO device_fingerprints (fingerprint, device_id, last_seen, hw_fingerprint) VALUES (?, ?, strftime('%s','now'), ?) ON CONFLICT(fingerprint) DO UPDATE SET device_id = excluded.device_id, last_seen = excluded.last_seen, hw_fingerprint = COALESCE(excluded.hw_fingerprint, device_fingerprints.hw_fingerprint)")
         .run(fingerprint, id, hw_fingerprint || null);
-      deviceSettings.applyToDevice(id, fingerprint);
-    } catch (e) { /* settings restore is best effort */ }
+      // ⚠️ AUDIT F07: NO settings restore here — this row has no workspace yet, so the #150
+      // workspace guard cannot work. The claim (/api/provision/pair) restores instead.
+    } catch (e) { /* fingerprint bookkeeping is best effort */ }
   }
   emitToDeviceWorkspace(_dashboardNsRef, id, 'dashboard:device-added', db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
   console.log(`New device registered via replica ${nodeId}: ${id} with pairing code: ${pairing_code}`);
@@ -1392,6 +1732,18 @@ const EVENT_APPLIERS = Object.freeze({
     try { ctx.reply('device:kiosk-sessions-ack', { ids, written }); } catch (_) { /* best effort */ }
   },
 
+  /*
+   * Audience counts (lib/audience.js): per-minute INTEGERS from the player's on-device detector,
+   * queued on the player until this ack names them. Validated strictly and kept only while the org
+   * has counting on for this screen — the device cannot turn it on by sending.
+   */
+  'audience'(deviceId, data, ctx) {
+    let out = { ids: [], written: 0 };
+    try { const r = require('../lib/audience').ingest(deviceId, data); out = { ids: r.ids, written: r.written }; }
+    catch (e) { console.warn(`[audience] ingest from ${deviceId} failed: ${e.message}`); }
+    try { ctx.reply('device:audience-ack', out); } catch (_) { /* best effort */ }
+  },
+
   'connectivity-report'(deviceId, data, ctx) {
     const { device_id } = data || {};
     if (device_id && device_id !== deviceId) return;          // forged/mismatched -> no-op
@@ -1418,6 +1770,9 @@ const EVENT_APPLIERS = Object.freeze({
     if (device_id !== deviceId) return;
     try {
       if (event === 'play_start') {
+        // View-only viewers join the screen where it is (lib/now-playing.js). Before the throttle:
+        // a viewer needs every start, proof-of-play does not.
+        nowPlaying.noteStart(device_id, { content_id, widget_id, zone_id }, eventTimeMs(data, ctx));
         // Throttle proof-of-play inserts per device so a runaway player
         // (0-second items) can't flood play_logs. Skipped cycles simply
         // don't create a row; the dashboard progress event below still fires.
@@ -1856,7 +2211,8 @@ module.exports = function setupDeviceSocket(io) {
         const res = await writeTo(edge.peer_node_id, {
           type: 'player-provision', opId: crypto.randomUUID(), sentAt, notAfter: sentAt + 60_000,
           payload: { pairing_code, device_info: data.device_info || null, fingerprint: data.fingerprint || null,
-                     hw_fingerprint: data.hw_fingerprint || null, ip: getClientIp(socket) },
+                     hw_fingerprint: data.hw_fingerprint || null, ip: getClientIp(socket),
+                     capabilities: data.capabilities ?? (data.device_info && data.device_info.capabilities) ?? null },
         });
         if (!res || !res.ok) {
           if (res && (res.offline || res.indeterminate)) return wait('primary_unreachable');
@@ -2143,8 +2499,16 @@ module.exports = function setupDeviceSocket(io) {
             // Prefer the incoming id, fall back to what is already stored, and only ever write
             // an id that still resolves. Same guard as the INSERT path below; this UPDATE was
             // missed, and it is the one that actually fires (37 FK failures on prod).
+            //
+            // ⚠️ AUDIT F06: the incoming id is honoured ONLY when the caller proved it owns that id
+            // (tokenProven). This block runs BEFORE the token check below, so an unauthenticated
+            // register naming a victim's UUID used to rebind a fingerprint the attacker controls to
+            // the victim's row; a second register with that fingerprint + any pairing_code then took
+            // the "reinstalled app" reclaim path and was minted the victim's NEW token + playlist.
+            // An unproven id leaves the existing link alone — the reclaim path must only ever see a
+            // link that a token-holding device (or the server's own provisioning) wrote.
             const known = (id) => !!(id && db.prepare('SELECT 1 FROM devices WHERE id = ?').get(id));
-            const fpDeviceId = known(device_id) ? device_id
+            const fpDeviceId = (tokenProven && known(device_id)) ? device_id
               : (known(existing.device_id) ? existing.device_id : null);
             db.prepare("UPDATE device_fingerprints SET last_seen = strftime('%s','now'), device_id = ?, hw_fingerprint = COALESCE(?, hw_fingerprint) WHERE fingerprint = ?")
               .run(fpDeviceId, hw_fingerprint || null, fingerprint);
@@ -2308,7 +2672,11 @@ module.exports = function setupDeviceSocket(io) {
             // deleted). device_fingerprints.device_id has an FK to devices(id), and
             // INSERT OR IGNORE does NOT suppress FK violations - so null out an
             // unknown id instead of letting it throw (was a caught, noisy error).
-            const fpDeviceId = (device_id && db.prepare('SELECT 1 FROM devices WHERE id = ?').get(device_id)) ? device_id : null;
+            // ⚠️ AUDIT F06: and never link to a client-supplied id the caller has not proved it owns
+            // (tokenProven) — see the UPDATE above. An unauthenticated register naming a victim's
+            // UUID would otherwise create (attacker-fp -> victim) and the next register with that fp
+            // + a pairing_code reclaimed the victim's row and was handed a fresh token for it.
+            const fpDeviceId = (tokenProven && db.prepare('SELECT 1 FROM devices WHERE id = ?').get(device_id)) ? device_id : null;
             db.prepare("INSERT OR IGNORE INTO device_fingerprints (fingerprint, device_id, hw_fingerprint) VALUES (?, ?, ?)")
               .run(fingerprint, fpDeviceId, hw_fingerprint || null);
           }
@@ -2429,6 +2797,9 @@ module.exports = function setupDeviceSocket(io) {
           // rate-backoff held against it: /api/update/check is unauthenticated and takes a
           // caller-supplied ?device_id=, so that bucket can have been burned by anyone who
           // merely knows this UUID. A genuine reconnect is the proof that lets us forgive it.
+          // ⚠️ AUDIT F17: forgive clears RATE state only. It runs on every accepted register, so if
+          // it also cleared the #341 no-progress counter (it used to) a display in the reinstall
+          // loop reset that counter on each post-install reconnect and was offered forever.
           try { require('../lib/ota-breaker').forgiveDevice(device_id); } catch (_) { /* non-fatal */ }
           socket.emit('device:registered', { device_id, device_token: tokenToSend, status: 'online' });
           // #143: a device paired/claimed server-side (user_id set) that RECONNECTS must be told
@@ -2529,6 +2900,10 @@ module.exports = function setupDeviceSocket(io) {
         // AFTER the row exists, so a failed insert leaves no half-authenticated socket.
         try {
           insertProvisioningRow({ id, pairing_code, token: newToken, ip: getClientIp(socket), device_info });
+          // ⚠️ NOW, not at the first post-pairing reconnect: the pairing claim acts on what the
+          // screen can do (it sends set_timezone to a display that declares system.time), and
+          // without this every new screen looked like its platform's baseline at that moment.
+          applyCapabilities(id, data);
         } catch (e) {
           console.warn(`Provisioning rejected for pairing_code ${pairing_code} from ${getClientIp(socket)}: ${e.message}`);
           socket.emit('device:auth-error', { error: 'Registration failed, please retry.' });
@@ -2538,17 +2913,19 @@ module.exports = function setupDeviceSocket(io) {
         authenticated = true;
 
         // #150: relink the fingerprint to the NEW device row (the fingerprint block above
-        // leaves device_id NULL on a post-delete re-pair) so the settings key is reliable,
-        // then restore any settings this physical device had at its last deletion —
-        // orientation/name/playlist/etc come back automatically instead of resetting. Runs
-        // BEFORE the dashboard:device-added emit below so that emit carries restored values.
+        // leaves device_id NULL on a post-delete re-pair) so the settings key is reliable.
+        //
+        // ⚠️ AUDIT F07: the settings RESTORE no longer runs here. This row was just INSERTed with
+        // no workspace_id, so applyToDevice's "same workspace only" guard could never fire and
+        // the previous tenant's playlist/layout/default content/team landed on the unclaimed row
+        // — then survived the claim into a DIFFERENT tenant. The claim (/api/provision/pair)
+        // calls deviceSettings.restoreOnClaim once the row is in its workspace; the link written
+        // here is what it keys on.
         if (fingerprint) {
           try {
             db.prepare("INSERT INTO device_fingerprints (fingerprint, device_id, last_seen, hw_fingerprint) VALUES (?, ?, strftime('%s','now'), ?) ON CONFLICT(fingerprint) DO UPDATE SET device_id = excluded.device_id, last_seen = excluded.last_seen, hw_fingerprint = COALESCE(excluded.hw_fingerprint, device_fingerprints.hw_fingerprint)")
               .run(fingerprint, id, hw_fingerprint || null);
-            const restored = deviceSettings.applyToDevice(id, fingerprint);
-            if (restored) console.log(`[#150] restored saved settings for re-paired device ${id} (fp ${fingerprint.slice(0, 8)}…)`);
-          } catch (e) { console.warn(`[#150] settings restore failed for ${id}: ${e.message}`); }
+          } catch (e) { console.warn(`[#150] fingerprint relink failed for ${id}: ${e.message}`); }
         }
 
         heartbeat.registerConnection(id, socket.id);
@@ -2698,7 +3075,32 @@ module.exports = function setupDeviceSocket(io) {
 
     socket.on('device:ota-status', (data) => dispatch('ota-status', data));
 
-    socket.on('device:exit', (data) => dispatch('exit', data));
+    /*
+     * ⚠️ device:exit is sent AS THE SOCKET DIES, and socket.io would drop it.
+     *
+     * socket.io's Socket#dispatch defers every event handler by a process.nextTick and then
+     * ignores the event if the socket is no longer connected ("ignore packet received after
+     * disconnection", node_modules/socket.io/dist/socket.js). A dying app writes its exit frame
+     * and then its close (a namespace DISCONNECT, or just the TCP FIN) back to back; when both land
+     * in one read — routine on a loaded server — the DISCONNECT is handled synchronously in
+     * between, the socket is closed before the deferred handler runs, and the announced reason is
+     * silently lost. The offline transition then records 'silent' for an app that told us it
+     * crashed.
+     *
+     * onAny listeners run SYNCHRONOUSLY on receipt, before that deferral, so the exit is noted
+     * here and applied by the 'disconnect' handler if the normal handler never got to it. The
+     * normal path is unchanged and still wins when it runs; received-vs-dispatched counters (not a
+     * cleared flag) so an earlier exit's handler cannot swallow a later, dropped one. Nothing here makes a VIOLENT death
+     * look announced: only a device:exit frame this socket actually received is ever applied.
+     */
+    let exitsReceived = 0, exitsDispatched = 0, lastExitData;
+    socket.onAny((event, data) => { if (event === 'device:exit') { exitsReceived++; lastExitData = data; } });
+    socket.on('device:exit', (data) => { exitsDispatched++; dispatch('exit', data); });
+    function applyUndispatchedExit() {
+      if (exitsReceived <= exitsDispatched) return;
+      exitsDispatched = exitsReceived;
+      try { dispatch('exit', lastExitData); } catch (e) { console.warn(`[exit] late exit for ${currentDeviceId}: ${e && e.message}`); }
+    }
 
     socket.on('device:event', (data) => dispatch('event', data));
 
@@ -2707,6 +3109,7 @@ module.exports = function setupDeviceSocket(io) {
     socket.on('device:play-event', (data) => dispatch('play-event', data));
 
     socket.on('device:kiosk-sessions', (data) => dispatch('kiosk-sessions', data));
+    socket.on('device:audience', (data) => dispatch('audience', data));
 
     /*
      * Interactive terminal output (lib/pty-relay.js). NOT a dispatch(): it writes nothing, is never
@@ -2770,14 +3173,11 @@ module.exports = function setupDeviceSocket(io) {
     // wall:sync. The device_id is stamped with the authenticated id so followers can trust it.
     // Sender must be an eligible member: in the group (m2m) AND on the group's shared playlist.
     function groupSenderEligible(group) {
-      if (!group || !group.sync_enabled || !group.playlist_id) return false;
       // Resolved playlist, for the same reason as groupSyncMembers: the raw column is stale for
-      // any device that inherits, and this guard decides whose sync broadcasts are trusted.
-      return !!db.prepare(`
-        SELECT 1 FROM device_group_members dgm
-        JOIN device_resolved_playlist r ON r.device_id = dgm.device_id
-        WHERE dgm.group_id = ? AND dgm.device_id = ? AND r.playlist_id = ?
-      `).get(group.id, currentDeviceId, group.playlist_id);
+      // any device that inherits, and this guard decides whose sync broadcasts are trusted. Keyed on
+      // the SYNC KEY (critique R2: this fourth reader was the one first missed), so a group whose
+      // members play head office's playlist can relay at all.
+      return corpResolve.isSyncMember(db, group, currentDeviceId);
     }
 
     socket.on('group:sync', (data) => {
@@ -2844,6 +3244,12 @@ module.exports = function setupDeviceSocket(io) {
         return;
       }
 
+      // An exit frame that arrived with the close and that socket.io is about to drop (see
+      // applyUndispatchedExit). Applied here, before the timer is armed, so the offline transition
+      // below keeps the reason the app announced. After the guards above on purpose: an evicted or
+      // superseded socket's late exit must not label a device a newer socket now owns.
+      applyUndispatchedExit();
+
       const deviceId = currentDeviceId;
       const closingSocketId = socket.id;
       console.log(`Device disconnected: ${deviceId} (offline transition deferred ${OFFLINE_DEBOUNCE_MS}ms)`);
@@ -2891,6 +3297,7 @@ module.exports.ingestScreenshot = ingestScreenshot;
 module.exports.validateDeviceToken = validateDeviceToken;
 module.exports.__applyHardwareIdentity = applyHardwareIdentity;
 module.exports.__hasPendingOffline = (deviceId) => pendingOfflines.has(deviceId);
+module.exports.__refreshWidgetRevs = refreshWidgetRevs;
 module.exports.__pendingOfflineCount = () => pendingOfflines.size;
 module.exports.__evictedSize = () => evictedSockets.size;
 module.exports.__resetTimers = () => {

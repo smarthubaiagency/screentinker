@@ -14,7 +14,7 @@
 
 ScreenTinker is a free, open-source **digital signage CMS** you can self-host on your own server — or run in our managed cloud. Manage TVs, video walls, and kiosks across multiple locations from one dashboard, with remote control, scheduling, playlists, and analytics. Built for retail, QSR menu boards, offices, lobbies, education, and any environment where you need centralized control over remote screens. Multi-tenant, MIT-licensed, single-developer maintained with direct contact access.
 
-**Runs on any screen** — Android TV, Fire TV, Samsung Tizen, LG webOS, Amazon Vega OS, Raspberry Pi, Windows, ChromeOS, or any web browser. No per-device player licence, no hardware lock-in.
+**Runs on any screen** — Android TV, Fire TV, Samsung Tizen, LG webOS, Amazon Vega OS, Roku, Raspberry Pi, Windows, ChromeOS, or any web browser. No per-device player licence, no hardware lock-in.
 
 **Why self-host?** Keep your content and data on your own infrastructure, avoid per-screen SaaS fees, run air-gapped on a private LAN, and read or fork the source. Set `SELF_HOSTED=true` and a $5 VPS drives hundreds of screens.
 
@@ -32,12 +32,12 @@ ScreenTinker is a free, open-source **digital signage CMS** you can self-host on
 - **Video walls** — combine multiple displays into one screen with bezel compensation, device rotation, and leader-based sync
 - **Remote control** — live view, touch injection, key input, power on/off
 - **Live video & Talk** — optional WebRTC path via a [go2rtc](https://github.com/AlexxIT/go2rtc) sidecar: sub-second live video of what a screen is actually playing (one screen watched by many dashboards without re-encoding), plus **Talk** — one-way announce or two-way intercom to a single screen, and one-way PA broadcast to a whole group or workspace, with an optional operator webcam shown fullscreen. Off by default and enabled per organization; an org can bring its own TURN/STUN. See [`docs/live-video.md`](docs/live-video.md)
-- **Live TV / IPTV & camera feeds** — play a **live stream on a screen** as an ordinary playlist item: an IPTV/TV channel over **HLS** (`.m3u8`, every player type), or an **RTSP** camera/NVR on native Android (lowest latency). The screen opens the URL itself, so it can be a LAN address and the server never ingests or restreams it — a channel on 40 screens is 40 pulls from your source, not 40 through ScreenTinker. Capability-gated per transport, so a player only receives a stream it can decode. See [`docs/live-playback.md`](docs/live-playback.md)
+- **Live TV / IPTV & camera feeds** — play a **live stream on a screen** as an ordinary playlist item: an IPTV/TV channel over **HLS** (`.m3u8`, every player type), or an **RTSP** camera/NVR on native Android (lowest latency). On an Android TV box with an HDMI input (Fire TV Cube), the box's own **HDMI IN** plays as an item too: full screen or in a zone, with logos and lower-thirds layered on top. The screen opens the URL itself, so it can be a LAN address and the server never ingests or restreams it — a channel on 40 screens is 40 pulls from your source, not 40 through ScreenTinker. Capability-gated per transport, so a player only receives a stream it can decode. See [`docs/live-playback.md`](docs/live-playback.md)
 - **Scheduling** — visual weekly calendar with recurrence rules (daily/weekly/monthly), priority-based conflict resolution, both device-level and group-level schedules (device-level overrides win over group-level), timezone support
-- **Resumable uploads** — large files upload in 5 MiB chunks, one file at a time, so a dropped connection costs one chunk instead of the whole file and progress **survives a page reload**. This is what makes uploading workable on a slow or distant connection: a single-request upload has to finish inside the shortest timeout between browser and server (behind a CDN, roughly two minutes), and that ceiling does not scale with file size. Declaring the size up front also means a workspace near its storage limit is told before the upload rather than after
+- **Resumable uploads** — large files upload in 1 MiB chunks, one file at a time, so a dropped connection costs one chunk instead of the whole file and progress **survives a page reload**. This is what makes uploading workable on a slow or distant connection: a single-request upload has to finish inside the shortest timeout between browser and server (behind a CDN, roughly two minutes), and that ceiling does not scale with file size. Declaring the size up front also means a workspace near its storage limit is told before the upload rather than after
 - **Device-side REST** — make a **screen** perform an HTTP request from **its own network**, so a LAN target is reachable at all: a PLC, a sensor, a local Home Assistant on the shop's `192.168.x.x` that the ScreenTinker server has no route to. Nothing is proxied through the server. Up to 64 KiB of the response comes back for the dashboard to show. ⚠️ Only `http://`/`https://` — `file://` and `content://` are refused, because the boundary worth defending is not "which host" but "is this still an HTTP fetch or has it become a local file read". Cloud metadata addresses are refused too, a hostname that resolves to one is caught by re-checking and pinning the resolved address, and redirects are not followed. ⚠️ Deliberately **not** a mesh command: a hub must not be able to aim someone else's panel at addresses inside their private network. See [`docs/android-troubleshooting.md`](docs/android-troubleshooting.md#device-side-rest-http_request)
 - **Display power schedules** — blank the **screen** on a weekly clock ("off 22:00–06:00, Mon–Fri") to save backlight hours, per device or per group, with device-level overriding group-level as everywhere else. The panel keeps running the whole time — playlists, downloads, heartbeats and remote control all continue, and waking it is instant — so this is **not** the same as switching the device off, which ScreenTinker deliberately does not schedule (see [`docs/android-troubleshooting.md`](docs/android-troubleshooting.md#scheduled-screen-off-vs-device-off)). Windows are evaluated **on the player** against its own timezone, so a screen sleeps and wakes on time with the network down. Android today; other players accept and store the schedule and report it as unsupported until their local evaluator lands
-- **Widgets** — clocks, weather, RSS tickers, text/HTML, webpages, social feeds, and Directory Board (scrolling lobby tenant/room/staff directories with dark/light themes, category management, and anti-burn-in motion)
+- **Widgets** — clocks, weather, RSS tickers, text/HTML, webpages, **social walls** (moderated posts from Instagram, Facebook, YouTube, X, Bluesky and Mastodon — see [`docs/social-feeds.md`](docs/social-feeds.md)), and Directory Board (scrolling lobby tenant/room/staff directories with dark/light themes, category management, and anti-burn-in motion)
 - **Data sources** — bind live external data into a slide or widget with `{{ds:slug.field}}`: an iCal/Webcal calendar or any JSON-over-HTTP feed, refreshed on its own schedule. Secret fields in a source's config are encrypted at rest
 - **Meeting-room signs** — point a slide at a room's calendar to show Busy / Available, what's on now, and when the room frees up — in every dashboard language, defaulting to English
 - **Kiosk mode** — interactive touchscreen interfaces
@@ -52,6 +52,7 @@ ScreenTinker is a free, open-source **digital signage CMS** you can self-host on
 - **White-label** — custom branding, colors, logo, favicon, CSS, and domain
 - **Content management** — folder organization, remote URL content (no upload needed), YouTube embeds, video duration detection via ffprobe, automatic thumbnail generation, Unicode-safe filenames (NFC normalization + UTF-8 multipart decoding)
 - **PDF to playlist** — drop in a PDF and every page becomes a full-screen slide in a playlist, rendered in your browser (no server-side PDF dependency)
+- **Storage backends** — keep media on local disk (the default, unchanged), **Amazon S3 or any S3-compatible store** (MinIO, Garage, Ceph RGW, SeaweedFS, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces), or **Azure Blob** — instance-wide from env, or per organization so an MSP customer's media stays in their own account. Attach an existing bucket and import from it by reference or copy. Moving media between backends is live: files are copied and verified, both copies serve until you switch, and old copies are removed only when you say so — screens keep playing throughout. Players still just fetch a URL: a presigned link when the screen can reach the bucket, otherwise the server streams it, so air-gapped screens keep working. See [`docs/storage.md`](docs/storage.md)
 - **Export/Import** — v2 format with playlists, device groups, schedules, and optional media bundling (ZIP); backward-compatible v1 import with automatic playlist migration
 - **Device authentication** — per-device tokens for secure WebSocket connections; devices authenticate on every reconnect
 - **Account management** — in-app password change, profile editing, email-based password reset
@@ -150,8 +151,9 @@ away, how many hops a screen's data crosses to reach you, and which server relay
 
 ## Supported Platforms
 
-Android TV, Fire TV, Raspberry Pi, Windows, ChromeOS, LG webOS, Samsung Tizen, BrightSign, and any
-device with a web browser.
+Android TV, Fire TV, Roku, Raspberry Pi, Windows, ChromeOS, LG webOS, Samsung Tizen, BrightSign, and any
+device with a web browser. Roku has limits a sign owner should read first: see
+[the Roku guide](https://screentinker.com/guides/roku-digital-signage.html).
 
 Anything with a reasonably modern browser can be a display without installing anything: point it at
 `/player`. The native players add what a browser cannot: the **Android APK** gives you unattended boot,
@@ -197,6 +199,8 @@ Schema migrations run automatically on first boot — no manual migration comman
 
 `npm start` is preferred over `node server.js` directly because the script invokes Node with `--env-file-if-exists=.env` so a `server/.env` file (gitignored) is loaded automatically for local dev.
 
+⚠️ **Only `npm start` reads `server/.env`.** Under pm2, systemd or `node server.js`, set the variables in that process manager instead: systemd `Environment=`, or for pm2 `SELF_HOSTED=true pm2 restart <id> --update-env` then `pm2 save`. A `.env` at the repository root is never read. At boot the server logs a `[config]` warning naming any key in either file that is not in effect.
+
 ### Environment Variables
 
 | Variable | Description | Default |
@@ -208,8 +212,10 @@ Schema migrations run automatically on first boot — no manual migration comman
 | `HIDE_BILLING` | Hide the Subscription nav item + billing view; `#/billing` redirects to the dashboard (UI-only, opt-in) | `false` |
 | `DISABLE_REGISTRATION` | Block new account creation (including OAuth auto-signup). First-user setup on an empty DB is still allowed. | `false` |
 | `DISABLE_HOMEPAGE` | Redirect `/` to `/app` instead of serving the marketing landing page. For internal-only self-hosted deployments. | `false` |
+| `VIEW_ONLY_ENABLED` | View-only display links (`/view/<token>`). Each display is still off until a workspace admin turns it on. `false` removes the feature from the instance — see [View-only display access](docs/view-only-access.md). | `true` when `SELF_HOSTED=true`, else `false` |
+| `VIEW_TRUSTED_PROXIES` | Comma-separated proxy addresses/CIDRs whose `X-Forwarded-For` the view-only **network** check believes. Unset = only the TCP peer counts. | unset |
 | `APP_URL` | Your public URL (used for Stripe callbacks and invite-accept URLs in emailed invites) | _(none)_ |
-| `JWT_SECRET` | JWT signing key (auto-generated if not set) | _(auto)_ |
+| `JWT_SECRET` | JWT signing key, also the source of the key that encrypts saved secrets. Auto-generated into `certs/.jwt_secret` if not set. ⚠️ Changing it later signs everyone out and makes saved secrets unreadable; the server warns at boot if it changed. | _(auto)_ |
 | `SSL_CERT` | Path to SSL certificate | `server/certs/cert.pem` |
 | `SSL_KEY` | Path to SSL private key | `server/certs/key.pem` |
 | `PING_INTERVAL` | Socket.IO Engine.IO ping interval (ms). Raise for slow TV WebKits that miss pongs under decode load. | `30000` |
@@ -225,6 +231,7 @@ Schema migrations run automatically on first boot — no manual migration comman
 | `MESH_MIN_NODE_VERSION` | Oldest peer version this server will pair with. | `2.0.0-0` |
 | `PRIMARY_URL` | On a replica: where writes for copied workspaces are forwarded. No default — unset, a replica is read-only. See [Scale-out](docs/scale-out.md). | unset |
 | `PRIMARY_REDIRECT` | Answer those writes with a `307` to `PRIMARY_URL` instead of proxying. Only behind one load balancer. | `false` |
+| `MCP_CORS_ORIGINS` | Browser origins allowed to call `/mcp` cross-origin, comma-separated (e.g. `http://localhost:6274` for the MCP Inspector in direct mode). Unset means no CORS on `/mcp`; native and server-side MCP clients need none. | unset |
 | `PLUGINS_ENABLED` | Load the plugin system (widget types, data-source resolvers, optional routes). Off by default and invisible — see [Plugins](docs/plugins.md). | unset |
 | `PLUGINS_DIR` | Operator-installed plugins. Survives `git pull`. | `$DATA_DIR/plugins` |
 | `PLUGIN_INBOX_DIR` | Quarantine for uploaded plugin zips. Not a plugin root. | `$DATA_DIR/plugin-inbox` |
@@ -879,7 +886,7 @@ scripts/upgrade.sh
 scripts/upgrade.sh v1.8.0
 ```
 
-Set `SERVICE_NAME` if your systemd unit is not named `screentinker`.
+It restarts the systemd unit `screentinker` (set `SERVICE_NAME` if yours is named differently), or else the pm2 process running this checkout's `server/`. Run it as the user that owns the pm2 process, since pm2 is per user. For anything else, set `RESTART_CMD='<your restart command>'`. If it can't find a way to restart, it says so and exits with status 2: the new release is installed, but the old one is still running until you restart it.
 
 If you deployed without git, initialize it once so `upgrade.sh` can resolve tags:
 
@@ -1004,6 +1011,12 @@ keytool -genkey -v -keystore android/release-key.jks -keyalg RSA -keysize 2048 -
    - **Samsung Tizen TV / signage**: point the TV's URL Launcher (or browser) at `https://your-instance/player` - no signing needed. For an installed native app, see [tizen/README.md](tizen/README.md)
    - **Any browser**: Open `https://your-instance/player` in kiosk/fullscreen mode
 4. Enter the pairing code shown on the device
+
+**A browser screen shows an empty setup page, or never shows a pairing code?** Open
+`https://your-instance/player/check` on that screen. It runs on very old browsers and says which
+player this one can run: `/player`, `/player/legacy` (older smart TVs and signage panels), or
+neither. Point the screen at the address it gives. If it says the browser is too old for both,
+use an Android TV box, Fire TV or Raspberry Pi on HDMI instead.
 
 ### Raspberry Pi notes
 

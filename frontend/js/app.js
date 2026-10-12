@@ -14,9 +14,16 @@ import * as dataSources from './views/data-sources.js';
 import * as reviews from './views/reviews.js';
 import * as videoWall from './views/video-wall.js';
 import * as reports from './views/reports.js';
+import * as audience from './views/audience.js';
 import * as servers from './views/servers.js';
 import * as noc from './views/noc.js';
 import * as triggers from './views/triggers.js';
+import * as qrCodes from './views/qr-codes.js';
+import * as socialFeeds from './views/social.js';
+import * as alerts from './views/alerts.js';
+import * as capFeeds from './views/cap-feeds.js';
+import * as automation from './views/automation.js';
+import * as corporate from './views/corporate.js';
 import * as activity from './views/activity.js';
 import * as kiosk from './views/kiosk.js';
 import * as onboarding from './views/onboarding.js';
@@ -34,6 +41,7 @@ import { t } from './i18n.js';
 import { isPlatformAdmin } from './utils.js';
 import { initNavGroups } from './components/nav-groups.js';
 import { renderWorkspaceSwitcher, selectedRemoteOrg, clearRemoteOrg } from './components/workspace-switcher.js';
+import { corporateSettings, renderHqContextBar } from './components/corporate-ui.js';
 
 /*
  * ⚠️ A PERSISTENT BANNER WHILE VIEWING SOMEBODY ELSE'S SERVER, and it is not decoration.
@@ -86,8 +94,11 @@ function renderRemoteOrgBanner() {
   el.querySelector('#leaveRemoteOrg').onclick = () => { clearRemoteOrg(); window.location.reload(); };
 }
 import { showToast } from './components/toast.js';
-import { api, meshCapability } from './api.js';
+import { api, meshCapability, setErrorTranslator } from './api.js';
 import { esc } from './utils.js';
+
+// Head office (corporate) refusals arrive with a code; show them in the viewer's language.
+setErrorTranslator(t);
 
 const app = document.getElementById('app');
 const sidebar = document.querySelector('.sidebar');
@@ -236,8 +247,15 @@ const NAV_LABEL_KEYS = {
   schedule: 'nav.schedule',
   walls: 'nav.walls',
   reports: 'nav.reports',
+  audience: 'nav.audience',
   servers: 'nav.servers',
   triggers: 'nav.triggers',
+  'qr-codes': 'nav.qr_codes',
+  social: 'nav.social',
+  alerts: 'nav.alerts',
+  'emergency-feeds': 'nav.emergency_feeds',
+  automation: 'nav.automation',
+  // corporate is relabelled per viewer (Corporate / Head office) by syncCorporateNav.
   kiosk: 'nav.kiosk',
   designer: 'nav.designer',
   activity: 'nav.activity',
@@ -563,10 +581,12 @@ function route() {
     else if (hash === '#/schedule' && link.dataset.view === 'schedule') link.classList.add('active');
     else if (hash === '#/widgets' && link.dataset.view === 'widgets') link.classList.add('active');
     else if (hash === '#/slides' && link.dataset.view === 'slides') link.classList.add('active');
+    else if (hash === '#/social' && link.dataset.view === 'social') link.classList.add('active');
     else if (hash === '#/templates' && link.dataset.view === 'templates') link.classList.add('active');
     else if ((hash === '#/data-sources' || hash.startsWith('#/data-sources/')) && link.dataset.view === 'data-sources') link.classList.add('active');
     else if ((hash.startsWith('#/wall') || hash === '#/walls') && link.dataset.view === 'walls') link.classList.add('active');
     else if (hash === '#/reports' && link.dataset.view === 'reports') link.classList.add('active');
+    else if (hash === '#/audience' && link.dataset.view === 'audience') link.classList.add('active');
     else if (hash === '#/activity' && link.dataset.view === 'activity') link.classList.add('active');
     else if ((hash === '#/designer' || hash.startsWith('#/designer/')) && link.dataset.view === 'designer') link.classList.add('active');
     else if ((hash === '#/kiosk' || hash.startsWith('#/kiosk/')) && link.dataset.view === 'kiosk') link.classList.add('active');
@@ -575,6 +595,7 @@ function route() {
     else if (hash.startsWith('#/platform/') && link.dataset.view === 'platform-' + hash.slice(11).split(/[/?]/)[0]) link.classList.add('active');
     else if (hash.startsWith('#/admin/player-debug') && link.dataset.view === 'platform-system') link.classList.add('active');
     else if ((hash === '#/members' || (hash.startsWith('#/workspace/') && hash.includes('/members'))) && link.dataset.view === 'members') link.classList.add('active');
+    else if ((hash === '#/corporate' || hash.startsWith('#/corporate/')) && link.dataset.view === 'corporate') link.classList.add('active');
   });
 
   // Route to view
@@ -585,7 +606,8 @@ function route() {
     const deviceId = hash.split('#/device/')[1].split('/')[0];
     currentView = deviceDetail;
     deviceDetail.render(app, deviceId);
-  } else if (hash === '#/content') {
+  } else if (hash === '#/content' || hash.startsWith('#/content?')) {
+    // ?canva=connected / ?canva_error=… come back from the Canva connect round trip.
     currentView = contentLibrary;
     contentLibrary.render(app);
   } else if (hash === '#/playlists' || hash.startsWith('#/playlists/')) {
@@ -618,6 +640,25 @@ function route() {
   } else if (hash === '#/triggers') {
     currentView = triggers;
     triggers.render(app);
+  } else if (hash === '#/qr-codes') {
+    currentView = qrCodes;
+    qrCodes.render(app);
+  } else if (hash === '#/social') {
+    currentView = socialFeeds;
+    socialFeeds.render(app);
+  } else if (hash === '#/alerts') {
+    currentView = alerts;
+    alerts.render(app);
+  } else if (hash === '#/emergency-feeds') {
+    currentView = capFeeds;
+    capFeeds.render(app);
+  } else if (hash === '#/automation') {
+    currentView = automation;
+    automation.render(app);
+  } else if (hash === '#/corporate' || hash.startsWith('#/corporate/')) {
+    // Head office (corporate) playlists: head office's face or a store's, chosen inside the view.
+    currentView = corporate;
+    corporate.render(app);
   } else if (hash === '#/servers') {
     /*
      * ⚠️ Its own route, deliberately NOT behind the workspace switcher. The switcher
@@ -636,6 +677,9 @@ function route() {
   } else if (hash === '#/reports') {
     currentView = reports;
     reports.render(app);
+  } else if (hash === '#/audience') {
+    currentView = audience;
+    audience.render(app);
   } else if (hash === '#/kiosk' || hash.startsWith('#/kiosk/')) {
     currentView = kiosk;
     kiosk.render(app);
@@ -676,7 +720,9 @@ function route() {
   } else if (hash.startsWith('#/platform/')) {
     currentView = admin;
     admin.render(app, hash.slice(11).split(/[/?]/)[0]);
-  } else if (hash === '#/settings') {
+  } else if (hash === '#/settings' || hash.startsWith('#/settings?')) {
+    // `?` prefix too: a credit-pack Checkout returns to `#/settings?credits=success` (the same trap
+    // the #/billing route below documents). Not a bare startsWith, so no future #/settings-x matches.
     currentView = settings;
     settings.render(app);
   } else if (hash.startsWith('#/billing')) {
@@ -698,6 +744,31 @@ function route() {
     currentView = dashboard;
     dashboard.render(app);
   }
+}
+
+/*
+ * Head office (corporate) playlists in the sidebar (spec §7.1). Two labels for one route: "Corporate"
+ * for the people who make head office's playlists (authors, org admins), "Head office" for a store
+ * whose screens head office drives. Hidden for everyone else — an install that never turns the
+ * feature on never sees it.
+ *
+ * ⚠️ ASKED ONCE PER PAGE LOAD (the settings read is cached in components/corporate-ui.js) and it
+ * never throws: no organization, a server without the route, or a remote org all mean "hidden".
+ * Admins see it while a head office workspace is set even with corporate playlists off, because
+ * emergency alerts work without them.
+ */
+function syncCorporateNav() {
+  const li = document.getElementById('corporateNavItem');
+  if (!li) return;
+  if (selectedRemoteOrg()) { li.style.display = 'none'; return; }
+  corporateSettings().then((s) => {
+    const hqFace = !!s && (s.can_author || s.is_admin);
+    const show = !!s && ((s.corporate_enabled && (hqFace || s.active_workspace_mandated)) || (s.is_admin && !!s.hq_workspace_id));
+    li.style.display = show ? '' : 'none';
+    const span = li.querySelector('span');
+    if (span) span.textContent = hqFace ? t('nav.corporate') : t('nav.head_office');
+    renderHqContextBar(s);
+  });
 }
 
 function updateSidebarUser() {
@@ -774,6 +845,8 @@ function updateSidebarUser() {
     const role = (() => { try { return JSON.parse(localStorage.getItem('user') || '{}').role; } catch (_) { return null; } })();
     nocNav.style.display = serversNav.style.display !== 'none' && role === 'platform_admin' ? '' : 'none';
   }
+
+  syncCorporateNav();
 
   let userEl = document.getElementById('sidebarUser');
   if (!userEl) {

@@ -139,6 +139,13 @@ const dashboardCsp = helmet.contentSecurityPolicy({
   },
 });
 
+/*
+ * FIRST: mark "an HTTP request is being served", for the corporate backstop's tripwire — a write to
+ * playlist_items with no actor INSIDE a request means some path lost its async context and was
+ * judged as system. See lib/corporate/actor.js. Costs one AsyncLocalStorage.run per request.
+ */
+app.use(require('./lib/corporate/actor').httpMarker);
+
 app.use(helmet({
   contentSecurityPolicy: false,        // we apply our own below, scoped to non-render paths
   crossOriginEmbedderPolicy: false,    // allow loading external widget content
@@ -153,6 +160,7 @@ app.use(helmet({
 app.use((req, res, next) => {
   if (req.path === '/' || req.path === '/landing.html') return next();
   if (req.path.startsWith('/player')) return next();
+  if (req.path.startsWith('/view/')) return next(); // view-only display page: the web player (routes/view.js)
   if (req.path === '/docs') return next(); // Redoc API reference needs a relaxed CSP
   if (req.path.startsWith('/api/widgets/') && req.path.endsWith('/render')) return next();
   if (req.path.startsWith('/api/widgets/') && req.path.endsWith('/data.json')) return next();
@@ -160,13 +168,14 @@ app.use((req, res, next) => {
   // Template previews carry their own sandboxing CSP (lib/templates/render.js).
   if (req.path.startsWith('/api/templates/preview/')) return next();
   if (req.path.startsWith('/api/templates/asset/')) return next();   // sets its own `sandbox` CSP
+  if (req.path.startsWith('/api/templates/demo/')) return next();    // the gallery preview: same CSP as a render
   if (req.path.startsWith('/api/kiosk/') && req.path.endsWith('/render')) return next();
   /*
    * ⚠️ AN HTML BUNDLE IS THE SAME CASE AS A WIDGET RENDER, and it fails the same way without this.
    * The document is flattened to data: URIs, so the dashboard's `script-src 'self'` blocks every
    * script in it, and `frame-ancestors 'self'` refuses the null-origin frame a player mounts it in
-   * — a blank rectangle with nothing in any log. What contains a bundle is the frame's sandbox
-   * attribute (allow-scripts, no allow-same-origin), not this policy.
+   * — a blank rectangle with nothing in any log. What contains a bundle is BUNDLE_SANDBOX_CSP,
+   * which the two bundle routes set themselves (see there), not this policy.
    */
   if (req.path.startsWith('/api/content/') && req.path.endsWith('/bundle')) return next();
   if (/^\/api\/content\/[^/]+\/bundle-preview\//.test(req.path)) return next();
@@ -248,10 +257,27 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(cors({
+/*
+ * ⚠️ /mcp HAS ITS OWN CORS POLICY: NONE, unless the operator names origins in MCP_CORS_ORIGINS.
+ *
+ * MCP clients are native apps and server-side connectors, not web pages, and the endpoint
+ * authenticates with a bearer token, never a cookie. Under the global policy below a self-hosted or
+ * development instance reflected ANY Origin with credentials, which no documented client needs and
+ * which the MCP transport spec warns against (validate Origin; DNS rebinding). Without an approved
+ * preflight a browser cannot send the Authorization header at all, so withholding CORS is what
+ * stops a web page driving /mcp. A browser-based client (e.g. the MCP Inspector in direct mode)
+ * still works once its origin is listed.
+ */
+const isMcpPath = (p) => p === '/mcp' || p.startsWith('/mcp/');
+const mcpCors = cors({
+  origin: (origin, cb) => cb(null, !!origin && config.mcpCorsOrigins.includes(origin)),
+  credentials: false,
+});
+const globalCors = cors({
   origin: corsOriginCheck,
   credentials: true,
-}));
+});
+app.use((req, res, next) => (isMcpPath(req.path) ? mcpCors : globalCors)(req, res, next));
 // Stripe webhook needs raw body (before express.json parses it)
 const stripeRouter = require('./routes/stripe');
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeRouter);
@@ -288,7 +314,15 @@ app.use((req, res, next) => {
  * with a size decided per upload kind — so the global JSON parser leaves that one path alone.
  */
 const jsonBody = express.json({ limit: '12mb' });
-app.use((req, res, next) => (req.path === '/api/templates/import' ? next() : jsonBody(req, res, next)));
+// Inbound automation hooks are signed over their exact bytes too, and arrive as XML (CAP) as often
+// as JSON — routes/hooks-in.js reads the raw body itself.
+/*
+ * ⚠️ /mcp PARSES ITS OWN BODY. Parsed here, malformed JSON became Express's HTML 400 (with a stack
+ * trace in development) instead of a JSON-RPC -32700 an MCP client can read, and the route's 1 MB
+ * limit never applied because this 12 MB parser had already consumed the body. routes/mcp.js has
+ * the parser and the error handler both.
+ */
+app.use((req, res, next) => (req.path === '/api/templates/import' || req.path.startsWith('/api/hooks/in/') || isMcpPath(req.path) ? next() : jsonBody(req, res, next)));
 const { sanitizeBody } = require('./middleware/sanitize');
 app.use(sanitizeBody);
 
@@ -461,6 +495,17 @@ function sendMarkdown(req, res, file, canonicalPath) {
   }
 }
 
+// /templates is rendered from the live catalog, so its rendition is too (the file on disk is only
+// the shell and its fallback copy).
+app.get('/templates.md', (req, res) => {
+  if (config.disableHomepage) return res.status(404).type('text/plain').send('not found');
+  const base = aiSurface.origin(req);
+  res.type('text/markdown; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Link', aiSurface.linkHeader(base));
+  res.send(mdRendition.toMarkdown(require('./routes/templates-gallery').build(), { url: `${base}/templates`, origin: base }));
+});
+
 app.get(/\.md$/, (req, res, next) => {
   const file = aiSurface.markdownSource(config.frontendDir, req.path);
   if (!file) return next();
@@ -553,6 +598,10 @@ app.get('/docs', (req, res) => {
 // The router falls back to the committed static page if that merge fails, because a URL named in a
 // contract should degrade to "our entries only" rather than to an error.
 app.use('/certified-hardware', require('./routes/certified-hardware'));
+// The public template gallery: the committed shell plus cards from the live official catalog.
+// Exact paths only, so nothing under /templates/ is claimed from the static files.
+app.get('/templates.html', (req, res) => res.redirect(301, '/templates'));
+app.get('/templates', require('./routes/templates-gallery').page);
 app.get('/certified-hardware/submit', (req, res) => {
   res.sendFile(path.join(config.frontendDir, 'certified-hardware-submit.html'));
 });
@@ -577,6 +626,12 @@ app.get(['/integrations', '/integrations/'], (req, res) => {
   if (req.path === '/integrations') return res.redirect(301, '/integrations/');
   res.sendFile(path.join(config.frontendDir, 'integrations', 'index.html'));
 });
+// The solutions hub (use cases: emergency alerts, meeting rooms, menu boards...) is served the same
+// way, for the same reason: static runs with index:false.
+app.get(['/solutions', '/solutions/'], (req, res) => {
+  if (req.path === '/solutions') return res.redirect(301, '/solutions/');
+  res.sendFile(path.join(config.frontendDir, 'solutions', 'index.html'));
+});
 
 // Serve frontend static files
 // JS/CSS/HTML: no-cache (always revalidate, uses ETag/304)
@@ -587,6 +642,9 @@ app.use(express.static(config.frontendDir, { index: false, etag: true, lastModif
   } else if (/\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|webp|mp4|webm)$/i.test(filePath)) {
     res.setHeader('Cache-Control', 'public, max-age=2592000'); // 30 days
   }
+  // The Power BI client is loaded by the bi-dashboard widget page, which a player frames in a
+  // sandboxed (opaque-origin) iframe — helmet's same-origin CORP would block the script there.
+  if (filePath.includes(`${path.sep}vendor${path.sep}powerbi${path.sep}`)) res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 }}));
 
 // Player HTML: dynamic route. Injects a small inline window.__playerConfig
@@ -596,14 +654,29 @@ app.use(express.static(config.frontendDir, { index: false, etag: true, lastModif
 // server-side endpoint defends in depth, but the kill switch saves network
 // traffic on the device too). Other player assets (JS, sw.js, etc) are still
 // served by the static middleware below; only index.html is dynamic.
-function sendPlayer(res, file) {
+/*
+ * A viewer shares its origin with any real web player in the same browser, and the player keeps its
+ * identity, playlist cache and clock in localStorage. So a viewer gets an in-memory localStorage that
+ * dies with the tab: it can never overwrite a real screen's state, and leaves nothing behind. ES5,
+ * because the legacy build is served to viewers too. (The player also namespaces its keys '__view'.)
+ */
+const VIEWER_STORAGE_SHIM = ' (function(){try{var m={};var s={getItem:function(k){return Object.prototype.hasOwnProperty.call(m,k)?m[k]:null;},'
+  + 'setItem:function(k,v){m[k]=String(v);},removeItem:function(k){delete m[k];},clear:function(){m={};},'
+  + 'key:function(i){return Object.keys(m)[i]||null;}};Object.defineProperty(s,"length",{get:function(){return Object.keys(m).length;}});'
+  + 'Object.defineProperty(window,"localStorage",{value:s,configurable:true});Object.defineProperty(window,"sessionStorage",{value:s,configurable:true});}catch(e){}})();';
+function sendPlayer(res, file, opts) {
   const playerHtmlPath = path.join(__dirname, 'player', file);
   fs.readFile(playerHtmlPath, 'utf8', (err, html) => {
     if (err) return res.status(500).type('text/plain').send('player HTML unavailable');
-    const reportingEnabled = String(process.env.PLAYER_DEBUG_REPORTING || 'on').toLowerCase() !== 'off';
+    // View-only viewers (routes/view.js) never report: there is no device to attribute it to.
+    const viewer = opts && opts.viewer;
+    const reportingEnabled = !viewer && String(process.env.PLAYER_DEBUG_REPORTING || 'on').toLowerCase() !== 'off';
     const inject =
       '  <script>window.__playerConfig = window.__playerConfig || {}; ' +
-      'window.__playerConfig.debugReporting = ' + JSON.stringify(reportingEnabled) + ';</script>\n';
+      'window.__playerConfig.debugReporting = ' + JSON.stringify(reportingEnabled) + ';' +
+      // `<` escaped so nothing in the object can close the script element.
+      (viewer ? ' window.__playerConfig.viewer = ' + JSON.stringify(viewer).replace(/</g, '\\u003c') + ';' + VIEWER_STORAGE_SHIM : '') +
+      '</script>\n';
     // Inject right before the debug-overlay.js script tag. If for any reason
     // the tag isn't present (e.g. file edited out), fall back to injecting
     // before </head> so the flag still lands.
@@ -627,7 +700,8 @@ function sendPlayer(res, file) {
       console.warn('[player] ST_PLAYER_VERSION marker not found — page will report a stale client_version');
     }
     modified = stamped;
-    res.type('html').setHeader('Cache-Control', 'no-cache');
+    // A viewer page carries its access token in the URL: never stored by a cache on the way.
+    res.type('html').setHeader('Cache-Control', viewer ? 'no-store' : 'no-cache');
     res.send(modified);
   });
 }
@@ -638,6 +712,13 @@ app.get(['/player', '/player/', '/player/index.html'], (req, res) => {
 
 app.get(['/player/legacy', '/player/legacy/', '/player/legacy/index.html', '/player/legacy.html'], (req, res) => {
   sendPlayer(res, 'legacy.html');
+});
+
+// Which web player can this screen's browser run? (player/check.html — ES3 on purpose, so it runs
+// on the very browsers that cannot run the player, and a photo of it diagnoses the screen.)
+app.get(['/player/check', '/player/check/'], (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile(path.join(__dirname, 'player', 'check.html'));
 });
 
 // #74/#75: serve the canonical schedule evaluator to the web player from the
@@ -1138,7 +1219,13 @@ const rateLimits = new Map();
  */
 const { canonicalLimitPath } = require('./lib/limit-paths');
 
-function rateLimit(windowMs, maxRequests) {
+/*
+ * `onReject(req, res, retryAfterSec)`, when given, writes the 429 itself — for a surface whose
+ * clients only understand their own error shape (/mcp answers JSON-RPC). The default body is
+ * unchanged. Every 429 now carries Retry-After, so a client in a loop knows how long to back off
+ * instead of guessing — which, for an agent, means retrying immediately.
+ */
+function rateLimit(windowMs, maxRequests, onReject) {
   return (req, res, next) => {
     // #100: key on the FULL path, not req.path. These limiters are mounted via
     // app.use('/api/auth/login', ...) etc., and Express strips the mount path, so
@@ -1168,7 +1255,9 @@ function rateLimit(windowMs, maxRequests) {
       // its job, several means a shared egress IP is denying real users. Identifiers are
       // salted-hashed inside the telemetry module and only ever counted. Response unchanged.
       try {
-        const endpoint = (req.originalUrl || req.url || req.path).split('?')[0];
+        // The bucket's SHAPE, never the raw path: a path can carry a credential (an inbound hook's
+        // URL is /api/hooks/in/<id>/<secret>), and this line goes to the server log.
+        const endpoint = normalisedPath;
         const ip = getClientIp(req);
         const ident = req.body && (req.body.email || req.body.username);
         const t = limiterTelemetry.recordRejection({ endpoint, ip, identifier: ident });
@@ -1179,6 +1268,10 @@ function rateLimit(windowMs, maxRequests) {
           { warn: t.distinctIdentifiers >= 3 },
         );
       } catch (_) { /* telemetry must never break the limiter */ }
+      // Seconds until the oldest hit in the window expires, i.e. until one more request fits.
+      const retryAfter = Math.max(1, Math.ceil((hits[0] + windowMs - now) / 1000));
+      res.set('Retry-After', String(retryAfter));
+      if (onReject) return onReject(req, res, retryAfter);
       return res.status(429).json({ error: 'Too many requests, try again later' });
     }
     hits.push(now);
@@ -1238,6 +1331,35 @@ app.use('/api/auth/users', rateLimit(60000, 20));
 // and an RFC 8058 one-click client posts `List-Unsubscribe=One-Click` urlencoded. That parser is not
 // global (see /api/hardware-submissions above for the same reason), so without it req.body is
 // undefined here and the token silently never arrives. Small limit — the body is two short fields.
+/*
+ * Tracked QR links (lib/qr-links.js): the public redirect a phone opens after scanning. No auth by
+ * design. Rate-limited per IP like the other public endpoints; the scan itself stores no IP.
+ */
+app.get('/q/:code', rateLimit(60000, 120), require('./routes/qr-links').redirect);
+/*
+ * View-only display access (lib/view-access.js, routes/view.js): /view/<token> and the network-only
+ * /view/screen/<id>, plus the read-only payload they poll. GET only, no session, no device row. The
+ * token is the credential, so each IP gets one bucket per route shape (lib/limit-paths.js), not one
+ * per token. 4s polling is 15/min per open viewer; 240/min leaves room for a wall of them on one NAT.
+ */
+app.get(['/view/:key', '/view/screen/:id', '/api/view/:kind/:key/payload'], rateLimit(60000, 240), require('./routes/view')({ sendPlayer }));
+// Canva OAuth callback (routes/canva.js): the browser returns from canva.com with no Authorization
+// header, so it cannot sit behind the JWT-only /api/canva mount below. It trusts only the signed
+// httpOnly transaction cookie set when the person pressed Connect.
+app.get('/api/canva/callback', rateLimit(60000, 30), require('./routes/canva').callback);
+// Inbound automation hooks (routes/hooks-in.js): the secret URL is the credential. Per-IP limit
+// here; each hook also has its own (30 a minute) inside, so one busy sender cannot starve another.
+app.use('/api/hooks/in', rateLimit(60000, 240), require('./routes/hooks-in'));
+
+/*
+ * Meeting-room display pages (lib/rooms/render.js) read their room's state and send book / end /
+ * check-in here. No session by design: the page runs in a sandboxed frame. Reads are what the
+ * widget's own render already shows; actions need the panel capability the server gave that screen
+ * (routes/room-panel.js), and are limited per device inside. The per-IP limit here is generous on
+ * purpose — every panel in a building polls from one NAT address.
+ */
+app.use('/api/room-panel', rateLimit(60000, 1200), require('./routes/room-panel'));
+
 app.use('/unsubscribe',
   rateLimit(60000, 20),
   express.urlencoded({ extended: false, limit: '4kb' }),
@@ -1254,7 +1376,8 @@ app.use('/unsubscribe',
  *
  * Rate-limited per IP: a model in a loop is the normal failure mode here, not an attacker.
  */
-app.use('/mcp', rateLimit(60000, 120), require('./routes/mcp'));
+const mcpRoute = require('./routes/mcp');
+app.use('/mcp', rateLimit(60000, 120, mcpRoute.rateLimited), mcpRoute);
 
 app.use('/api/auth', require('./routes/auth'));
 // Per-organization SSO configuration. Mounted under /api/organizations so the org id is the
@@ -1384,6 +1507,7 @@ app.get('/api/devices/:id/screenshot', (req, res) => {
 // send an Authorization header, so the dashboard fetches these with the Bearer
 // token; this verifies it and checks workspace membership. Anonymous players
 // (no token) still fall back to the playlist/widget reference gate. (#39)
+const { isReferencedForPlayers } = require('./lib/content-reference');
 function requesterCanAccessContent(req, content) {
   try {
     const m = (req.headers.authorization || '').match(/^Bearer (.+)$/);
@@ -1408,16 +1532,17 @@ app.get('/api/content/:id/file', (req, res) => {
   const content = db.prepare('SELECT * FROM content WHERE id = ?').get(req.params.id);
   if (!content) return res.status(404).json({ error: 'Content not found' });
   if (!content.filepath) return res.status(404).json({ error: 'No file (remote URL content)' });
-  const inPlaylist = db.prepare('SELECT id FROM playlist_items WHERE content_id = ? LIMIT 1').get(req.params.id);
-  // Scope widget lookup to widgets in the content's workspace — prevents a user
-  // in another workspace from unlocking this content by creating a widget that
-  // references the UUID. Phase 2.2d: keyed off content.workspace_id (was user_id).
-  // Perf note: LIKE scan on widgets.config is O(n) per request. Fine at current scale
-  // (<100 widgets); revisit with a content_widget_refs join table if this grows.
-  const inWidget = inPlaylist ? null : db.prepare('SELECT id FROM widgets WHERE workspace_id = ? AND config LIKE ? LIMIT 1').get(content.workspace_id, `%/api/content/${req.params.id}/%`);
-  if (!inPlaylist && !inWidget && !requesterCanAccessContent(req, content)) return res.status(403).json({ error: 'Content not assigned to any playlist or widget' });
+  // In a playlist, a widget in the content's workspace, or a device's standby image — see
+  // lib/content-reference.js for why each, and for the workspace scoping.
+  if (!isReferencedForPlayers(db, content) && !requesterCanAccessContent(req, content)) return res.status(403).json({ error: 'Content not assigned to any playlist or widget' });
   const safePath = path.resolve(config.contentDir, path.basename(content.filepath));
   if (!safePath.startsWith(path.resolve(config.contentDir))) return res.status(403).json({ error: 'Invalid path' });
+  // Storage backends (lib/storage): no local file, but stored copies — stream from whichever answers.
+  if (!fs.existsSync(safePath) && require('./lib/storage/serve').storedElsewhere(content)) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    return require('./lib/storage/serve').serveFromStorage(req, res, content, 'asset', { harden: hardenUploadResponse });
+  }
   // Scale-out (docs/scale-out.md): the row was copied, the bytes were not — fetch through, or (C3,
   // under a caches-content edge) store them here first and then serve the local file.
   if (config.primaryUrl && content.workspace_id && !fs.existsSync(safePath) &&
@@ -1456,9 +1581,23 @@ app.get('/api/content/:id/file', (req, res) => {
  * ephemeral id, and that id — not a token, not a session — is what the iframe loads. The mint lives
  * in routes/content.js behind auth; only the read is here, with the other public content routes.
  */
+/*
+ * ⚠️ THE ONE HEADER THAT CONTAINS A BUNDLE, on both routes that serve one. `sandbox allow-scripts`
+ * with NO allow-same-origin puts the document in an OPAQUE ORIGIN wherever it is loaded — framed by
+ * a player, or opened top-level in a tab. The second case is the one that matters: the bundle is
+ * a stranger's HTML served from the dashboard's own origin, and the dashboard's session JWT sits
+ * in localStorage there (frontend/js/api.js). A frame's sandbox attribute only applies when there
+ * IS a frame, so a bundle URL sent to an admin and opened in a tab used to run with that admin's
+ * token in reach. Same reasoning and same header as template renders (lib/templates/render.js).
+ * Scripts still run, so the bundle still works; it just cannot touch this origin. Nothing else
+ * goes in this policy: a bundle may fetch the feeds it was written for, from wherever.
+ */
+const BUNDLE_SANDBOX_CSP = 'sandbox allow-scripts';
+
 app.get('/api/content/:id/bundle-preview/:token', (req, res) => {
   const html = require('./lib/bundle-preview-store').get(req.params.token, req.params.id);
   if (html == null) return res.status(410).send('Preview expired');
+  res.setHeader('Content-Security-Policy', BUNDLE_SANDBOX_CSP);
   res.removeHeader('X-Frame-Options');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1474,11 +1613,11 @@ app.get('/api/content/:id/bundle-preview/:token', (req, res) => {
  * So the rule is the same one those two use — the content must be referenced by a playlist, or by a
  * widget in its own workspace, or the caller must hold a session for that workspace.
  *
- * ⚠️ AND IT MUST NOT GET `Content-Security-Policy: sandbox`. Every other response from the upload
- * paths does, via hardenUploadResponse, because uploaded bytes must never execute. A bundle is the
- * one exception in the product: it is HTML whose whole purpose is to run its own scripts. What
- * keeps it contained is the frame's sandbox attribute — allow-scripts with NO allow-same-origin, so
- * an opaque origin with no access to the player's storage — chosen by the player, not by us.
+ * ⚠️ AND IT MUST NOT GET hardenUploadResponse's script-blocking `sandbox`. Every other response
+ * from the upload paths does, because uploaded bytes must never execute. A bundle is the one
+ * exception in the product: it is HTML whose whole purpose is to run its own scripts. So it gets
+ * BUNDLE_SANDBOX_CSP instead — `sandbox allow-scripts`, NO allow-same-origin — set HERE by us,
+ * not left to the player's frame attribute, because a link opened in a tab has no frame.
  *
  * The bytes are never extracted to disk; lib/bundle-inline.js reads entries out of the stored
  * archive in memory. Rate limiting comes from the /api/content mount above, which matters here
@@ -1492,19 +1631,24 @@ app.get('/api/content/:id/bundle', async (req, res) => {
   if (content.mime_type !== htmlBundle.BUNDLE_MIME || !content.filepath) {
     return res.status(404).json({ error: 'Not an HTML bundle' });
   }
-  const inPlaylist = db.prepare('SELECT id FROM playlist_items WHERE content_id = ? LIMIT 1').get(req.params.id);
-  const inWidget = inPlaylist ? null : db.prepare('SELECT id FROM widgets WHERE workspace_id = ? AND config LIKE ? LIMIT 1').get(content.workspace_id, `%/api/content/${req.params.id}/%`);
-  if (!inPlaylist && !inWidget && !requesterCanAccessContent(req, content)) {
+  if (!isReferencedForPlayers(db, content) && !requesterCanAccessContent(req, content)) {
     return res.status(403).json({ error: 'Content not assigned to any playlist or widget' });
   }
 
-  const safePath = path.resolve(config.contentDir, path.basename(content.filepath));
+  let safePath = path.resolve(config.contentDir, path.basename(content.filepath));
   if (!safePath.startsWith(path.resolve(config.contentDir))) return res.status(403).json({ error: 'Invalid path' });
 
   try {
+    // The inliner reads the archive's central directory from a FILE; a bundle held only in a
+    // storage backend is fetched once into the storage cache (never into contentDir) first.
+    if (!fs.existsSync(safePath) && require('./lib/storage/serve').storedElsewhere(content)) {
+      safePath = await require('./lib/storage/locations').ensureLocalFile(content, 'asset');
+      if (!safePath) return res.status(404).json({ error: 'Bundle not found' });
+    }
     const { inlineBundle } = require('./lib/bundle-inline');
     const entry = content.bundle_entry || 'index.html';
     const out = await inlineBundle(safePath, entry);
+    res.setHeader('Content-Security-Policy', BUNDLE_SANDBOX_CSP);
     // Framed by a player at a null origin, so SAMEORIGIN would refuse it — the same reason the
     // widget render route drops this header.
     res.removeHeader('X-Frame-Options');
@@ -1558,9 +1702,7 @@ app.get('/api/content/:id/thumbnail', (req, res) => {
   // referenced by a playlist or by a widget IN THE CONTENT'S WORKSPACE. Without
   // this, any anonymous caller holding a content UUID could pull any tenant's
   // thumbnail (the /file route already had this check; the thumbnail route did not).
-  const inPlaylist = db.prepare('SELECT id FROM playlist_items WHERE content_id = ? LIMIT 1').get(req.params.id);
-  const inWidget = inPlaylist ? null : db.prepare('SELECT id FROM widgets WHERE workspace_id = ? AND config LIKE ? LIMIT 1').get(content.workspace_id, `%/api/content/${req.params.id}/%`);
-  if (!inPlaylist && !inWidget && !requesterCanAccessContent(req, content)) return res.status(403).json({ error: 'Content not assigned to any playlist or widget' });
+  if (!isReferencedForPlayers(db, content) && !requesterCanAccessContent(req, content)) return res.status(403).json({ error: 'Content not assigned to any playlist or widget' });
   // YouTube (and any future remote-sourced) content stores thumbnail_path as a remote
   // http(s) URL, not a local file. Proxy it instead of resolving it to a local path that
   // doesn't exist (contentDir/hqdefault.jpg -> ENOENT spam). Local thumbnails are
@@ -1571,6 +1713,9 @@ app.get('/api/content/:id/thumbnail', (req, res) => {
   // See /file — cross-origin so sandboxed widget iframes can load it.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  if (!fs.existsSync(safePath) && require('./lib/storage/serve').storedElsewhere(content)) {
+    return require('./lib/storage/serve').serveFromStorage(req, res, content, 'thumb', { harden: hardenUploadResponse });
+  }
   hardenUploadResponse(res, content.thumbnail_path);
   res.sendFile(safePath);
 });
@@ -1698,6 +1843,14 @@ app.get('/api/widgets/:id/data.json', (req, res, next) => { req._skipAuth = true
 app.post('/api/widgets/:id/telemetry', (req, res, next) => { req._skipAuth = true; next(); }); // diag widget reports frame stats (null-origin iframe)
 app.get('/api/widgets/:id/telemetry', (req, res, next) => { req._skipAuth = true; next(); });
 app.get('/api/widgets/preview-session/:id', (req, res, next) => { req._skipAuth = true; next(); });
+// bi-dashboard (lib/bi/widget.js): the Grafana image and the Power BI / Tableau embed token a
+// screen's widget page fetches. Public like /render, and for the same reason (a null-origin frame).
+app.get('/api/widgets/:id/bi-image.png', (req, res, next) => { req._skipAuth = true; next(); });
+app.get('/api/widgets/:id/bi-token', (req, res, next) => { req._skipAuth = true; next(); });
+// Social walls (lib/social/widget.js): the posts and cached images a wall's page fetches. Public for
+// the same reason (a null-origin frame), and limited to what that wall shows.
+app.get('/api/widgets/:id/social.json', (req, res, next) => { req._skipAuth = true; next(); });
+app.get('/api/widgets/:id/social-media/:hash', (req, res, next) => { req._skipAuth = true; next(); });
 /*
  * ⚠️ AI GENERATION IS HEAVIER THAN THE PREVIEW ROUTES BELOW AND WAS THE ONLY ONE UNLIMITED.
  *
@@ -1716,11 +1869,34 @@ app.use('/api/ai/generate-design', rateLimit(60000, 10));
  * generations a minute from a held Enter key.
  */
 app.use('/api/ai/generate-layered', rateLimit(60000, 3));
+/*
+ * Hosted images spend real money on a PLATFORM key, so they get the same cap as the BYO image
+ * routes. The ledger already refuses to overdraw; this stops a loop from burning a balance down.
+ */
+app.use('/api/ai/hosted/generate', rateLimit(60000, 10));
+app.use('/api/ai/hosted/checkout', rateLimit(60000, 10));
+{
+  /*
+   * Hosted-AI housekeeping. A reservation left 'pending' is an attempt a crash interrupted: refund
+   * it (fail closed, in the customer's favour). Also nags daily while the rate card is past its
+   * re-verify date. Both are no-ops on an instance with no platform provider keys.
+   */
+  const aiHousekeeping = () => {
+    try {
+      const n = require('./lib/ai-credits').sweepStale();
+      if (n) console.warn(`[ai-hosted] refunded ${n} abandoned reservation(s)`);
+      require('./lib/ai-hosted').warnIfRateCardStale();
+    } catch (e) { console.error('[ai-hosted] housekeeping failed:', e && e.message); }
+  };
+  setTimeout(aiHousekeeping, 30000).unref();
+  setInterval(aiHousekeeping, 10 * 60 * 1000).unref();
+}
 app.use('/api/widgets/preview', rateLimit(60000, 30)); // base64 inline = memory-intensive
 app.use('/api/widgets/preview-session', rateLimit(60000, 30)); // preview session creation retains rendered HTML in memory for 5min
 // `/test` triggers an outbound fetch of an arbitrary calendar feed; cap it so a single
 // workspace cannot fan out unbounded requests to third-party URLs.
 app.use('/api/data-sources/test', rateLimit(60000, 10));
+app.use('/api/cap-feeds/test', rateLimit(60000, 10));   // fetches an arbitrary public URL, like the data-source test
 app.post('/api/plugin-submissions', rateLimit(3600000, 10)); // 10 plugin zips per hour per IP
 app.post('/api/admin/plugins/submissions', rateLimit(3600000, 20));
 app.get('/api/kiosk/:id/render', (req, res, next) => { req._skipAuth = true; next(); });
@@ -1735,6 +1911,7 @@ app.get('/api/kiosk/:id/render', (req, res, next) => { req._skipAuth = true; nex
   const tplRoutes = require('./routes/templates');
   tplPublic.get('/preview/:token', (req, res, next) => tplRoutes.handle(req, res, next));
   tplPublic.get('/thumb/:sha', (req, res, next) => tplRoutes.handle(req, res, next));
+  tplPublic.get('/demo/:sha', (req, res, next) => tplRoutes.handle(req, res, next));
   tplPublic.get(/^\/asset\/[0-9a-f]{64}\/.+$/, (req, res, next) => tplRoutes.handle(req, res, next));
   app.use('/api/templates', rateLimit(60000, 120), tplPublic);
 }
@@ -1757,6 +1934,14 @@ for (const r of AGENCY_ROUTERS) {
   // reach ONLY here; agencyGate enforces the playlist allowlist + bound workspace.
   app.use(r.path, bearerAuth, resolveTenancy, agencyGate, require(r.mod));
 }
+
+/*
+ * Corporate refusals that escaped a route as an exception — a CorporateError from the guard, or the
+ * backstop's RAISE(ABORT, 'CORPORATE_LOCKED') surfacing as a SqliteError — answered as the JSON a
+ * client can act on (403/409 + code) instead of Express's default 500 page with a stack trace.
+ * Anything else is passed on untouched, so every other error behaves exactly as before.
+ */
+app.use(require('./lib/corporate/guard').errorHandler);
 
 /*
  * Plugins (P1). Off unless PLUGINS_ENABLED is set: boot() returns without scanning or
@@ -1899,6 +2084,18 @@ app.get('/api/release-notes', (req, res) => {
 app.use('/api/status', require('./routes/status'));
 
 /*
+ * The zone this server sees the caller in, for the Pi/Debian installers to set a real time zone
+ * on a fresh image (Pi OS ships Europe/London). Answered from Cloudflare's cf-timezone header, so
+ * screentinker.com can say and a self-hosted server without Cloudflare answers null (the dashboard
+ * then offers the pairing admin's browser zone instead). ⚠️ no-store: one cached answer would
+ * give every Pi the first caller's zone.
+ */
+app.get('/api/public/timezone', (req, res) => {
+  res.set('Cache-Control', 'private, no-store');
+  res.json({ timezone: require('./lib/device-timezone').requestTimezone(req) });
+});
+
+/*
  * Opt-in install statistics — the COLLECTOR side, plus the public aggregate the marketing
  * page reads. Both live in routes/telemetry-collector.js; both are mounted only when
  * TELEMETRY_COLLECTOR=1, so a normal self-hosted install exposes neither.
@@ -1925,6 +2122,10 @@ app.use('/api/billing', bearerAuth, require('./routes/billing'));
 // RGB565, etc.) for MCUs that call HTTP instead of running a browser. Handles its own dual
 // auth (device token OR API token) so it cannot use the PUBLIC_ROUTERS bearerAuth loop.
 app.use('/api/embedded', require('./routes/embedded'));
+// Player raster — the same Chromium pipeline, as full-colour frames for a player that cannot run
+// HTML (the Roku: GET /api/player/raster). Device-token auth like the embedded routes, and for the
+// same reason outside the PUBLIC_ROUTERS loop. Rate-limited per device inside the router.
+app.use('/api/player', require('./routes/player-raster'));
 
 
 // Activity logging middleware now mounted earlier (just before the workspace
@@ -1959,7 +2160,19 @@ winCache.start();                                    // native Windows player: n
 // /api/win/update/check + /download/win — the same factory as the Pi route (routes/native-update.js),
 // plus the device-less sha256 lookup the SYSTEM helper service makes before running an installer.
 require('./routes/win-update')(app);
+const macCache = require('./lib/mac-cache');
+macCache.start();                                    // native macOS player: newest ScreenTinker-<ver>.dmg + its sha256
+// /download/mac only — a Mac never updates itself, so the factory mounts no update check for it.
+require('./routes/mac-update')(app);
+// The OPTIONAL audience-counting add-on for the Pi/Windows players (OpenCV + face model, per
+// platform), fetched by their installers only when the operator ticks it. Never pushed to a screen.
+require('./lib/audience-addon').start();
+require('./routes/audience-addon')(app);
 require('./lib/revision-retention').start(require('./db/database').db);   // version history: bounded retention, daily
+// Storage backends (docs/storage.md): resume a migration copier a restart interrupted (it never
+// commits or drains by itself), honour STORAGE_DRAIN_AFTER_HOURS, probe open breakers. Idle on an
+// install that never configured storage — there is nothing in storage_migrations to resume.
+require('./lib/storage/migrate').startBackground();
 const { getBand } = require('./services/loop-lag');  // #146 Item C: critical-band download shed
 app.get('/api/update/check', (req, res) => {
   const currentVersion = req.query.version;
@@ -2012,8 +2225,28 @@ app.get('/api/update/check', (req, res) => {
   // Channel selection. An opted-in display is compared against — and offered — the BETA build's
   // declared version, not the server's. Falls back to stable whenever no usable beta is published,
   // so ticking the box on a server with no beta build is a no-op, not a broken display.
-  const onBeta = betaChannel && apkCache.betaAvailable();
+  // A beta behind the stable release does not count (lib/apk-cache.js betaSuperseded): the display
+  // is then compared against stable, and decide()'s beta exemption lets it be offered.
+  const onBeta = betaChannel && apkCache.betaAvailable(latestVersion);
   if (onBeta) latestVersion = apkCache.getBeta().version;
+
+  /*
+   * Health-checked rollout (lib/ota-rollout.js): a stable version reaches screens in waves and halts
+   * itself if the screens that took it do worse. Android cannot downgrade, so a halt here only stops
+   * the spread. Beta and forced checks skip the waves; nothing skips a halt.
+   */
+  if (!onBeta) {
+    const g = require('./lib/ota-rollout').gate('android', apkCache.get(), { deviceId, currentVersion, forced });
+    const isUpgrade = currentVersion && (otaBreaker.cmp(String(currentVersion), latestVersion) || 0) < 0;
+    if ((g.action === 'wait' || g.action === 'halted') && isUpgrade) {
+      logOtaCheck(deviceId, currentVersion, latestVersion, false, g.reason);
+      return res.json({
+        latest_version: latestVersion, current_version: currentVersion || 'unknown',
+        update_available: false, reason: g.reason, download_url: '/download/apk', apk_size: 0, apk_modified: 0,
+        retry_after_seconds: 1800,
+      });
+    }
+  }
 
   // The hold-my-prerelease guard only applies when we are NOT actively serving a beta: on the beta
   // channel the beta build is the target, so normal comparison does the right thing.
@@ -2225,6 +2458,21 @@ app.use('/uploads/content', (req, res, next) => {
    */
   res.removeHeader('Cache-Control');
   res.removeHeader('Content-Disposition');
+  /*
+   * Storage backends (lib/storage): the name belongs to a row whose bytes are in a bucket (or on a
+   * copy that is not this disk). Streamed from whichever stored copy answers, under the same
+   * immutable header the static route sets — the name changes whenever the bytes do, which is what
+   * makes immutable true. This is what lets every existing player keep building
+   * /uploads/content/<filepath> while the file lives in S3, Azure or MinIO: no player change needed.
+   */
+  {
+    const hit = require('./lib/storage/serve').rowForUploadName(require('./db/database').db, path.basename(req.path));
+    if (hit) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      return require('./lib/storage/serve').serveFromStorage(req, res, hit.row, hit.kind, { harden: hardenUploadResponse, cacheControl: 'public, max-age=2592000, immutable' });
+    }
+  }
   // Scale-out (docs/scale-out.md): a copied workspace's file lives on the primary. Only a name that
   // belongs to a copied content row is fetched through; anything else stays the miss above.
   // C3: under a caches-content edge the fetch-through STORES the file first, then serves it
@@ -2282,7 +2530,32 @@ startScheduler(io);
 // #157: auto-deactivate expired content + republish affected playlists
 const { startContentExpiry } = require('./services/content-expiry');
 startContentExpiry(io);
+// Corporate local slots: hourly tidy of unused compositions and unreachable retired slots.
+require('./services/corporate-sweep').startCorporateSweep();
+// Corporate state an older server version may have changed (a rollback, then this upgrade): drop the
+// composition cache, republish head office playlists that version published, report empty alerts.
+try { require('./lib/corporate/reconcile').reconcileAtBoot(require('./db/database').db, io); } catch (e) { console.error('[corporate] boot reconcile:', e && e.message); }
+// Head office emergency alerts: restore any live "Activate now" from the table, arm its expiry
+// timers and the 30-second belt sweep (lib/corporate/emergency-live.js).
+require('./lib/corporate/emergency-live').init(io);
 require('./lib/smart-playlist').start(io);
+require('./lib/ota-rollout').start();   // player rollouts: waves, automatic halt and rollback
+require('./lib/local-conditions').start(io);   // local weather for weather conditions
+// Dynamic device groups: a backstop for membership inputs changed by a path that does not reconcile
+// (an import, a mesh sync, a direct fix-up). A sweep that finds nothing to change writes nothing.
+{
+  const t = setInterval(() => {
+    try { require('./lib/device-group-rules').sweep(db, io); } catch (e) { console.warn(`[groups] sweep failed: ${e.message}`); }
+  }, 5 * 60 * 1000);
+  if (t.unref) t.unref();
+}
+require('./lib/cap/feeds').start(io);   // CAP emergency feeds: polling, expiry, pushes
+require('./lib/canva').start(io);       // Canva: re-export linked designs that changed
+require('./lib/cloud-folders').start(io);   // SharePoint/OneDrive folder syncs
+require('./lib/automation/overrides').setIo(io);   // automation: timed playlist overrides
+require('./lib/automation/events').start();          // automation: REST-hook deliveries, screen up/down events
+require('./lib/social/feeds').start(io);   // social walls: fetch feeds, cache images
+require('./lib/rooms/service').start();   // meeting rooms: release meetings nobody checked in to (off unless an org turns it on)
 
 // Start alert service
 const { startAlertService } = require('./services/alerts');
@@ -2616,18 +2889,59 @@ app.post('/api/provision/pair', requireAuth, resolveTenancy, checkDeviceLimit, (
   // device API responses, so Math.random's recoverable state would let one tenant predict
   // another's.
   const settingsPin = sixDigitCode();
-  db.prepare("UPDATE devices SET pairing_code = NULL, name = ?, user_id = ?, workspace_id = ?, status = 'online', settings_pin = ?, updated_at = strftime('%s','now') WHERE id = ?")
+  // ⚠️ AUDIT F07: a row arriving in a workspace it did not come from carries NO tenant-scoped
+  // assignment across. The claim used to leave playlist_id/layout_id/default_content_id/team_id
+  // untouched, and the #150 restore had already written the PREVIOUS tenant's values onto the
+  // workspace-less provisioning row — device_resolved_playlist falls back to d.playlist_id and
+  // the payload builder loads it with no workspace check, so tenant B's screen played tenant A's
+  // content. Cleared whenever the row's workspace differs from the claiming one (a provisioning
+  // row's is always NULL); the same-workspace restore below puts back what genuinely belongs here.
+  const crossWorkspace = device.workspace_id !== req.workspaceId;
+  db.prepare(`UPDATE devices SET pairing_code = NULL, name = ?, user_id = ?, workspace_id = ?, status = 'online', settings_pin = ?,
+                ${crossWorkspace ? 'playlist_id = NULL, layout_id = NULL, default_content_id = NULL, team_id = NULL,' : ''}
+                updated_at = strftime('%s','now') WHERE id = ?`)
     .run(deviceName, req.user.id, req.workspaceId, settingsPin, device.id);
 
   // Link fingerprint to user
   db.prepare("UPDATE device_fingerprints SET user_id = ?, device_id = ? WHERE device_id = ?")
     .run(req.user.id, device.id, device.id);
 
+  // #150 settings restore — ⚠️ AUDIT F07: runs HERE, after workspace_id is set, not at
+  // provisioning time where the row had no workspace and the guard was a no-op. applyToDevice
+  // applies the snapshot only if it was taken in THIS workspace; a second-hand panel claimed
+  // elsewhere gets nothing of its previous owner's. An operator-typed name beats the restored one;
+  // the restored name beats the auto-generated "Display N".
+  let pairedName = deviceName;
+  try {
+    const restored = require('./lib/device-settings').restoreOnClaim(device.id);
+    if (restored) {
+      if (name) db.prepare('UPDATE devices SET name = ? WHERE id = ?').run(name, device.id);
+      else if (restored.device_name) pairedName = restored.device_name;
+      console.log(`[#150] restored saved settings for re-paired device ${device.id}`);
+    }
+  } catch (e) { console.warn(`[#150] settings restore failed for ${device.id}: ${e.message}`); }
+
+  // Join any dynamic group whose rules this screen matches, before it asks for its first playlist.
+  require('./lib/device-group-rules').reconcileDeviceAsSystem(db, null, device.id);
+
   // Notify the device via WebSocket — or, scale-out C2, through the replica it is attached to.
-  const pairedMsg = { device_id: device.id, name: deviceName, settings_pin: settingsPin };
+  const pairedMsg = { device_id: device.id, name: pairedName, settings_pin: settingsPin };
   const pairedRoom = deviceNs.adapter.rooms.get(device.id);
   if (pairedRoom && pairedRoom.size > 0) deviceNs.to(device.id).emit('device:paired', pairedMsg);
   else if (device.attached_node_id) { try { require('./lib/mesh/command-relay').relayToAttached(db, device.id, 'device:paired', pairedMsg); } catch (e) { /* the screen learns on its next register */ } }
+
+  // Time zone fallback: a display still on its image's default zone (Pi OS ships Europe/London)
+  // gets the pairing admin's browser zone, when it can set its own (system.time: the native
+  // players). Only for a LAN server's sake — on screentinker.com the installer already asked
+  // /api/public/timezone. Never blocks the pairing; an override or a chosen zone is left alone.
+  try {
+    const row = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
+    const tz = require('./lib/device-timezone').pairingTimezone(row, req.body && req.body.browser_timezone);
+    if (tz) {
+      const r = require('./lib/device-command').deliverCommand(deviceNs, row, 'set_timezone', { timezone: tz });
+      console.log(`[pair] ${device.id}: time zone ${row.reported_timezone || '(none)'} → ${tz} from the pairing browser (${r.status})`);
+    }
+  } catch (e) { console.warn(`[pair] time zone fallback failed for ${device.id}: ${e.message}`); }
 
   const updated = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id);
   require('./lib/device-sanitize').stripDeviceSecrets(updated); // never leak device_token to clients
@@ -2702,6 +3016,7 @@ app.get(['/download', '/download/'], (req, res) => {
     brightsign: { exists: bsPackage.available(), version: bsPackage.version() },
     deb: debCache.get(),
     exe: winCache.get(),
+    dmg: macCache.get(),
   }, base));
 });
 
@@ -2723,7 +3038,7 @@ app.get('/download/apk', (req, res) => {
   // Serve the slot the check advertised. If these disagree the client is handed bytes whose
   // size does not match apk_size, which is how an OTA loop starts — so both sides resolve
   // the channel the same way, and both fall back to stable identically.
-  const apk = apkCache.forChannel(req.query.channel === 'beta' ? 'beta' : 'stable');
+  const apk = apkCache.forChannel(req.query.channel === 'beta' ? 'beta' : 'stable', apkCache.get().version || VERSION);
   if (!apk.exists) {
     return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>APK Not Available</title><style>body{font-family:-apple-system,system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#0f172a;color:#e2e8f0}div{text-align:center;max-width:480px;padding:32px 24px}h1{color:#f87171;font-size:22px;margin:0 0 8px}p{line-height:1.6;color:#94a3b8;font-size:14px;margin:0 0 20px}code{background:#1e293b;padding:2px 6px;border-radius:4px;font-size:13px}a{color:#3b82f6;text-decoration:none}a:hover{text-decoration:underline}.btn{display:inline-block;background:#2563eb;color:#fff;padding:10px 20px;border-radius:6px;font-size:14px;font-weight:500;text-decoration:none;margin-bottom:24px}.btn:hover{background:#1d4ed8;text-decoration:none}.muted{font-size:12px;color:#64748b}</style></head><body><div><h1>APK Not Available</h1><p>The Android APK has not been compiled yet.</p><a class="btn" href="https://github.com/screentinker/screentinker/releases/latest" target="_blank" rel="noopener">&#128230; Download from GitHub Releases</a><p class="muted">Self-hosting? Mount a built APK at <code>/data/ScreenTinker.apk</code> to serve it from this instance. Or use the <a href="/player">web player</a> instead.</p></div></body></html>`);
   }
@@ -2855,7 +3170,7 @@ app.get(['/tizen', '/tizen/'], (req, res) => {
  * answering 200 with unrelated markup learns to distrust the whole directory. Flagged in
  * docs/seo-directory-listings.md and unfixed until now.
  */
-const CONTENT_PREFIXES = ['/guides/', '/integrations/'];
+const CONTENT_PREFIXES = ['/guides/', '/integrations/', '/solutions/'];
 
 /*
  * ⚠️ A MISSING ASSET IS A 404, NEVER THE APP SHELL. Every app route is `/#/…`, so a path ending in a
@@ -3011,6 +3326,23 @@ server.listen(listenPort, '0.0.0.0', () => {
     }
   } catch (e) {
     console.error(`[EMAIL] config check failed: ${e.message}`);
+  }
+
+  // Settings that look applied but are not, and a JWT_SECRET that changed under saved secrets.
+  // Both used to fail silently; see lib/config-check.js.
+  try {
+    const cc = require('./lib/config-check');
+    for (const m of cc.envFileWarnings({ serverDir: __dirname })) console.warn(m);
+    const appSettings = require('./lib/app-settings');
+    const sk = cc.checkSecretKey({
+      secret: config.jwtSecret,
+      get: (k) => appSettings.get(k, undefined),
+      set: (k, v) => appSettings.set(k, v),
+      certsDir: config.certsDir,
+    });
+    for (const m of sk.messages) console.error(m);
+  } catch (e) {
+    console.error(`[config] check failed: ${e.message}`);
   }
 
   // Media tooling diagnostics — ffmpeg/ffprobe are SYSTEM dependencies that video

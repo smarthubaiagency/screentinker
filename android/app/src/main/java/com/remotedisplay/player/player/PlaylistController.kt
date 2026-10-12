@@ -22,6 +22,9 @@ data class PlaylistItem(
     // Changes whenever the widget is edited. Carried into the render URL so an edited widget gets
     // a URL the player has not seen, which is what defeats the deliberate same-URL WebView reuse.
     val widgetRev: Long = 0L,
+    // A meeting-room display's panel capability (server lib/rooms/service.js panelToken): lets the
+    // page book the room. Carried in the render URL's FRAGMENT, which never reaches a server log.
+    val widgetPanel: String = "",
     // Bumped by the server when an asset's BYTES change under a stable content id (the dashboard's
     // "replace file"). The cache is keyed on it: without one, a replaced asset would keep playing
     // the copy already on disk forever, because nothing about the id or the URL would differ.
@@ -47,7 +50,9 @@ data class PlaylistItem(
      * player that only renders the widget iframe makes no sound, which is why this exists. */
     val slideAudio: SlideAudio? = null,
     // feat/transition-engine: the resolved GL transition this item plays INTO (null = hard cut).
-    val transition: TransitionSpec? = null
+    val transition: TransitionSpec? = null,
+    // An emergency alert card: a change to the set of these is applied at once (see Interrupt).
+    val interrupt: Boolean = false
 ) {
     /*
      * ⚠️  WHICH ITEM THIS IS, FOR CONTINUITY — AND IT IS NOT contentId.
@@ -92,6 +97,7 @@ class PlaylistController(
         // this, so a bad/zero duration on any path can't peg the main thread (see #widget
         // zero-duration self-loop — a solo fullscreen widget with duration_sec=0).
         const val MIN_ADVANCE_MS = 500L
+        const val OFFLINE_COVER_RECHECK_MS = 15_000L
     }
 
     private val items = mutableListOf<PlaylistItem>()
@@ -142,6 +148,11 @@ class PlaylistController(
      */
     private var contentUsable: (PlaylistItem) -> Boolean = { false }
     fun setContentUsableCheck(f: (PlaylistItem) -> Boolean) { contentUsable = f }
+
+    // Offline fallback (OfflineGate): can this item load right now? Injected like the checks above;
+    // the default always says yes, so a controller that is not given one behaves exactly as before.
+    private var cannotLoad: (PlaylistItem) -> Boolean = { false }
+    fun setOfflineCheck(f: (PlaylistItem) -> Boolean) { cannotLoad = f }
 
     // Slide audio. Injected like contentReady above, for the same reason: this class should not
     // know where the server URL is stored, and a controller with neither set still behaves exactly
@@ -328,6 +339,12 @@ class PlaylistController(
         get() = currentItem?.contentId
 
     fun updatePlaylist(assignmentsJson: JSONArray, order: String = "sequential") {
+        // An alert raised or cleared is never parked behind a visitor's session: drop the hold and
+        // apply it (playing the card hides the interactive page, which closes its session record).
+        if (held && interruptKeysOf(assignmentsJson) != Interrupt.keys(items)) {
+            Log.i("PlaylistController", "emergency alert changed — ending the interactive hold")
+            dropHold()
+        }
         if (held) {
             Log.i("PlaylistController", "playlist update parked until the interactive session ends")
             parkedUpdate = assignmentsJson to order
@@ -357,6 +374,7 @@ class PlaylistController(
                     muted = obj.optInt("muted", 0) == 1,
                     widgetId = if (obj.isNull("widget_id")) null else obj.optString("widget_id", "").ifEmpty { null },
                     widgetRev = obj.optLong("widget_rev", 0L),
+                    widgetPanel = if (obj.isNull("widget_panel")) "" else obj.optString("widget_panel", ""),
                     contentRev = obj.optLong("content_rev", 0L),
                     widgetType = if (obj.isNull("widget_type")) null else obj.optString("widget_type", "").ifEmpty { null },
                     widgetConfig = when (val wc = obj.opt("widget_config")) {
@@ -375,7 +393,8 @@ class PlaylistController(
                     meta = obj.optJSONObject("meta"),
                     weight = obj.optInt("weight", 1).coerceAtLeast(1),
                     transition = Transitions.parse(obj.optJSONObject("transition")),
-                    slideAudio = parseSlideAudio(obj.optJSONObject("audio"))
+                    slideAudio = parseSlideAudio(obj.optJSONObject("audio")),
+                    interrupt = obj.optBoolean("interrupt", false)
                 )
             )
         }
@@ -409,6 +428,8 @@ class PlaylistController(
             } + "|" + (it.playFrom ?: "") + "~" + (it.playUntil ?: "") + "|" + (if (it.enabled) "1" else "0") + "|" + (it.fitMode ?: "") + "|" + (it.transition?.sig() ?: "") +
             "|" + (it.playWhen?.let { c -> c.type + c.path + c.op + (c.value ?: "") } ?: "") +
             "|" + it.tags.joinToString(",") + "|" + (it.meta?.toString() ?: "")
+        // Compared BEFORE items is replaced: an alert raised or cleared skips the deferral below.
+        val interruptChanged = Interrupt.changed(Interrupt.keys(items), Interrupt.keys(newItems))
         val oldContentIds = items.map(::sig)
         val newContentIds = newItems.map(::sig)
         val playlistChanged = oldContentIds != newContentIds
@@ -447,12 +468,17 @@ class PlaylistController(
         // explicit "stop showing that" from an operator, not an item rotating out — deferring it
         // meant selecting "no playlist" left the old content up indefinitely, which is the opposite
         // of what was asked for and looked like the setting had done nothing.
+        // Nor is a ONE-ITEM outgoing playlist: it has no next item to rotate to (PendingSwap guard 3,
+        // web/Tizen `outgoingNeverAdvances`), so its replacement is applied now.
         if (PendingSwap.shouldDefer(
                 isRunning = isRunning,
                 wallFollower = wallFollower,
                 hasContentOnScreen = hasContentOnScreen,
                 currentlyPlayingId = currentlyPlayingId,
                 newContentIds = newItems.map { it.itemKey },
+                interruptChanged = interruptChanged,
+                // ⚠️ The OUTGOING list: `items` has not been replaced yet at this point.
+                outgoingCount = items.size,
             )) {
             var succ: String? = null
             if (items.isNotEmpty()) {
@@ -467,6 +493,7 @@ class PlaylistController(
             armPendingSwapDeadline()
             return
         }
+        if (interruptChanged) Log.i("PlaylistController", "Emergency alert raised/cleared — swapping now, not at the next advance")
         // A non-deferred structural update supersedes any pending swap.
         pendingItems = null
         pendingSuccessorId = null
@@ -524,6 +551,19 @@ class PlaylistController(
         } else {
             currentIndex = 0
         }
+    }
+
+    /** The interrupt keys of a raw payload, for the hold check (which runs before parsing). */
+    private fun interruptKeysOf(arr: JSONArray): Set<String> {
+        val out = HashSet<String>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (!o.optBoolean("interrupt", false)) continue
+            val cid = if (o.isNull("content_id")) "" else o.optString("content_id", "")
+            val wid = if (o.isNull("widget_id")) "" else o.optString("widget_id", "")
+            out.add("$cid|$wid")   // itemKey's shape
+        }
+        return out
     }
 
     fun removeContent(contentId: String) {
@@ -586,6 +626,7 @@ class PlaylistController(
         cancelAdvance()
         cancelRetry()
         cancelPendingSwapDeadline()   // else a stopped controller can still fire next()
+        cancelCover(); offlineCoverShowing = false; failingSince = 0L
         hasContentOnScreen = false
         pendingItems = null
         pendingSuccessorId = null
@@ -707,12 +748,14 @@ class PlaylistController(
      * (durationSec = how long to stay on the channel), not by clip length. A dwell of 0/absent means
      * "stay until the schedule makes it ineligible"; a dwell > 0 advances on a timer like any item.
      */
-    private fun isLiveStream(item: PlaylistItem): Boolean = item.mimeType == "video/hls" || item.mimeType == "video/rtsp"
+    private fun isLiveStream(item: PlaylistItem): Boolean = item.mimeType == "video/hls" || item.mimeType == "video/rtsp" || LiveInput.isLiveInput(item.mimeType)
 
     private fun playCurrentItem() {
         cancelAdvance()
         cancelRetry()
+        offlineCoverShowing = false
         val item = currentItem ?: return
+        if (!OfflineGate.needsNetwork(item)) { failingSince = 0L; cancelCover() }
         itemStartedAt = System.currentTimeMillis()
         // #234: remember where we are so a controller rebuilt seconds from now can carry on.
         try { saveResume?.invoke(currentIndex, itemStartedAt) } catch (_: Throwable) {}
@@ -811,36 +854,118 @@ class PlaylistController(
     private fun slotMs(it: PlaylistItem): Long = (if (it.durationSec > 0) it.durationSec else 10).toLong() * 1000L
     fun groupScheduleTarget(syncedNowMs: Long): GroupTarget? {
         if (items.isEmpty()) return null
-        var acc = 0L
-        val slots = ArrayList<Triple<Int, Long, Long>>()   // index, startMs, durMs
-        for (i in items.indices) {
-            if (!scheduleAllows(items[i])) continue
-            // A dwell-0 live HLS channel is INFINITE (its stream never ends and it declares no finite
-            // slot length). On the clock scheduler it would swallow the whole period and desync every
-            // synced member, so it is INELIGIBLE here and skipped. A dwell>0 live channel has a finite
-            // slot (its durationSec) and participates normally. Solo playback is unaffected — it never
-            // calls this; it plays the channel and holds via scheduleLiveDwellRecheck().
-            if (isLiveStream(items[i]) && items[i].durationSec <= 0) continue
-            val d = slotMs(items[i]); slots.add(Triple(i, acc, d)); acc += d
-        }
-        if (slots.isEmpty() || acc <= 0L) return null
-        val period = acc
-        val phase = ((syncedNowMs % period) + period) % period
-        var chosenIdx = slots.size - 1
-        for (k in slots.indices) { val s = slots[k]; if (phase >= s.second && phase < s.second + s.third) { chosenIdx = k; break } }
-        val chosen = slots[chosenIdx]
-        val next = slots[(chosenIdx + 1) % slots.size]
-        val secToBoundary = (chosen.second + chosen.third - phase) / 1000f
-        return GroupTarget(chosen.first, (phase - chosen.second) / 1000f, next.first, secToBoundary)
+        // A dwell-0 live HLS channel is INFINITE (its stream never ends and it declares no finite
+        // slot length). On the clock scheduler it would swallow the whole period and desync every
+        // synced member, so it is INELIGIBLE here and skipped. A dwell>0 live channel has a finite
+        // slot (its durationSec) and participates normally. Solo playback is unaffected — it never
+        // calls this; it plays the channel and holds via scheduleLiveDwellRecheck().
+        // The rule itself lives in WallZones.target, shared with every wall zone, so the group
+        // scheduler and a wall layout can never disagree about where a timeline is.
+        val t = WallZones.target(
+            items.map { WallZones.SlotItem(it.durationSec, scheduleAllows(it), isLiveStream(it)) },
+            syncedNowMs
+        ) ?: return null
+        return GroupTarget(t.index, t.posSec, t.nextIndex, t.secToBoundary)
     }
 
-    // Playable NOW = schedule-active AND its content is downloaded/available.
+    // Playable NOW = schedule-active AND its content is downloaded/available — and, offline, not an
+    // item that needs the network while something cached could take its turn (OfflineGate, point 1).
     private fun playableNow(i: Int): Boolean =
-        i in items.indices && scheduleAllows(items[i]) && contentReady(items[i])
+        i in items.indices && scheduleAllows(items[i]) && contentReady(items[i]) && !offlineSkip(i)
 
     /** Scheduled, and we hold bytes for it — but their revision could not be confirmed. */
     private fun playableStale(i: Int): Boolean =
-        i in items.indices && scheduleAllows(items[i]) && contentUsable(items[i])
+        i in items.indices && scheduleAllows(items[i]) && contentUsable(items[i]) && !offlineSkip(i)
+
+    private fun hasLocalBytes(it: PlaylistItem): Boolean = contentReady(it) || contentUsable(it)
+
+    private fun offlineSkip(i: Int): Boolean =
+        OfflineGate.shouldSkip(cannotLoad, items, i, ::scheduleAllows, ::hasLocalBytes)
+
+    /*
+     * OFFLINE FALLBACK, the half that reacts to an item ACTUALLY failing (OfflineGate, point 2).
+     *
+     * failingSince is the start of the current run of web-load failures, and it survives the playlist
+     * re-showing the same failing item on its timer — that is what lets a 10-second widget still
+     * reach the 30-second cover instead of restarting the count every turn. Cleared by a successful
+     * load and by anything that does not need the network taking the screen.
+     */
+    private var failingSince = 0L
+    private var offlineCoverShowing = false
+    private var coverRunnable: Runnable? = null
+
+    /** The fullscreen web item on screen failed to load (MainActivity, from WebViewSupport). */
+    fun onNetworkItemFailed() {
+        val item = currentItem ?: return
+        if (!isRunning || held || wallFollower || offlineCoverShowing || !OfflineGate.needsNetwork(item)) return
+        val now = System.currentTimeMillis()
+        if (failingSince == 0L) failingSince = now
+        // Something cached can play instead: give it the turn now. The failure has already been
+        // recorded against this item, so the selection below passes over it (and over every network
+        // item, if the server is unreachable too).
+        if (OfflineGate.hasOfflineAlternative(items, ::scheduleAllows, ::hasLocalBytes)) {
+            Log.i("PlaylistController", "offline: ${item.filename} failed to load — playing cached content instead")
+            next()
+            return
+        }
+        // Nothing cached: the page stays hidden and keeps retrying. After a sustained run, cover it
+        // with the standby image if there is one (no standby = the hidden, retrying page is all
+        // there is, which is still better than an error page).
+        if (buildDefaultItem() == null) return
+        if (OfflineGate.shouldCover(failingSince, now)) { showOfflineCover(); return }
+        if (coverRunnable == null) {
+            val r = Runnable {
+                coverRunnable = null
+                val cur = currentItem
+                if (failingSince > 0L && cur != null && OfflineGate.needsNetwork(cur) && !offlineCoverShowing) showOfflineCover()
+            }
+            coverRunnable = r
+            handler.postDelayed(r, maxOf(MIN_ADVANCE_MS, failingSince + OfflineGate.COVER_AFTER_MS - now))
+        }
+    }
+
+    /** A web load succeeded: the run of failures is over. */
+    fun onNetworkItemRecovered() {
+        failingSince = 0L
+        cancelCover()
+    }
+
+    private fun cancelCover() {
+        coverRunnable?.let { handler.removeCallbacks(it) }
+        coverRunnable = null
+    }
+
+    /*
+     * Standby image over a web item that cannot load. Not an advance: currentIndex stays on the
+     * failing item and no advance timer runs, so the playlist does not churn black-cover-black while
+     * the network is gone. Every recheck asks two questions — could the item load now (the server is
+     * reachable and its last failure has aged out: re-show it, which reloads it), or has something cached become playable (a download finished) — and
+     * otherwise leaves the cover up.
+     */
+    private fun showOfflineCover() {
+        val dflt = buildDefaultItem() ?: return
+        if (!dflt.isRemote && !hasLocalBytes(dflt)) return
+        Log.i("PlaylistController", "offline: covering ${currentItem?.filename} with the standby image")
+        cancelAdvance()
+        cancelCover()
+        offlineCoverShowing = true
+        onItemChanged(dflt)
+        defaultShowing = false
+        scheduleCoverRecheck()
+    }
+
+    private fun scheduleCoverRecheck() {
+        cancelRetry()
+        retryRunnable = Runnable {
+            if (!isRunning || !offlineCoverShowing) return@Runnable
+            when {
+                currentItem?.let { !cannotLoad(it) } == true -> { Log.i("PlaylistController", "retrying ${currentItem?.filename}"); playCurrentItem() }
+                OfflineGate.hasOfflineAlternative(items, ::scheduleAllows, ::hasLocalBytes) -> next()
+                else -> scheduleCoverRecheck()
+            }
+        }
+        handler.postDelayed(retryRunnable!!, OFFLINE_COVER_RECHECK_MS)
+    }
 
     /*
      * Strict first, stale only if strict finds nothing. Every selection goes through these two so a

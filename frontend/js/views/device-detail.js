@@ -9,7 +9,10 @@ import { showDeviceOwnerQRModal } from '../components/device-owner-qr-modal.js';
 import { frameDeviceOutput, displayAspectRatio } from '../lib/device-frame.js';
 import * as gettingStarted from '../components/getting-started.js';
 import { LiveViewer, whenVisible } from '../lib/webrtc-viewer.js';
-import { renderPowerScheduleEditor, readPowerScheduleEditor, presetWindows } from '../components/power-schedule-editor.js';
+import { renderPowerScheduleEditor, readPowerScheduleEditor, presetWindows, problemMessage } from '../components/power-schedule-editor.js';
+import * as cui from '../components/corporate-ui.js';
+import { openDeviceMoveDialog } from '../components/device-move-dialog.js';
+import { setupViewAccess } from '../components/view-access-card.js';
 
 // The player distinguishes three cases for the Wi-Fi name, because "--" was hiding a real
 // answer: Android 8.1+ refuses to reveal the SSID to an app without location permission, and a
@@ -50,6 +53,7 @@ async function wirePowerSchedule(device) {
       inherited = eff && eff.source === 'group' ? eff : null;
       host.innerHTML = renderPowerScheduleEditor(current || { windows: [], enabled: true }, {
         supported,
+        playerVersion: device.app_version || null,
         inherited,
         groupSchedules,
         state: res.state,
@@ -62,7 +66,7 @@ async function wirePowerSchedule(device) {
   }
 
   function redraw(windows, enabled) {
-    host.innerHTML = renderPowerScheduleEditor({ ...(current || {}), windows, enabled }, { supported, inherited, groupSchedules });
+    host.innerHTML = renderPowerScheduleEditor({ ...(current || {}), windows, enabled }, { supported, inherited, groupSchedules, playerVersion: device.app_version || null });
     bind();
   }
 
@@ -81,7 +85,7 @@ async function wirePowerSchedule(device) {
     }));
     // Re-render on a time change so the "crosses midnight" hint appears as soon as it is true —
     // an overnight window is the common case and the least obvious thing about this editor.
-    host.querySelectorAll('.power-start, .power-end').forEach((el) => el.addEventListener('change', () => {
+    host.querySelectorAll('.power-start, .power-end, .power-allday').forEach((el) => el.addEventListener('change', () => {
       const s = readPowerScheduleEditor(document);
       redraw(s?.windows || [], s?.enabled !== false);
     }));
@@ -89,9 +93,14 @@ async function wirePowerSchedule(device) {
     host.querySelector('#powerSave')?.addEventListener('click', async () => {
       const s = readPowerScheduleEditor(document);
       if (!s) return;
+      // A row that cannot be saved is said, never dropped (an empty schedule saved over visible times).
+      const problem = problemMessage(s);
+      if (problem) { showToast(problem, 'error'); return; }
+      const { problems, ...body } = s;
+      void problems;
       try {
-        if (current?.id) await api.updatePowerSchedule(current.id, s);
-        else await api.createPowerSchedule({ device_id: device.id, ...s });
+        if (current?.id) await api.updatePowerSchedule(current.id, body);
+        else await api.createPowerSchedule({ device_id: device.id, ...body });
         showToast(t('power.saved'), 'success');
         await load();
       } catch (err) {
@@ -327,6 +336,20 @@ const LINUX_TERMINAL_PRESETS = [
   { label: 'Whoami', cmd: 'id' },
 ];
 
+// The native macOS player: /bin/sh as the signed-in user, read-only diagnostics. There is no
+// privileged helper on a Mac, so nothing here could reach root even if it tried.
+const MAC_TERMINAL_PRESETS = [
+  { label: 'System', cmd: 'sw_vers; sysctl -n hw.model' },
+  { label: 'Storage', cmd: 'df -h /' },
+  { label: 'Memory', cmd: 'vm_stat | head -6' },
+  { label: 'Network', cmd: 'ifconfig | grep -E "^[a-z]|inet "' },
+  { label: 'Uptime', cmd: 'uptime' },
+  { label: 'Power', cmd: 'pmset -g | head -20' },
+  { label: 'Player status', cmd: 'launchctl print gui/$(id -u)/com.screentinker.player | head -25' },
+  { label: 'Player log', cmd: 'tail -n 50 "$HOME/Library/Application Support/ScreenTinker/state/player.log"' },
+  { label: 'Whoami', cmd: 'id' },
+];
+
 // The native Windows player: its one-shot shell is PowerShell (`powershell -NoProfile -Command`), run
 // as the signed-in player user. Read-only diagnostics only; anything needing elevation is not
 // reachable from here at all (the SYSTEM helper takes a fixed verb list, not commands).
@@ -451,6 +474,11 @@ function isAndroidDevice(device) {
   if (device.client_type === 'pi' || platform.startsWith('linux/')) return false;
   // The native Windows player, same reasoning and same inlining (see isWindowsDevice below).
   if (device.client_type === 'win' || platform.startsWith('windows/')) return false;
+  // And the native macOS player (see isMacDevice below).
+  if (device.client_type === 'mac' || platform.startsWith('macos/')) return false;
+  // And the Roku player (see isRokuDevice below): a Roku build that ever reported its OS string as
+  // android_version must not be offered MediaProjection or device-owner provisioning.
+  if (device.client_type === 'roku' || platform === 'roku' || platform.startsWith('roku/')) return false;
   if (device.client_type === 'apk') return true;
   const av = String(device.android_version || '');
   return av !== '' && !av.startsWith('Web/');
@@ -474,17 +502,86 @@ function isWindowsDevice(device) {
   return String(device.platform || '').toLowerCase().startsWith('windows/');
 }
 
-// Either native player (the shared Python/Qt engine): what they have in common is that they are not
+// Mirrors the 'macos' arm of platformFamily(): the native macOS player registers client_type 'mac'
+// and platform 'macOS/<version> (<model>)'. NOT Safari or Chrome opening /player on a Mac.
+function isMacDevice(device) {
+  if (!device) return false;
+  if (device.client_type === 'mac') return true;
+  return String(device.platform || '').toLowerCase().startsWith('macos/');
+}
+
+// Mirrors the 'roku' arm of platformFamily(): the Roku player (roku/, BrightScript) registers
+// client_type 'roku' and platform 'roku'. Either signal is enough.
+function isRokuDevice(device) {
+  if (!device) return false;
+  if (device.client_type === 'roku') return true;
+  const platform = String(device.platform || '').toLowerCase();
+  return platform === 'roku' || platform.startsWith('roku/');
+}
+
+// Any native player (the shared Python/Qt engine): what they have in common is that they are not
 // Android, have no device-owner tier, and carry an on-device settings menu behind the PIN.
 function isNativeDevice(device) {
-  return isLinuxDevice(device) || isWindowsDevice(device);
+  return isLinuxDevice(device) || isWindowsDevice(device) || isMacDevice(device);
+}
+
+function isEmbeddedDevice(device) {
+  if (!device) return false;
+  return device.client_type === 'embedded' || String(device.platform || '').toLowerCase().includes('embedded');
 }
 
 // The one-shot shell's presets and wording, per native OS. Android keeps TERMINAL_PRESETS.
 function terminalPresets(device) {
   if (isWindowsDevice(device)) return WINDOWS_TERMINAL_PRESETS;
+  if (isMacDevice(device)) return MAC_TERMINAL_PRESETS;
   if (isLinuxDevice(device)) return LINUX_TERMINAL_PRESETS;
   return TERMINAL_PRESETS;
+}
+
+
+/*
+ * Location field (lib/local-conditions.js): search a place, pick it, Save stores its coordinates.
+ * Delegated from the document and installed once, because this page re-renders its form and a
+ * listener on the input itself would be left on a node that is no longer there.
+ */
+let locWired = false;
+function wireLocationSearch() {
+  if (locWired) return;
+  locWired = true;
+  let timer = null;
+  let rows = [];
+  document.addEventListener('input', (e) => {
+    const input = e.target;
+    if (!input || input.id !== 'deviceLocSearch') return;
+    const results = document.getElementById('deviceLocResults');
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const q = input.value.trim();
+      if (!results) return;
+      if (q.length < 2) { results.innerHTML = ''; return; }
+      try {
+        rows = await api.get(`/devices/geocode?q=${encodeURIComponent(q)}`);
+        results.innerHTML = rows.map((r, i) => `<button type="button" class="btn btn-secondary btn-sm" data-loc-i="${i}" style="text-align:left">${esc([r.name, r.region, r.country].filter(Boolean).join(', '))}</button>`).join('');
+      } catch (err) { results.innerHTML = `<span style="font-size:12px;color:var(--danger)">${esc(err.message)}</span>`; }
+    }, 300);
+  });
+  document.addEventListener('click', (e) => {
+    const pick = e.target.closest && e.target.closest('#deviceLocResults [data-loc-i]');
+    const clear = e.target.closest && e.target.closest('#deviceLocClear');
+    const input = document.getElementById('deviceLocSearch');
+    if (!input || (!pick && !clear)) return;
+    if (pick) {
+      const r = rows[Number(pick.dataset.locI)];
+      if (!r) return;
+      input.value = [r.name, r.region, r.country].filter(Boolean).join(', ');
+      input.dataset.lat = String(r.latitude); input.dataset.lon = String(r.longitude);
+    } else {
+      input.value = ''; input.dataset.lat = ''; input.dataset.lon = '';
+    }
+    input.dataset.changed = '1';
+    const results = document.getElementById('deviceLocResults');
+    if (results) results.innerHTML = '';
+  });
 }
 
 export function render(container, deviceId) {
@@ -617,14 +714,24 @@ async function loadDevice(deviceId, activeTab = null) {
     const latestTelemetry = device.telemetry?.[0] || {};
     const diagWidget = (device.assignments || []).find(a => a && a.widget_type === 'diag-smoothness');
 
+    const currentDither = (() => {
+      if (!device.screen_profile) return 'floyd-steinberg';
+      if (typeof device.screen_profile === 'object') return device.screen_profile.dither || 'floyd-steinberg';
+      try {
+        const p = JSON.parse(device.screen_profile);
+        if (p && p.dither) return p.dither;
+      } catch (_) {}
+      return 'floyd-steinberg';
+    })();
+
     contentEl.innerHTML = `
       <div class="device-header">
         <div class="device-header-left">
           <h1 id="deviceName">${esc(device.name)}</h1>
           ${(() => { const b = livenessBadge(device); return `<span class="device-status-badge ${b.state}"${b.title ? ` title="${esc(b.title)}"` : ''}>${esc(b.label)}</span>`; })()}
-          ${device.owner_name || device.owner_email ? `<span style="font-size:12px;color:var(--text-muted)">${t('device.owner_label', { owner: device.owner_name || device.owner_email })}</span>` : ''}
+          ${device.owner_name || device.owner_email ? `<span style="font-size:12px;color:var(--text-muted)">${t('device.owner_label', { owner: esc(device.owner_name || device.owner_email) })}</span>` : ''}
         </div>
-        <div style="display:flex;gap:8px">
+        <div class="device-header-actions">
           <button class="btn btn-secondary btn-sm" id="devicePreviewBtn">${t('device.preview_btn')}</button>
           <button class="btn btn-secondary btn-sm" id="renameBtn">${t('device.rename')}</button>
           ${can('remote.screenshot') ? `
@@ -640,8 +747,9 @@ async function loadDevice(deviceId, activeTab = null) {
           ${can('remote.talk') ? `<button class="btn btn-secondary btn-sm" id="start2wayBtn">🎙️ ${t('device.talk.two_way')}</button>` : ''}
           <button class="btn btn-danger btn-sm" id="stopTalkBtn" style="display:none">${t('device.talk.stop')}</button>
           <button class="btn btn-secondary btn-sm" id="muteTalkBtn" style="display:none">${t('device.talk.mute')}</button>` : ''}
-          ${device.android_version && !device.android_version.startsWith('Web/') && !isNativeDevice(device) ? `
+          ${device.android_version && !device.android_version.startsWith('Web/') && !isNativeDevice(device) && !isRokuDevice(device) ? `
           <button class="btn btn-secondary btn-sm" id="deviceOwnerBtn" title="${t('device.owner_provision.tip')}">${t('device.owner_provision.btn')}</button>` : ''}
+          <button class="btn btn-secondary btn-sm" id="moveDeviceBtn">${t('move.button')}</button>
           <button class="btn btn-secondary btn-sm" id="blockDeviceBtn">${device.blocked ? 'Unblock' : 'Block'}</button>
           <button class="btn btn-danger btn-sm" id="deleteDeviceBtn">${t('device.remove')}</button>
         </div>
@@ -713,6 +821,9 @@ async function loadDevice(deviceId, activeTab = null) {
 
       <!-- Playlist Tab -->
       <div class="tab-content" id="tab-playlist">
+        ${/* Head office decides what plays here: its own section replaces the picker, the layout
+              selector, the draft banner (head office's draft, not the store's) and the item list. */ ''}
+        ${device.playlist_source === 'corporate' ? corporatePlaylistTab(device) : `
         ${device.playlist_status === 'draft' ? `
         <div id="deviceDraftBanner" style="background:#78350f;border:1px solid #92400e;border-radius:var(--radius);padding:14px 20px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:16px">
           <div style="display:flex;align-items:center;gap:10px;color:#fbbf24">
@@ -762,7 +873,7 @@ async function loadDevice(deviceId, activeTab = null) {
         </div>
         <div class="playlist-container" id="playlistContainer">
           ${renderPlaylist(device.assignments || [])}
-        </div>
+        </div>`}
       </div>
 
       <!-- Info Tab -->
@@ -816,7 +927,7 @@ async function loadDevice(deviceId, activeTab = null) {
             </svg>
             ${t('device.ctl.clear_update_cache')}
           </button>` : ''}
-          ${can('system.reboot') ? `
+          ${can('system.reboot') && !isEmbeddedDevice(device) ? `
           <button class="btn btn-danger btn-sm" id="shutdownBtn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
@@ -846,7 +957,7 @@ async function loadDevice(deviceId, activeTab = null) {
                  ISP's address as the screen's. Above is where the connection comes FROM (public);
                  this is what the screen calls itself on its own network. -->
             <div class="info-card-label">${t('device.info.local_ip')}</div>
-            <div class="info-card-value small" id="telLocalIp">${device.local_ip || '--'}</div>
+            <div class="info-card-value small" id="telLocalIp">${esc(device.local_ip || '--')}</div>
           </div>
           ${device.local_ip6 ? `
           <div class="info-card">
@@ -855,18 +966,29 @@ async function loadDevice(deviceId, activeTab = null) {
                  tell them nothing. A dual-stack panel shows both cards; a v6-only panel used to
                  show a dash here and nothing else, because the player only ever collected v4. -->
             <div class="info-card-label">${t('device.info.local_ip6')}</div>
-            <div class="info-card-value small" id="telLocalIp6">${device.local_ip6}</div>
+            <div class="info-card-value small" id="telLocalIp6">${esc(device.local_ip6)}</div>
           </div>` : ''}
-          ${device.android_version && !device.android_version.startsWith('Web/') ? `
+          ${(device.android_version && !device.android_version.startsWith('Web/')) || latestTelemetry.battery_level != null || (isEmbeddedDevice(device) && device.power_source) ? `
           <div class="info-card">
             <div class="info-card-label">${t('device.info.battery')}</div>
-            <div class="info-card-value" id="telBattery">${latestTelemetry.battery_level != null ? latestTelemetry.battery_level + '%' : '--'}</div>
+            <div class="info-card-value" id="telBattery">${
+              // Charging / mains annotations are an embedded-panel reading; every other player keeps
+              // the plain percentage it has always shown.
+              !isEmbeddedDevice(device)
+                ? (latestTelemetry.battery_level != null ? latestTelemetry.battery_level + '%' : '--')
+                : latestTelemetry.battery_charging
+                  ? (latestTelemetry.battery_level != null ? t('device.info.battery_charging_pct', { level: latestTelemetry.battery_level }) : t('device.info.battery_charging'))
+                  : (device.power_source === 'usb' || latestTelemetry.power_source === 'usb')
+                    ? (latestTelemetry.battery_level != null ? t('device.info.battery_mains_pct', { level: latestTelemetry.battery_level }) : t('device.info.battery_mains'))
+                    : (latestTelemetry.battery_level != null ? `${latestTelemetry.battery_level}%` : '--')
+            }</div>
             ${latestTelemetry.battery_level != null ? `
             <div class="progress-bar">
               <div class="progress-bar-fill ${latestTelemetry.battery_level > 50 ? 'success' : latestTelemetry.battery_level > 20 ? 'warning' : 'danger'}"
                    style="width:${latestTelemetry.battery_level}%"></div>
             </div>` : ''}
-          </div>
+          </div>` : ''}
+          ${device.android_version && !device.android_version.startsWith('Web/') ? `
           <div class="info-card">
             <div class="info-card-label">${t('device.info.storage')}</div>
             <div class="info-card-value small" id="telStorage">${latestTelemetry.storage_free_mb ? t('device.info.size_free', { size: formatBytes(latestTelemetry.storage_free_mb) }) : '--'}</div>
@@ -879,7 +1001,7 @@ async function loadDevice(deviceId, activeTab = null) {
           ` : `
           <div class="info-card">
             <div class="info-card-label">${t('device.info.player_type')}</div>
-            <div class="info-card-value small">${isBrightSignDevice(device) ? t('device.info.brightsign_player') : isLinuxDevice(device) ? t('device.info.linux_player') : isWindowsDevice(device) ? t('device.info.windows_player') : t('device.info.web_player')}</div>
+            <div class="info-card-value small">${isEmbeddedDevice(device) ? (String(device.screen_profile || '').includes('seeed-reterminal-sticky') ? t('device.info.reterminal_sticky_player') : t('device.info.embedded_player')) : isBrightSignDevice(device) ? t('device.info.brightsign_player') : isLinuxDevice(device) ? t('device.info.linux_player') : isWindowsDevice(device) ? t('device.info.windows_player') : isRokuDevice(device) ? t('device.info.roku_player') : t('device.info.web_player')}</div>
           </div>
           ${device.hardware_model ? `
           <div class="info-card">
@@ -952,7 +1074,7 @@ async function loadDevice(deviceId, activeTab = null) {
               ${device.edid.checksumValid === false ? `<br><span style="color:var(--warning,#f59e0b)">${t('device.info.edid_checksum_bad')}</span>` : ''}
             </div>
           </div>` : ''}
-          ${(device.android_version && !device.android_version.startsWith('Web/')) || (isNativeDevice(device) && latestTelemetry.wifi_rssi != null) ? `
+          ${(device.android_version && !device.android_version.startsWith('Web/')) || (isNativeDevice(device) && latestTelemetry.wifi_rssi != null) || latestTelemetry.wifi_rssi != null ? `
           <div class="info-card">
             <div class="info-card-label">${t('device.info.wifi')}</div>
             <!-- ⚠️ The network NAME is deliberately gone (Phase −1). An SSID is geolocatable
@@ -987,7 +1109,7 @@ async function loadDevice(deviceId, activeTab = null) {
           ${device.android_version && !device.android_version.startsWith('Web/') ? `
           <div class="info-card">
             <div class="info-card-label">${t('device.info.android_version')}</div>
-            <div class="info-card-value small">${device.android_version}</div>
+            <div class="info-card-value small">${esc(device.android_version)}</div>
           </div>` : ''}
           <div class="info-card">
             <div class="info-card-label">${t('device.info.settings_pin')}</div>
@@ -1002,12 +1124,12 @@ async function loadDevice(deviceId, activeTab = null) {
           <div class="info-card">
             <div class="info-card-label">${t('device.info.screen_resolution')}</div>
             <div class="info-card-value small">${device.screen_width && device.screen_height
-              ? device.screen_width + 'x' + device.screen_height +
+              ? esc(device.screen_width + 'x' + device.screen_height) +
                 // #134: show the UI render surface alongside the HDMI output when they differ
                 // (TV boxes that render at 720p and upscale to a 1080p signal).
                 (device.render_width && device.render_height &&
                  (device.render_width !== device.screen_width || device.render_height !== device.screen_height)
-                  ? ` (UI ${device.render_width}x${device.render_height})` : '')
+                  ? ` (UI ${esc(device.render_width + 'x' + device.render_height)})` : '')
               : '--'}</div>
           </div>
           <div class="info-card">
@@ -1056,8 +1178,12 @@ async function loadDevice(deviceId, activeTab = null) {
           </div>
         </div>
 
+        ${!isEmbeddedDevice(device) ? `
         ${renderTriggerConfig(device)}
         ${renderTriggerDiagnostics(device)}
+        ` : ''}
+
+        <div id="viewAccessCard"></div>
 
         <!-- Uptime Timeline (24h) -->
         <div style="margin-top:20px">
@@ -1081,7 +1207,11 @@ async function loadDevice(deviceId, activeTab = null) {
           <div id="incidentsPanel"></div>
         </div>
 
-        <div style="margin-top:20px">
+        <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <h4 style="font-size:14px;font-weight:600;margin:0">${t('nav.settings')}</h4>
+            <button class="btn btn-primary btn-sm" id="saveSettingsTopBtn">${t('device.form.save_settings')}</button>
+          </div>
           <div style="display:flex;gap:12px;margin-bottom:12px">
             <div class="form-group" style="flex:1;margin:0">
               <label>${t('device.form.orientation_label')}</label>
@@ -1100,17 +1230,46 @@ async function loadDevice(deviceId, activeTab = null) {
                 </div>
                 <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('device.form.background_hint')}</div>
               </div>
-            <div class="form-group" style="flex:1;margin:0">
-              <label>${t('device.form.default_content_label')}</label>
-              <select id="deviceDefaultContent" class="input" style="background:var(--bg-input)">
-                <option value="">${t('device.form.default_content_none')}</option>
-              </select>
+              <div class="form-group" style="flex:1;margin:0">
+                <label>${t('device.form.default_content_label')}</label>
+                <select id="deviceDefaultContent" class="input" style="background:var(--bg-input)">
+                  <option value="">${t('device.form.default_content_none')}</option>
+                </select>
+              </div>
             </div>
+            ${isEmbeddedDevice(device) ? `
+            <div class="form-group">
+              <label>${t('device.form.dither_label')}</label>
+              <select id="epdDither" class="input" style="background:var(--bg-input)">
+                <option value="floyd-steinberg" ${currentDither === 'floyd-steinberg' ? 'selected' : ''}>Floyd–Steinberg</option>
+                <option value="atkinson" ${currentDither === 'atkinson' ? 'selected' : ''}>Atkinson</option>
+                <option value="none" ${currentDither === 'none' ? 'selected' : ''}>${t('device.form.dither_none')}</option>
+              </select>
+              <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('device.form.dither_hint')}</div>
+            </div>
+            ` : ''}
+            <div class="form-group">
+            <label>${t('device.form.tags_label')}</label>
+            <input id="deviceTags" class="input" value="${esc((Array.isArray(device.tags) ? device.tags : []).join(', '))}" placeholder="${t('device.form.tags_placeholder')}">
+            <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('device.form.tags_hint')}</div>
+          </div>
+          <div class="form-group">
+            <label>${t('device.form.location_label')}</label>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <input id="deviceLocSearch" class="input" style="flex:1;min-width:200px" value="${esc(device.location_label || (device.latitude != null ? `${device.latitude}, ${device.longitude}` : ''))}" placeholder="${t('device.form.location_placeholder')}"
+                data-lat="${device.latitude != null ? esc(String(device.latitude)) : ''}" data-lon="${device.longitude != null ? esc(String(device.longitude)) : ''}">
+              <button type="button" class="btn btn-secondary btn-sm" id="deviceLocClear">${t('device.form.location_clear')}</button>
+            </div>
+            <div id="deviceLocResults" style="display:flex;flex-direction:column;gap:4px;margin-top:6px"></div>
+            <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${device.local_weather
+              ? esc(t('device.form.location_weather', { cond: t(`playlist.condition.wx.${device.local_weather.group || 'clear'}`), temp: Math.round(device.local_weather.temperature_c) }))
+              : t('device.form.location_hint')}</div>
           </div>
           <div class="form-group">
             <label>${t('device.form.notes_label')}</label>
             <textarea id="deviceNotes" class="input" rows="3" placeholder="${t('device.form.notes_placeholder')}" style="resize:vertical">${esc(device.notes || '')}</textarea>
           </div>
+          ${!isEmbeddedDevice(device) ? `
           <div style="margin:12px 0">
             <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
               <input type="checkbox" id="otaToggle" ${device.ota_enabled === 0 ? '' : 'checked'}> ${t('device.ota.toggle')}
@@ -1120,7 +1279,7 @@ async function loadDevice(deviceId, activeTab = null) {
                 <input type="checkbox" id="otaBetaToggle" ${device.ota_beta === 1 ? 'checked' : ''}> ${t('device.ota.beta')}
               </label>
               <div style="font-size:11px;color:var(--text-muted);margin:4px 0 0 24px">${t('device.ota.beta_hint')}</div>
-          </div>
+          </div>` : ''}
           ${liveVideoAvailable ? `
           <div style="margin:12px 0">
             <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
@@ -1128,15 +1287,20 @@ async function loadDevice(deviceId, activeTab = null) {
             </label>
             <div style="font-size:11px;color:var(--text-muted);margin:4px 0 0 24px">${t('device.live_video.hint')}</div>
           </div>` : ''}
+          ${(!isEmbeddedDevice(device) || device.power_source === 'usb') ? `
           <div class="form-group" style="max-width:280px">
             <label>${t('device.reboot_schedule.label')}</label>
             <input type="time" id="rebootSchedule" class="input" style="background:var(--bg-input)" value="${esc(device.reboot_schedule || '')}">
             <div style="font-size:11px;color:var(--text-muted);margin:4px 0 0 0">${t('device.reboot_schedule.hint')}</div>
           </div>
-          <button class="btn btn-secondary btn-sm" id="saveNotesBtn">${t('device.form.save_settings')}</button>
-          <button class="btn btn-secondary btn-sm" id="reAdoptBtn" style="margin-left:8px" title="${t('device.readopt.button_hint')}">${t('device.readopt.button')}</button>
+          ` : ''}
+          <div style="margin-top:16px;display:flex;gap:8px;align-items:center">
+            <button class="btn btn-primary" id="saveNotesBtn">${t('device.form.save_settings')}</button>
+            <button class="btn btn-secondary btn-sm" id="reAdoptBtn" title="${t('device.readopt.button_hint')}">${t('device.readopt.button')}</button>
+          </div>
         </div>
 
+        ${!isEmbeddedDevice(device) ? `
         <div style="margin-top:20px">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
             <input type="checkbox" id="debugLogToggle"> ${t('device.debug.toggle')}
@@ -1154,10 +1318,12 @@ async function loadDevice(deviceId, activeTab = null) {
           </div>
           <div id="debugLogPanel" style="display:none;margin-top:8px;background:#0b0f1a;border:1px solid var(--border);border-radius:6px;padding:8px;height:220px;overflow-y:auto;font-family:monospace;font-size:11px;line-height:1.45;color:#cbd5e1"></div>
         </div>
+        ` : ''}
 
 
         <!-- #109: PiP overlay tester. Pushes device:pip-show/clear via POST /api/pip
              (real triggers are external via the API token; this is for testing). -->
+        ${can('playback.pip') ? `
         <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
           <div style="font-weight:600;margin-bottom:8px">Overlay (PiP) — test</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -1178,6 +1344,7 @@ async function loadDevice(deviceId, activeTab = null) {
             <button class="btn btn-secondary btn-sm" id="clearPipBtn">Clear overlay</button>
           </div>
         </div>
+        ` : ''}
       </div>
 
       ${(can('remote.stream') || can('remote.input') || can('remote.screenshot')) ? `
@@ -1265,7 +1432,7 @@ async function loadDevice(deviceId, activeTab = null) {
               ${can('display.power') ? `
               <hr style="border-color:var(--border);margin:8px 0">
               <div style="display:flex;gap:4px">
-                <button class="btn btn-secondary btn-sm" style="flex:1" onclick="window._sendCmd('screen_off')">${t('device.remote.scrn_off')}</button>
+                <button class="btn btn-secondary btn-sm" id="remoteScreenOffBtn" style="flex:1" onclick="window._sendCmd('screen_off')">${t('device.remote.scrn_off')}</button>
                 <button class="btn btn-secondary btn-sm" style="flex:1" onclick="window._sendCmd('screen_on')">${t('device.remote.scrn_on')}</button>
               </div>` : ''}
             </div>` : ''}
@@ -1379,7 +1546,11 @@ async function loadDevice(deviceId, activeTab = null) {
       if (currentDevice) sendKey(currentDevice.id, keycode);
     };
     window._sendCmd = (type) => {
-      if (currentDevice) sendCommand(currentDevice.id, type, {});
+      if (!currentDevice) return;
+      // A refusal (head office's screen, a gated command) must not vanish: say why.
+      sendCommand(currentDevice.id, type, {}, (ack) => {
+        if (ack && ack.reason === 'corporate') showToast(ack.error || t('corp.locked.title'), 'error');
+      });
     };
     window._enableSystemView = () => {
       if (!currentDevice) return;
@@ -1440,7 +1611,9 @@ async function loadDevice(deviceId, activeTab = null) {
     setupActions(device);
     setupRemote(device);
     setupPlaylistActions(device);
+    setupCorporateDevice(device);
     setupEnrolKey(device);
+    setupViewAccess(device);
 
     /*
      * The checklist, at the end of its own trail.
@@ -1523,6 +1696,7 @@ function renderTriggerConfig(device) {
       <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
         <div style="font-weight:600;margin-bottom:4px">${t('device.trigcfg.title')}</div>
         <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">${esc(t('device.trigcfg.intro'))}</div>
+        ${headOfficeTriggerNotes(device)}
 
         <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
           <label style="display:flex;gap:6px;align-items:center;font-size:13px">
@@ -1627,6 +1801,19 @@ function playlistSourceBadge(device) {
     `<span title="${esc(title)}" style="font-size:11px;padding:2px 8px;border-radius:10px;`
     + `background:var(--bg-input);color:${color};white-space:nowrap">${esc(text)}</span>`;
 
+  /*
+   * Head office (corporate) decides what plays here. The playlist is NAMED, as plain text — not a
+   * link: a store user cannot open head office's workspace, so a link would 404. A dark mandate
+   * says the screen was turned off by head office rather than looking unassigned.
+   */
+  if (device.playlist_source === 'corporate') {
+    const corp = device.corporate || {};
+    if (corp.dark) return chip(t('corp.badge.dark'), t('corp.tip.dark'), 'var(--warning, #f59e0b)');
+    const name = corp.playlist_name;
+    return chip(t('corp.badge.locked'), t('corp.tip.locked'), 'var(--warning, #f59e0b)')
+      + (name ? ` <span class="corp-playlist-name" style="font-size:12px;color:var(--text-secondary)">${esc(name)}</span>` : '');
+  }
+
   if (device.playlist_source === 'device') {
     return chip(t('device.playlist.overridden'), t('device.playlist.overridden_tip'), 'var(--text-secondary)')
       + `<button class="btn btn-secondary btn-sm" id="revertPlaylistBtn" title="${esc(t('device.playlist.revert_tip'))}"`
@@ -1641,6 +1828,236 @@ function playlistSourceBadge(device) {
     );
   }
   return '';
+}
+
+/* ── Head office (corporate) on the device page (spec §7.9) ───────────────────────────────────
+ *
+ * A store manager must be able to answer "why can't I change this?" and "what CAN I change?" from
+ * this page. Head office's items are listed locked (a click explains, and points at the slot), each
+ * local slot is a section with this screen's content for it and where that content is set, and
+ * Add content asks which slot and for how many screens BEFORE adding (no 409 round trip, no silent
+ * fork — critique U1). Everything comes from the `corporate` block of GET /api/devices/:id.
+ */
+function corporatePlaylistTab(device) {
+  const corp = device.corporate || {};
+  const target = corp.mandate ? corp.mandate.target_label : '';
+  if (corp.dark) {
+    return `<div class="corp-notice">${cui.chip(t('corp.badge.dark'), 'dark', '', { lock: true })} ${esc(t('corp.dev.dark', { target }))}
+      ${corp.can_change ? `<a class="btn btn-secondary btn-sm" href="#/corporate/where">${esc(t('corp.dev.change_in_corporate'))}</a>` : ''}</div>`;
+  }
+  const slots = corp.slots || [];
+  const items = corp.items || [];
+  const slotName = (id) => (slots.find((x) => x.id === id) || {}).name || '';
+  return `
+    <div class="corp-notice">
+      ${cui.chip(t('corp.badge.locked'), 'hq', t('corp.tip.locked'), { lock: true })}
+      ${esc(t('corp.dev.plays_here', { name: corp.playlist_name || '', target }))}
+      · ${esc(corp.layout_id ? t('corp.dev.layout_hq') : t('corp.dev.layout_full'))}
+      ${corp.can_change ? `<a class="btn btn-secondary btn-sm" href="#/corporate/where">${esc(t('corp.dev.change_in_corporate'))}</a>` : ''}
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0">
+      <h3 style="font-size:16px">${esc(t('corp.dev.loop_title'))}</h3>
+      <button class="btn btn-primary btn-sm" id="corpAddContentBtn">${esc(t('device.playlist.add_content_btn'))}</button>
+    </div>
+    <div class="playlist-container" id="corpLoop">
+      ${items.length ? items.map((a, i) => `
+        <div class="playlist-item ${a.locked ? 'corp-locked-item' : ''}" data-corp-item="${i}" ${a.locked ? 'role="button" tabindex="0"' : ''}>
+          <div class="playlist-item-info">
+            <div class="playlist-item-name">${a.locked ? cui.LOCK_SVG + ' ' : ''}${esc(a.filename || t('common.unknown'))}</div>
+            <div class="playlist-item-meta">${a.origin === 'slot' ? cui.chip(t('corp.dev.from_slot', { slot: slotName(a.slot_id) }), 'slot') : a.origin === 'fallback' ? cui.chip(t('corp.preview.tag_fallback'), 'muted') : cui.chip(t('corp.preview.tag_corporate'), 'hq')}
+              ${a.duration_sec ? ` &middot; ${esc(cui.formatSec(a.duration_sec))}` : ''}</div>
+          </div>
+        </div>`).join('') : `<div class="empty-state"><p>${esc(t('corp.preview.empty'))}</p></div>`}
+    </div>
+    <h3 style="font-size:16px;margin:18px 0 10px">${esc(t('corp.store.slots'))}</h3>
+    ${slots.length ? slots.map((sl) => corporateSlotSection(sl)).join('') : `<div class="corp-help">${esc(t('corp.err.CORPORATE_NO_SLOT', { name: corp.playlist_name || '' }))}</div>`}`;
+}
+
+function corporateSlotSection(sl) {
+  const f = sl.fill;
+  const level = f ? cui.levelLabel(f.scope_kind, f.scope_name, { thisScreen: f.scope_kind === 'device' }) : '';
+  return `
+    <div class="corp-card corp-slot-card" data-corp-slot="${esc(sl.id)}">
+      <div class="corp-card-head">
+        <strong class="corp-card-title">${esc(t('corp.store.slot_title', { slot: sl.name }))}</strong>
+        <span class="corp-help">${esc(cui.limitsText(sl.limits))}</span>
+      </div>
+      ${sl.help_text ? `<div class="corp-hq-note">${esc(t('corp.store.hq_says'))} ${esc(sl.help_text)}</div>` : ''}
+      ${f ? `
+        <div class="corp-card-meta">${esc(t('corp.dev.from_level', { level }))} · ${esc(tn('corp.n_screens', f.screens || 0))}</div>
+        ${f.fill_state === 'over_limit' ? `<div class="corp-notice corp-notice-danger">${esc(t('corp.slot.over_limit'))}</div>` : ''}
+        ${f.status === 'draft' ? `<div class="corp-notice">${esc(f.has_published ? t('corp.dev.unpublished') : t('corp.dev.never_published'))}
+          <button class="btn btn-primary btn-sm" data-corp-publish="${esc(f.fill_playlist_id)}">${esc(tn('corp.hq.publish_n', f.screens || 0))}</button></div>` : ''}
+        ${sl.own ? `<div class="corp-notice">${esc(t('corp.slot.own_chip_here', { slot: sl.name }))}
+          <button class="btn btn-secondary btn-sm" data-corp-unown="${esc(f.fill_id)}">${esc(t('corp.slot.use_shared'))}</button></div>` : ''}`
+        : `<div class="corp-help">${esc(sl.has_fallback ? t('corp.dev.empty_fallback') : t('corp.store.empty_slot_skip'))}</div>`}
+      <div class="corp-card-actions">
+        <button class="btn btn-secondary btn-sm" data-corp-add="${esc(sl.id)}">${esc(t('device.playlist.add_content_btn'))}</button>
+        ${f ? `<a class="btn btn-secondary btn-sm" href="#/playlists/${esc(f.fill_playlist_id)}">${esc(t('corp.locked.edit_slot'))}</a>` : ''}
+        ${!sl.own ? `<button class="btn btn-secondary btn-sm" data-corp-own="${esc(sl.id)}">${esc(t('corp.slot.give_own'))}</button>` : ''}
+      </div>
+    </div>`;
+}
+
+/** Trigger panel: why head office's emergency alerts cannot reach this screen, and who manages it. */
+function headOfficeTriggerNotes(device) {
+  const h = device.head_office_triggers;
+  if (!h) return '';
+  return `${h.listeners_off ? `<div class="corp-notice corp-notice-warn">${esc(t('corp.em.device_warn'))}</div>` : ''}
+    ${h.settings_locked ? `<div class="corp-notice">${cui.LOCK_SVG} ${esc(t('corp.em.locked_settings'))}</div>` : ''}`;
+}
+
+/*
+ * D13: the device controls only org admins may use on a screen head office drives. Each carries a
+ * lock, and a click explains instead of sending a command the server refuses. Restart, volume and
+ * the other everyday controls stay as they are.
+ */
+const CORP_GATED_CONTROLS = {
+  setServerUrlBtn: 'set_server_url', termRun: 'shell', apkInstall: 'install_apk', ptyConnect: 'shell',
+  launchAppBtn: 'launch', t2KioskOff: 'kiosk_unlock', screenOffBtn: 'screen_off', remoteScreenOffBtn: 'screen_off', shutdownBtn: 'shutdown',
+  sysTimeout: 'set_screen_timeout', sendPipBtn: 'pip', blockDeviceBtn: 'block', powerSave: 'power',
+};
+const CORP_TRIGGER_CONTROLS = ['trigHttp', 'trigUdp', 'trigHttpPort', 'trigUdpPort', 'trigClearAll', 'saveTrigCfgBtn', 'rotateTrigSecretBtn'];
+let corpLockHandler = null;
+let corpLockObserver = null;
+
+function teardownCorporateLocks() {
+  if (corpLockHandler) { ['click', 'mousedown', 'keydown'].forEach((ev) => document.removeEventListener(ev, corpLockHandler, true)); corpLockHandler = null; }
+  if (corpLockObserver) { corpLockObserver.disconnect(); corpLockObserver = null; }
+}
+
+function setupCorporateDevice(device) {
+  teardownCorporateLocks();
+  const corp = device.corporate;
+  const gated = corp && corp.controls_locked ? CORP_GATED_CONTROLS : {};
+  const trig = device.head_office_triggers && device.head_office_triggers.settings_locked ? CORP_TRIGGER_CONTROLS : [];
+  const ids = [...Object.keys(gated), ...trig];
+  if (ids.length) {
+    const mark = () => ids.forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el || el.dataset.corpLocked) return;
+      el.dataset.corpLocked = gated[id] ? 'mandate' : 'emergency';
+      el.title = t('corp.locked.title');
+      if (el.tagName === 'INPUT' && el.type !== 'checkbox') el.readOnly = true;
+    });
+    mark();
+    // Some sections (power schedule, terminal) render after this runs.
+    const host = document.getElementById('deviceContent') || document.getElementById('app');
+    if (host && window.MutationObserver) { corpLockObserver = new MutationObserver(mark); corpLockObserver.observe(host, { childList: true, subtree: true }); }
+    corpLockHandler = (e) => {
+      const el = e.target && e.target.closest && e.target.closest('[data-corp-locked]');
+      if (!el) return;
+      if (e.type === 'keydown' && !['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      // One explanation per gesture: a select opens on mousedown (so it explains there and its click
+      // is swallowed); everything else explains on the click that follows the mousedown.
+      const isSelect = el.tagName === 'SELECT';
+      if (e.type === 'mousedown' && !isSelect) return;
+      if (e.type === 'click' && isSelect) return;
+      const emergency = el.dataset.corpLocked === 'emergency';
+      const action = t(`corp.ctl.${gated[el.id] || 'other'}`);
+      const name = corp && corp.playlist_name ? corp.playlist_name : '';
+      cui.explainLocked({ text: emergency ? t('corp.em.locked_settings') : t('corp.dev.control_locked', { name, action }) });
+    };
+    ['click', 'mousedown', 'keydown'].forEach((ev) => document.addEventListener(ev, corpLockHandler, true));
+  }
+  if (!corp || device.playlist_source !== 'corporate') return;
+
+  // Locked items: one explanation, with the way to what the store CAN change.
+  document.querySelectorAll('[data-corp-item]').forEach((row) => {
+    const it = (corp.items || [])[Number(row.dataset.corpItem)];
+    if (!it || !it.locked) return;
+    const open = () => cui.explainLocked({
+      text: t('corp.err.CORPORATE_LOCKED', { name: corp.playlist_name || '' }) + ' ' + t('corp.locked.volume'),
+      actions: (corp.slots || []).length ? [{ label: t('corp.locked.edit_slot'), primary: true, onClick: () => document.querySelector('[data-corp-slot]')?.scrollIntoView({ block: 'center', behavior: 'smooth' }) }] : [],
+    });
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+  document.getElementById('corpAddContentBtn')?.addEventListener('click', () => corporateAdd(device, null));
+  document.querySelectorAll('[data-corp-add]').forEach((b) => b.addEventListener('click', () => corporateAdd(device, b.dataset.corpAdd)));
+  document.querySelectorAll('[data-corp-publish]').forEach((b) => b.addEventListener('click', async () => {
+    try { b.disabled = true; await api.publishPlaylist(b.dataset.corpPublish); showToast(t('corp.dev.published'), 'success'); loadDevice(device.id, 'playlist'); }
+    catch (e) { b.disabled = false; showToast(e.message, 'error'); }
+  }));
+  document.querySelectorAll('[data-corp-own]').forEach((b) => b.addEventListener('click', async () => {
+    const sl = (corp.slots || []).find((x) => x.id === b.dataset.corpOwn);
+    const ok = await cui.ask({ title: t('corp.slot.give_own'), text: t('corp.slot.give_own_confirm', { slot: sl ? sl.name : '' }), confirmLabel: t('corp.slot.give_own') });
+    if (!ok) return;
+    try {
+      const f = await api.createFill(sl.id, { scope_kind: device.wall_id ? 'wall' : 'device', scope_id: device.wall_id || device.id });
+      showToast(t('corp.slot.own_created'), 'success');
+      window.location.hash = `#/playlists/${f.fill_playlist_id}`;
+    } catch (e) { showToast(e.message, 'error'); }
+  }));
+  document.querySelectorAll('[data-corp-unown]').forEach((b) => b.addEventListener('click', async () => {
+    const ok = await cui.ask({ title: t('corp.slot.use_shared'), text: t('corp.slot.use_shared_confirm'), confirmLabel: t('corp.slot.use_shared'), danger: true });
+    if (!ok) return;
+    try { await api.deleteFill(b.dataset.corpUnown); showToast(t('corp.slot.level_removed'), 'success'); loadDevice(device.id, 'playlist'); }
+    catch (e) { showToast(e.message, 'error'); }
+  }));
+}
+
+/*
+ * Add content on a screen head office drives: it goes into one of head office's local slots. The
+ * question is asked first — which slot, and for whom: the level this screen already takes its slot
+ * content from ("Everyone in Store 1 (12 screens)") or only this screen.
+ */
+async function corporateAdd(device, slotId) {
+  const corp = device.corporate || {};
+  const slots = corp.slots || [];
+  if (!slots.length) { cui.explainLocked({ text: t('corp.err.CORPORATE_NO_SLOT', { name: corp.playlist_name || '' }) }); return; }
+  let slot = slotId ? slots.find((x) => x.id === slotId) : slots.length === 1 ? slots[0] : null;
+  if (!slot) {
+    slot = await new Promise((resolve) => {
+      let picked = null;
+      const m = cui.openModal({
+        title: t('corp.slot.which'),
+        body: `<select id="corpWhich" class="input" style="width:100%">${slots.map((x) => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}</select>`,
+        footer: `<button class="btn btn-secondary" data-corp-close>${esc(t('common.cancel'))}</button><button class="btn btn-primary" id="corpWhichGo">${esc(t('corp.slot.next'))}</button>`,
+        onClose: () => resolve(picked),
+      });
+      m.q('#corpWhichGo').addEventListener('click', () => { picked = slots.find((x) => x.id === m.q('#corpWhich').value) || null; m.close(); });
+    });
+    if (!slot) return;
+  }
+  const f = slot.fill;
+  const level = f ? cui.levelLabel(f.scope_kind, f.scope_name, { thisScreen: f.scope_kind === 'device' }) : t('corp.level.this_workspace');
+  const scope = await new Promise((resolve) => {
+    let chosen = null;
+    const shared = f && f.scope_kind !== 'device' && f.scope_kind !== 'wall';
+    const m = cui.openModal({
+      title: t('corp.slot.add_title', { slot: slot.name }),
+      body: `<p class="corp-explain">${esc(f ? tn('corp.slot.confirm_add', f.screens || 0, { slot: slot.name, level }) : t('corp.slot.confirm_add_new', { slot: slot.name }))}</p>
+             <p class="corp-help">${esc(t('corp.slot.draft_note'))}</p>`,
+      footer: `<button class="btn btn-secondary" data-corp-close>${esc(t('common.cancel'))}</button>
+               ${!f || shared ? `<button class="btn btn-secondary" id="corpOnlyThis">${esc(t('corp.slot.only_this'))}</button>` : ''}
+               <button class="btn btn-primary" id="corpForLevel">${esc(f ? t('corp.slot.add_for', { level }) : t('corp.slot.add_for_ws'))}</button>`,
+      onClose: () => resolve(chosen),
+    });
+    m.q('#corpOnlyThis')?.addEventListener('click', () => { chosen = 'device'; m.close(); });
+    m.q('#corpForLevel').addEventListener('click', () => { chosen = 'nearest'; m.close(); });
+  });
+  if (!scope) return;
+  const lim = slot.limits || {};
+  let toastShown = false;
+  await openContentPicker({
+    title: t('corp.slot.add_title', { slot: slot.name }),
+    targetPlaylistId: f ? f.fill_playlist_id : null,
+    slotMode: { allowVideo: !(lim.allow_video === 0 || lim.allow_video === false), allowWidgets: !(lim.allow_widgets === 0 || lim.allow_widgets === false) },
+    add: async (item) => {
+      const body = { ...(item.type === 'widget' ? { widget_id: item.id } : { content_id: item.id }), slot_id: slot.id, fill_scope: scope };
+      const r = await api.addAssignment(device.id, body);
+      const to = r && r.redirected_to;
+      if (to && !toastShown) {
+        toastShown = true;
+        showToast(tn('corp.slot.added', to.screens || 0, { slot: to.slot_name || slot.name, level: cui.levelLabel(to.scope_kind, to.scope_name, { thisScreen: to.scope_kind === 'device' }) }), 'success');
+      }
+      return r;
+    },
+    onClose: (changed) => { if (changed) loadDevice(device.id, 'playlist'); },
+  });
 }
 
 function renderPlaylist(assignments) {
@@ -2164,6 +2581,10 @@ function setupActions(device) {
     showToast(ok ? t('device.debug.copied', { n: panel.childElementCount }) : t('device.debug.copy_failed'), ok ? 'success' : 'error');
   });
 
+  wireLocationSearch();
+  document.getElementById('saveSettingsTopBtn')?.addEventListener('click', () => {
+    document.getElementById('saveNotesBtn')?.click();
+  });
   document.getElementById('saveNotesBtn')?.addEventListener('click', async () => {
     try {
   // #325: "Use the default" clears the override. A colour input cannot be empty, so the intent is
@@ -2179,7 +2600,37 @@ function setupActions(device) {
     bgInput.addEventListener('input', () => { bgInput.dataset.cleared = ''; });
   }
 
-      await api.updateDevice(device.id, {
+      const loc = document.getElementById('deviceLocSearch');
+      const locBody = loc && loc.dataset.changed === '1'
+        ? (loc.dataset.lat ? { latitude: Number(loc.dataset.lat), longitude: Number(loc.dataset.lon), location_label: loc.value.trim() || null }
+          : { latitude: null, longitude: null, location_label: null })
+        : {};
+
+      let epdProfileUpdate = undefined;
+      const ditherEl = document.getElementById('epdDither');
+      if (ditherEl) {
+        let existingPreset = 'seeed-reterminal-sticky';
+        try {
+          if (typeof device.screen_profile === 'string') {
+            if (device.screen_profile.startsWith('{')) {
+              const p = JSON.parse(device.screen_profile);
+              if (p.preset) existingPreset = p.preset;
+            } else if (device.screen_profile) {
+              existingPreset = device.screen_profile;
+            }
+          } else if (typeof device.screen_profile === 'object' && device.screen_profile?.preset) {
+            existingPreset = device.screen_profile.preset;
+          }
+        } catch (_) {}
+        epdProfileUpdate = {
+          preset: existingPreset,
+          dither: ditherEl.value || 'floyd-steinberg',
+        };
+      }
+
+      const saved = await api.updateDevice(device.id, {
+        ...locBody,
+        tags: document.getElementById('deviceTags')?.value ?? undefined,
         notes: document.getElementById('deviceNotes').value,
         orientation: document.getElementById('deviceOrientation').value,
         // #325: the reset button clears the field, which sends '' and the API stores NULL, putting
@@ -2187,15 +2638,32 @@ function setupActions(device) {
         background_color: (document.getElementById('devBackground')?.dataset.cleared === '1')
           ? '' : (document.getElementById('devBackground')?.value || ''),
         default_content_id: document.getElementById('deviceDefaultContent').value || null,
-        ota_enabled: document.getElementById('otaToggle')?.checked ? 1 : 0,
-        ota_beta: document.getElementById('otaBetaToggle')?.checked ? 1 : 0,
-        reboot_schedule: document.getElementById('rebootSchedule')?.value || null,
+        // OTA toggles and the reboot time are not rendered for an embedded panel. Send each one only
+        // when its control is on the page, so a save never writes a value the operator could not see.
+        ...(document.getElementById('otaToggle')
+          ? { ota_enabled: document.getElementById('otaToggle').checked ? 1 : 0 } : {}),
+        ...(document.getElementById('otaBetaToggle')
+          ? { ota_beta: document.getElementById('otaBetaToggle').checked ? 1 : 0 } : {}),
+        ...(document.getElementById('rebootSchedule')
+          ? { reboot_schedule: document.getElementById('rebootSchedule').value || null } : {}),
         // Only present when the live-video toggle rendered (server master on); otherwise omitted so
         // a save never flips a flag the operator could not see.
         ...(document.getElementById('liveVideoToggle')
           ? { live_video_enabled: document.getElementById('liveVideoToggle').checked ? 1 : 0 } : {}),
+        ...(epdProfileUpdate !== undefined ? { screen_profile: epdProfileUpdate } : {}),
       });
+      if (saved && saved.screen_profile !== undefined) {
+        device.screen_profile = saved.screen_profile;
+      }
       showToast(t('device.toast.settings_saved'), 'success');
+      // A tag change can move the screen into or out of dynamic groups; say which.
+      for (const c of (saved && saved.groups_changed) || []) {
+        showToast(t(c.op === 'add' ? 'device.toast.joined_group' : 'device.toast.left_group', { name: c.name }), 'info');
+      }
+      if (saved && Array.isArray(saved.tags)) {
+        const el = document.getElementById('deviceTags');
+        if (el) el.value = saved.tags.join(', ');   // show what was stored (normalised), not what was typed
+      }
     } catch (err) {
       showToast(err.message, 'error');
     }
@@ -2361,6 +2829,13 @@ function setupActions(device) {
     } catch (err) { showToast(err.message, 'error'); }
     finally { blockBtn.disabled = false; }
   });
+
+  // Move to another workspace of the organization (components/device-move-dialog.js). Once moved
+  // the screen is no longer in this workspace, so the page goes back to the dashboard.
+  document.getElementById('moveDeviceBtn')?.addEventListener('click', () => openDeviceMoveDialog([device.id], {
+    currentWorkspaceId: device.workspace_id,
+    onMoved: () => { window.location.hash = '/'; },
+  }));
 
   // Delete (double-click to confirm)
   const deleteBtn = document.getElementById('deleteDeviceBtn');
@@ -2737,11 +3212,14 @@ async function setupPlaylistActions(device) {
   document.getElementById('applyLayoutBtn')?.addEventListener('click', async () => {
     const layoutId = document.getElementById('deviceLayoutSelect').value;
     try {
-      await fetch(`/api/layouts/device/${device.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('token')}` },
-        body: JSON.stringify({ layout_id: layoutId || null })
-      });
+      /*
+       * ⚠️ api.put, NOT a bare fetch. fetch only rejects on a network failure, so the old handler
+       * showed "Layout applied" for a 403 (viewer, cross-workspace layout) or a 400 (bad id) and then
+       * reloaded onto the unchanged layout with no explanation. request() throws the server's own
+       * error for a non-2xx, and it also applies the linked-server routing a bare fetch skipped —
+       * which sent this write to the LOCAL server while a customer's server was on screen.
+       */
+      await api.put(`/layouts/device/${device.id}`, { layout_id: layoutId || null });
       showToast(layoutId ? t('device.toast.layout_applied') : t('device.toast.switched_to_fullscreen'), 'success');
       // Reload the device page to show updated zone selectors, stay on playlist tab
       loadDevice(device.id, 'playlist');
@@ -3183,7 +3661,19 @@ function updateTelemetryDisplay(telemetry) {
     const el = document.getElementById(id);
     if (el) el.textContent = val;
   };
-  if (telemetry.battery_level != null) update('telBattery', telemetry.battery_level + '%');
+  if (!isEmbeddedDevice(currentDevice)) {
+    if (telemetry.battery_level != null) update('telBattery', telemetry.battery_level + '%');
+  } else if (telemetry.battery_level != null || telemetry.power_source || telemetry.battery_charging) {
+    let text = '--';
+    if (telemetry.battery_charging) {
+      text = telemetry.battery_level != null ? t('device.info.battery_charging_pct', { level: telemetry.battery_level }) : t('device.info.battery_charging');
+    } else if (telemetry.power_source === 'usb' || currentDevice?.power_source === 'usb') {
+      text = telemetry.battery_level != null ? t('device.info.battery_mains_pct', { level: telemetry.battery_level }) : t('device.info.battery_mains');
+    } else if (telemetry.battery_level != null) {
+      text = telemetry.battery_level + '%';
+    }
+    update('telBattery', text);
+  }
   if (telemetry.storage_free_mb) update('telStorage', t('device.info.size_free', { size: formatBytes(telemetry.storage_free_mb) }));
   if (telemetry.local_ip) update('telLocalIp', telemetry.local_ip);
   // update() no-ops when the card is absent, which is the case for a v4-only panel — a screen that
@@ -3276,6 +3766,7 @@ export function cleanup() {
   debugFrozen = false;
   debugHeld = [];
   remoteActive = false;
+  teardownCorporateLocks();
   currentDevice = null;
   window._sendKey = null;
 }

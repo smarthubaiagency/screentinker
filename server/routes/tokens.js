@@ -7,13 +7,14 @@ const crypto = require('crypto');
 const { db } = require('../db/database');
 const { generateToken, hashToken, displayPrefix } = require('../middleware/apiToken');
 const { accessContext } = require('../lib/tenancy');
-const { isZonedPlaylist } = require('../lib/agency-targets'); // #73: full-screen-only guardrail
+const { isZonedPlaylist, isGovernedPlaylist } = require('../lib/agency-targets'); // #73: full-screen-only guardrail
 const { isPlatformRole } = require('../middleware/auth');       // #146: billing:read mint gate
 
 // #73: 'agency' is OFF the read/write/full ladder (not in apiToken.js SCOPE_RANK), so a
 // tokenScopeGate-mounted router rejects it; it reaches only the AGENCY_ROUTER via agencyGate.
 // #146: 'billing:read' is likewise off-ladder — reaches only /api/billing via requireBillingRead.
 const { SCOPES } = require('../lib/api-scopes');   // shared with the published resource metadata
+const { dropTokenSubscriptions } = require('../lib/user-deletion'); // revoking a token ends its Zapier subscriptions
 
 // #158: per-workspace folder cap (mirrors folders.js) — auto-creating an agency folder must
 // respect the same ceiling so a token-mint can't blow past it.
@@ -103,6 +104,8 @@ router.post('/', (req, res) => {
       if (!inWs.get(pid, req.workspaceId)) return res.status(400).json({ error: `playlist ${pid} is not in this workspace` });
       // #73: agencies get FULL-SCREEN playlists only - a zoned playlist can't take full-screen uploads.
       if (isZonedPlaylist(db, pid)) return res.status(400).json({ error: 'A selected playlist is assigned to a zone on a screen — agency uploads play full-screen, so it can\'t be shared with an agency. Use a full-screen playlist.' });
+      // CORPORATE: head office's playlists (and their children) are changed by its admins, never by a token.
+      if (isGovernedPlaylist(db, pid)) return res.status(400).json({ error: 'A selected playlist is head office\'s (corporate), so it can\'t be shared with an agency. Share the slot playlist instead.', code: 'CORPORATE_TOKEN' });
     }
   }
   const secret = generateToken();
@@ -134,9 +137,14 @@ router.post('/', (req, res) => {
 router.delete('/:id', (req, res) => {
   const row = db.prepare('SELECT id, revoked_at FROM api_tokens WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
   if (!row) return res.status(404).json({ error: 'Token not found' });
-  if (!row.revoked_at) {
-    db.prepare("UPDATE api_tokens SET revoked_at = strftime('%s','now') WHERE id = ?").run(req.params.id);
-  }
+  // The REST-hook (Zapier) subscriptions it made go too, on every call: a repeat revoke also sweeps
+  // any left by a revoke that predates this cleanup.
+  db.transaction(() => {
+    if (!row.revoked_at) {
+      db.prepare("UPDATE api_tokens SET revoked_at = strftime('%s','now') WHERE id = ?").run(req.params.id);
+    }
+    dropTokenSubscriptions(db, [row.id]);
+  })();
   res.json({ success: true });
 });
 
@@ -153,6 +161,8 @@ router.put('/:id/targets', (req, res) => {
     if (!inWs.get(pid, tok.workspace_id)) return res.status(400).json({ error: `playlist ${pid} is not in this token's workspace` });
     // #73: full-screen-only - a zoned playlist can't be (re-)designated to an agency.
     if (isZonedPlaylist(db, pid)) return res.status(400).json({ error: 'A selected playlist is assigned to a zone on a screen — agency uploads play full-screen, so it can\'t be shared with an agency. Use a full-screen playlist.' });
+    // CORPORATE: head office's playlists (and their children) are changed by its admins, never by a token.
+    if (isGovernedPlaylist(db, pid)) return res.status(400).json({ error: 'A selected playlist is head office\'s (corporate), so it can\'t be shared with an agency. Share the slot playlist instead.', code: 'CORPORATE_TOKEN' });
   }
   const ins = db.prepare('INSERT OR IGNORE INTO api_token_targets (token_id, playlist_id) VALUES (?, ?)');
   db.transaction(() => {

@@ -333,3 +333,192 @@ test('#409: the cursor keypress is guarded like every other optional tool', () =
   assert.match(code, /command -v wtype >\/dev\/null 2>&1 && wtype .* \|\| true/,
     'wtype must be probed before it is called, and must never fail the launcher');
 });
+
+// The native-player arm of the installer: from `if [ "$NATIVE" = true ]` to its `exit 0`.
+function nativeArm() {
+  const m = SRC.match(/\nif \[ "\$NATIVE" = true \]; then\n([\s\S]*?)\n    exit 0\nfi\n/);
+  assert.ok(m, 'native arm not found — did the installer restructure?');
+  return m[1];
+}
+
+test('native: Desktop vs Lite is decided by what BOOTS, not by which packages are installed', () => {
+  // The browser kiosk (option 1/2) installs xserver-xorg on Lite. Reading that as Desktop left
+  // the native service disabled and the kiosk's X server holding the screen (DRM Permission denied).
+  const arm = nativeArm();
+  assert.doesNotMatch(arm, /dpkg -l (xserver-xorg|labwc)/, 'installed packages say nothing about whether a desktop runs');
+  assert.match(arm, /display-manager\.service/);
+  assert.match(arm, /systemctl get-default[^\n]*\n?[^\n]*graphical\.target/);
+  assert.match(arm, /if \[ -z "\$NATIVE_MODE" \]/, '--native-mode must override the detection');
+  assert.match(SRC, /--native-mode\)\n[\s\S]*?lite\|desktop\) NATIVE_MODE="\$2"/);
+});
+
+test('native: an earlier browser-kiosk install cannot keep the screen', () => {
+  const arm = nativeArm();
+  assert.match(arm, /systemctl disable --now screentinker-kiosk\.service/);
+  assert.match(arm, /rm -f \/etc\/systemd\/system\/screentinker-kiosk\.service/);
+  assert.match(arm, /\.config\/autostart\/screentinker\.desktop/);
+  assert.match(arm, /grep -q 'screentinker-kiosk\\\.sh'/, 'only remove an autostart entry that is the kiosk one');
+  assert.doesNotMatch(arm, /screentinker-server\.service/, 'the All-in-One server must keep running');
+  // The cleanup runs before either mode is set up, so both modes get it.
+  assert.ok(arm.indexOf('screentinker-kiosk.service') < arm.indexOf('screentinker-pi setup'));
+});
+
+test('native: the desktop autostart writes a log file (an autostart entry has no journal)', () => {
+  const launcher = fs.readFileSync(path.join(ROOT, 'native', 'packaging', 'linux', 'screentinker-pi'), 'utf8');
+  const fn = launcher.match(/def cmd_autostart\(args\):\n([\s\S]*?)\n\ndef /);
+  assert.ok(fn);
+  assert.match(fn[1], /player\.log/);
+  assert.match(fn[1], /os\.dup2\(fd, 2\)/);
+  assert.ok(fn[1].indexOf('dup2') < fn[1].indexOf('cmd_run(args)'), 'redirect before exec');
+});
+
+// Runs the native arm's REAL mode detection + kiosk cleanup against a fake root, with systemctl
+// stubbed: the scenario from the field (browser kiosk installed first, then the native player).
+function runNativeDetect({ files = {}, defaultTarget = 'multi-user.target', mode = '' }) {
+  const arm = nativeArm();
+  const start = arm.indexOf('    if [ -z "$NATIVE_MODE" ]; then');
+  const end = arm.indexOf('    if [ "$NATIVE_MODE" = desktop ]; then\n        screentinker-pi setup');
+  assert.ok(start > 0 && end > start, 'detection block not found');
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'st-native-'));
+  for (const [p, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(fake, p)), { recursive: true });
+    fs.writeFileSync(path.join(fake, p), body);
+  }
+  const block = arm.slice(start, end).replace(/(?<![\w.~])\/(etc|home|root)\//g, `${fake}/$1/`);
+  // ⚠️ Under the installer's OWN strict mode: without it a failing command in the block (Lite has no
+  // lightdm.conf) looked fine here while the real script died on it.
+  assert.match(SRC, /^set -euo pipefail$/m);
+  const script = [
+    'set -euo pipefail',
+    `NATIVE_MODE='${mode}'; SUDO_USER=sudoer`,
+    'log() { :; }',
+    `systemctl() { echo "systemctl $*" >> "${fake}/calls"; [ "$1" = get-default ] && echo ${defaultTarget}; return 0; }`,
+    'getent() { echo "uid1000:x:1000"; }',
+    block,
+    'echo "MODE=$NATIVE_MODE USER=$DESKTOP_USER"',
+  ].join('\n');
+  try {
+    const out = execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    // Snapshot BEFORE the fake root is removed below.
+    const left = new Set(fs.readdirSync(fake, { recursive: true }).map(String));
+    const exists = (p) => left.has(p);
+    const calls = exists('calls') ? fs.readFileSync(path.join(fake, 'calls'), 'utf8') : '';
+    return { out: out.trim().split('\n').pop(), exists, calls };
+  } finally {
+    fs.rmSync(fake, { recursive: true, force: true });
+  }
+}
+
+const KIOSK_UNIT = 'etc/systemd/system/screentinker-kiosk.service';
+const KIOSK_ENTRY = 'home/pi/.config/autostart/screentinker.desktop';
+
+test('native (run): Lite after a browser-kiosk install → lite, and the kiosk unit is gone', () => {
+  // xserver-xorg is installed (the kiosk put it there) but no display manager boots.
+  const r = runNativeDetect({ files: { [KIOSK_UNIT]: '[Unit]\n', 'etc/keep': '' } });
+  assert.match(r.out, /^MODE=lite /);
+  assert.equal(r.exists('etc/keep'), true, 'snapshot sanity');
+  assert.equal(r.exists(KIOSK_UNIT), false);
+  assert.match(r.calls, /disable --now screentinker-kiosk\.service/);
+});
+
+test('native (run): a desktop that boots → desktop, user from the autologin, kiosk entry removed', () => {
+  const r = runNativeDetect({
+    defaultTarget: 'graphical.target',
+    files: {
+      'etc/systemd/system/display-manager.service': '',
+      'etc/lightdm/lightdm.conf': '[Seat:*]\nautologin-user=kioskuser\n',
+      [KIOSK_ENTRY]: '[Desktop Entry]\nExec=/home/pi/screentinker-kiosk.sh\n',
+      'home/pi/.config/autostart/other.desktop': 'Exec=/usr/bin/other\n',
+    },
+  });
+  assert.equal(r.out, 'MODE=desktop USER=kioskuser');
+  assert.equal(r.exists(KIOSK_ENTRY), false);
+  assert.equal(r.exists('home/pi/.config/autostart/other.desktop'), true, 'only the kiosk entry goes');
+});
+
+test('native (run): a desktop image set to boot to console → lite; an unrelated screentinker.desktop is kept', () => {
+  const r = runNativeDetect({
+    files: {
+      'etc/systemd/system/display-manager.service': '',
+      [KIOSK_ENTRY]: '[Desktop Entry]\nExec=/usr/bin/something-else\n',
+    },
+  });
+  assert.match(r.out, /^MODE=lite USER=sudoer$/);
+  assert.equal(r.exists(KIOSK_ENTRY), true);
+});
+
+test('native (run): --native-mode overrides the detection', () => {
+  const r = runNativeDetect({ mode: 'desktop' });
+  assert.match(r.out, /^MODE=desktop /);
+});
+
+test('native (run): Lite with NO lightdm.conf runs to the end under set -euo pipefail', () => {
+  // The field report: Option 3 on a clean Lite image after a kiosk install stopped right after
+  // "Native player mode: lite" — kiosk unit still there, setup never ran.
+  const r = runNativeDetect({ files: { [KIOSK_UNIT]: '[Unit]\n' } });
+  assert.equal(r.out, 'MODE=lite USER=sudoer');
+  assert.equal(r.exists(KIOSK_UNIT), false);
+});
+
+// ---------------------------------------------------------------------- clock: NTP + a real time zone
+// ⚠️ Pi OS's default zone IS Europe/London: a Pi in Chicago played its schedules on UK time.
+
+function runClock(src, { cur, body = '', tz = '' }) {
+  const fn = src.match(/^st_setup_clock\(\) \{[\s\S]*?^\}$/m);
+  assert.ok(fn, 'st_setup_clock not found');
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'st-clock-'));
+  const calls = path.join(fake, 'calls');
+  const script = [
+    'set -euo pipefail',
+    `TIMEZONE=${JSON.stringify(tz)}`,
+    'log() { echo "LOG $1"; }', 'warn() { echo "WARN $1"; }',
+    `timedatectl() { case "$1" in show) echo ${JSON.stringify(cur)};; *) echo "$*" >> "${calls}";; esac; }`,
+    `curl() { [ -n ${JSON.stringify(body)} ] && printf '%s' ${JSON.stringify(body)} || return 22; }`,
+    fn[0],
+    'st_setup_clock http://server',
+  ].join('\n');
+  try {
+    const out = execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    const done = fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n') : [];
+    return { out, ntp: done.includes('set-ntp true'), set: done.filter((c) => c.startsWith('set-timezone')).map((c) => c.split(' ')[1]) };
+  } finally {
+    fs.rmSync(fake, { recursive: true, force: true });
+  }
+}
+
+for (const [name, file] of [['raspberry-pi-setup.sh', SCRIPT], ['debian-13-setup.sh', path.join(path.dirname(SCRIPT), 'debian-13-setup.sh')]]) {
+  const src = fs.readFileSync(file, 'utf8');
+  test(`${name}: clock — NTP on, a default zone is detected from our server`, () => {
+    for (const cur of ['Europe/London', 'Etc/UTC', '']) {
+      const r = runClock(src, { cur, body: '{"timezone":"America/Chicago"}' });
+      assert.ok(r.ntp, 'NTP is turned on');
+      assert.deepEqual(r.set, ['America/Chicago'], `from ${cur || '(none)'}`);
+    }
+  });
+  test(`${name}: clock — a zone somebody chose is kept; --timezone wins`, () => {
+    let r = runClock(src, { cur: 'Asia/Tokyo', body: '{"timezone":"America/Chicago"}' });
+    assert.deepEqual(r.set, []);
+    assert.ok(r.ntp);
+    r = runClock(src, { cur: 'Asia/Tokyo', tz: 'America/Denver' });
+    assert.deepEqual(r.set, ['America/Denver']);
+  });
+  test(`${name}: clock — no answer or a bad one keeps the zone, never fails the install`, () => {
+    for (const body of ['', '<html>404</html>', '{"timezone":"Mars/Olympus"}', '{"timezone":"../../etc/passwd"}', '{"timezone":"a; reboot"}']) {
+      const r = runClock(src, { cur: 'Etc/UTC', body });
+      assert.deepEqual(r.set, [], `body ${body || '(none)'}`);
+      assert.match(r.out, /WARN/);
+    }
+  });
+}
+
+test('the clock is set BEFORE the native player starts, and on the kiosk paths too', () => {
+  // Native: `screentinker-pi setup` sets it (before it starts the player — test_launcher.py), with
+  // --timezone passed through; the installer calling st_setup_clock too printed every warning twice.
+  const arm = SRC.slice(SRC.indexOf('if [ "$NATIVE" = true ]; then'), SRC.indexOf('# 8. Kiosk launcher supervision'));
+  assert.ok(!/^\s*st_setup_clock /m.test(arm), 'the native path leaves the clock to screentinker-pi setup');
+  assert.match(arm, /&& TZ_ARGS=\(--timezone "\$TIMEZONE"\)/);
+  for (const mode of ['desktop', 'lite']) {
+    assert.match(arm, new RegExp(`screentinker-pi setup "\\$SERVER_URL" --mode ${mode}[^\\n]*"\\$\\{TZ_ARGS\\[@\\]\\}"`));
+  }
+  assert.ok(SRC.lastIndexOf('st_setup_clock "$SERVER_URL"') > SRC.indexOf('# 8. Kiosk launcher supervision'), 'kiosk installs set it too');
+});

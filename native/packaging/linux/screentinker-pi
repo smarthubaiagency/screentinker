@@ -1,11 +1,14 @@
 #!/usr/bin/python3
 """screentinker-pi — launcher and setup for the native ScreenTinker Raspberry Pi player.
 
-  screentinker-pi setup URL [--name NAME] [--mode lite|desktop] [--user USER]
+  screentinker-pi setup URL [--name NAME] [--mode lite|desktop] [--user USER]      (mode: detected)
                             [--allow-package-install] [--state-dir DIR]     (as root)
   screentinker-pi run                  start the player in the foreground (what the service runs)
   screentinker-pi status               show configuration and service state
   screentinker-pi unpair               forget this panel's pairing (as root, or as the player user)
+  screentinker-pi audience-addon install [--server URL] | remove | status          (as root)
+                                       the OPTIONAL audience-counting add-on (OpenCV + face model,
+                                       ~54 MB) from the configured server; off unless installed
 
 Two run modes:
   lite     Pi OS Lite, no desktop: a system service draws straight to the display over KMS (eglfs)
@@ -16,15 +19,28 @@ Two run modes:
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import pwd
+import shutil
+import struct
 import subprocess
 import sys
+import tempfile
+import urllib.request
+import zipfile
 
 LIB = "/usr/lib/screentinker-pi"
 SYSTEM_CONFIG = "/etc/screentinker-pi/config.json"
 SERVICE = "screentinker-pi"
+# Root-owned on purpose: the player imports code from here, so the player user (and with it the
+# dashboard's remote shell) must not be able to write it — nor any directory above it, which is why
+# it is NOT under /opt/screentinker (raspberry-pi-setup.sh hands that tree to the player user). The
+# player refuses it otherwise: screentinker_native/system/audience.py LINUX_ADDON_DIR.
+AUDIENCE_DIR = "/usr/lib/screentinker-pi-audience"
+# Where 1.x add-ons went. Never loaded from now on; install and remove delete it.
+OLD_AUDIENCE_DIRS = ("/opt/screentinker/audience-addon",)
 
 
 def load_cfg():
@@ -53,6 +69,28 @@ def sh(*argv, check=False):
     return subprocess.run(list(argv), check=check)
 
 
+def boots_to_desktop():
+    """The installer's rule (scripts/raspberry-pi-setup.sh): a desktop that BOOTS — a display manager
+    enabled and graphical.target the default — not "desktop packages are installed"."""
+    if not os.path.exists("/etc/systemd/system/display-manager.service"):
+        return False
+    r = subprocess.run(["systemctl", "get-default"], capture_output=True, text=True)
+    return r.stdout.strip() == "graphical.target"
+
+
+def desktop_login_user():
+    """The display manager's autologin user, else whoever ran sudo — the installer's rule too."""
+    try:
+        with open("/etc/lightdm/lightdm.conf") as f:
+            users = [l.split("=", 1)[1].strip() for l in f
+                     if l.strip().startswith("autologin-user") and "=" in l]
+        if users and users[-1]:
+            return users[-1]
+    except OSError:
+        pass
+    return os.environ.get("SUDO_USER")
+
+
 def kms_card():
     """The DRM card that actually has connectors. A Pi 5 exposes TWO cards (v3d renders, vc4
     displays) and eglfs picks card0 by default — the wrong one — which is a black screen with no error."""
@@ -64,6 +102,26 @@ def kms_card():
             continue
     cards = sorted({os.path.basename(p).split("-", 1)[0] for p in glob.glob("/sys/class/drm/card[0-9]-*")})
     return "/dev/dri/" + cards[0] if cards else None
+
+
+def pulse_server(uid=None, wait_s=20, sleep=None, exists=None):
+    """The player user's own PipeWire (PulseAudio protocol) socket, waited for briefly at boot.
+
+    ⚠️ Debian's Qt has no ALSA audio backend: without a sound server it reports "No audio device
+    detected" and every video plays silently. The Lite service runs as a system user with no login
+    session; the package enables lingering for it, so systemd starts its PipeWire at boot. A system
+    unit cannot name its own User='s uid (%U is root's there), so this finds the socket by uid instead.
+    Returns "unix:<path>", or None when there is none (the player still runs, just without sound)."""
+    import time
+    uid = os.getuid() if uid is None else uid
+    sleep = sleep or time.sleep
+    exists = exists or os.path.exists
+    sock = "/run/user/%d/pulse/native" % uid
+    for _ in range(max(1, int(wait_s))):
+        if exists(sock):
+            return "unix:" + sock
+        sleep(1)
+    return None
 
 
 def cmd_run(args):
@@ -84,7 +142,14 @@ def cmd_run(args):
                 json.dump({"device": card, "hwcursor": False}, f)
             env["QT_QPA_EGLFS_KMS_CONFIG"] = kcfg
     elif env.get("WAYLAND_DISPLAY") and "QT_QPA_PLATFORM" not in env:
-        env["QT_QPA_PLATFORM"] = "wayland"
+        # ⚠️ With a fallback. A bare "wayland" aborts Qt at startup when the Wayland platform plugin
+        # is missing (it is the separate qt6-wayland package, which early .debs did not depend on):
+        # the desktop autostart ran, the player died before drawing anything, and the screen just
+        # showed the desktop. xcb goes through Xwayland, which Pi OS's labwc and wayfire both run.
+        env["QT_QPA_PLATFORM"] = "wayland;xcb"
+    pulse = pulse_server()
+    if pulse and "PULSE_SERVER" not in env:
+        env["PULSE_SERVER"] = pulse
     # WebEngine: GPU rasterisation on the Pi's V3D is where Chromium is least stable; the scene graph
     # (video, images, transitions) keeps its GPU path regardless.
     env.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
@@ -93,22 +158,117 @@ def cmd_run(args):
     os.execve(sys.executable, argv, env)
 
 
+# The zone an image ships with, i.e. one nobody chose. ⚠️ Pi OS's default IS Europe/London: every Pi
+# set up without the Imager's locale step ran its schedules on UK time (seen on a Pi 4 in Chicago).
+DEFAULT_ZONES = ("", "Europe/London", "Etc/UTC", "UTC", "Etc/Universal", "Universal", "GMT", "Etc/GMT")
+
+
+def valid_zone(tz):
+    import re
+    return bool(tz) and bool(re.match(r"^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}$", tz)) \
+        and os.path.isfile(os.path.join("/usr/share/zoneinfo", tz))
+
+
+def lookup_zone(server, urlopen=None):
+    """The zone the SERVER sees this Pi in (screentinker.com answers from Cloudflare's visitor
+    location). Our own server only: no third-party geo-IP service sees the customer's IP. None when
+    it cannot say (a LAN server, an older server, no network); the dashboard fills it in at pairing."""
+    urlopen = urlopen or urllib.request.urlopen
+    try:
+        with urlopen(server.rstrip("/") + "/api/public/timezone", timeout=5) as r:
+            tz = (json.loads(r.read().decode("utf-8") or "{}") or {}).get("timezone")
+    except Exception:
+        return None
+    return tz if isinstance(tz, str) and valid_zone(tz) else None
+
+
+def setup_clock(server, wanted=None, run=None, current=None, lookup=None, out=print):
+    """NTP on, and a real time zone. An explicit --timezone wins; a zone somebody chose is kept; a
+    default one is looked up. Never fails setup: a wrong zone is worse than none, so when unsure, keep."""
+    run = run or (lambda *a: subprocess.run(list(a), capture_output=True, text=True))
+    run("timedatectl", "set-ntp", "true")
+    if current is None:
+        r = run("timedatectl", "show", "-p", "Timezone", "--value")
+        current = (getattr(r, "stdout", "") or "").strip()
+    if wanted:
+        if not valid_zone(wanted):
+            out("⚠️  Unknown time zone %r (expected Area/City, e.g. America/Chicago): kept %s" % (wanted, current or "the current zone"))
+            return current
+        tz, why = wanted, "from --timezone"
+    elif current not in DEFAULT_ZONES:
+        out("Time zone: %s (kept; change with --timezone Area/City)" % current)
+        return current
+    else:
+        tz = (lookup or lookup_zone)(server)
+        if not tz:
+            out("Time zone: %s — could not detect one. If that is wrong, pair the display from a browser in" % (current or "UTC"))
+            out("   its time zone, or re-run with --timezone Area/City (e.g. America/Chicago).")
+            return current
+        why = "detected"
+    if tz != current:
+        r = run("timedatectl", "set-timezone", tz)
+        if getattr(r, "returncode", 0) != 0:
+            out("⚠️  Could not set the time zone to %s: %s" % (tz, (getattr(r, "stderr", "") or "").strip()))
+            return current
+    out("Time zone: %s (%s)" % (tz, why))
+    return tz
+
+
+ALL_OUTPUTS_CONF = "/usr/share/screentinker-pi/pipewire-all-outputs.conf"
+
+
+def install_all_outputs(user, run=None, src=ALL_OUTPUTS_CONF):
+    """The "All outputs" sound sink (HDMI and the headphone jack together) for the desktop user.
+
+    The package installs it for the Lite service's `screentinker` user only; in desktop mode the
+    player runs as the login user, whose PipeWire picked the headphone jack — video sound never
+    reached the HDMI screen (seen on a Pi 4 with the Desktop image). Written AS that user, so root
+    never follows a link in someone's home. Takes effect at their next login, which is when the
+    player starts. Never fails setup: no sound is better than no player."""
+    run = run or (lambda *a: subprocess.run(list(a), capture_output=True, text=True))
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return False
+    dest = os.path.join(home, ".config/pipewire/pipewire.conf.d/50-screentinker-all-outputs.conf")
+    r = run("runuser", "-u", user, "--", "install", "-D", "-m", "0644", src, dest)
+    if getattr(r, "returncode", 0) != 0:
+        print("⚠️  Could not set up sound on all outputs for %s: %s" % (user, (getattr(r, "stderr", "") or "").strip()))
+        return False
+    print("Sound: all outputs (HDMI and headphones) for %s, from the next login." % user)
+    return True
+
+
 def cmd_setup(args):
     need_root()
     cfg = load_cfg()
     cfg["server_url"] = args.url.rstrip("/")
     if args.name:
         cfg["device_name"] = args.name
-    cfg["mode"] = args.mode
+    # ⚠️ DETECTED when not given. This defaulted to lite, so re-running `setup URL` by hand on a
+    # Desktop Pi — a natural thing to try when the player has not appeared — enabled the system
+    # service on a machine whose display manager owns the screen. The service then failed every DRM
+    # page flip ("Permission denied") and the screen stayed on the desktop. Reported from the field.
+    desktop = boots_to_desktop()
+    mode = args.mode or ("desktop" if desktop else "lite")
+    if args.mode is None:
+        print("Mode: %s (detected; override with --mode lite|desktop)" % mode)
+    elif mode == "lite" and desktop:
+        print("⚠️  This Pi boots to a desktop, and the desktop owns the screen: the lite service will not")
+        print("   be able to draw until the desktop is disabled (sudo raspi-config → System → Boot → Console).")
+        print("   To run inside the desktop instead: sudo screentinker-pi setup URL --mode desktop")
+    cfg["mode"] = mode
+    setup_clock(cfg["server_url"], args.timezone)
     cfg["allow_package_install"] = bool(args.allow_package_install)
-    if args.mode == "desktop":
-        user = args.user or os.environ.get("SUDO_USER")
+    if mode == "desktop":
+        user = args.user or desktop_login_user()
         if not user:
             sys.exit("--mode desktop needs --user (the desktop login user)")
         pwd.getpwnam(user)
         cfg["desktop_user"] = user
         # The helper is granted to the screentinker GROUP: put the desktop user in it.
         sh("adduser", user, "screentinker")
+        install_all_outputs(user)
         sh("systemctl", "disable", "--now", SERVICE)
         print("Desktop mode: the player starts full screen at %s's next desktop login." % user)
         print("⚠️  The dashboard's remote terminal runs as %s — if that user has sudo, so does the terminal." % user)
@@ -128,6 +288,19 @@ def cmd_autostart(args):
     me = pwd.getpwuid(os.getuid()).pw_name
     if cfg.get("mode") != "desktop" or cfg.get("desktop_user") != me:
         return 0
+    # An autostart entry has no journal: without a file, a player that dies at login leaves no trace.
+    state = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), SERVICE)
+    try:
+        os.makedirs(state, exist_ok=True)
+        path = os.path.join(state, "player.log")
+        if os.path.exists(path) and os.path.getsize(path) > 5_000_000:
+            os.replace(path, path + ".1")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        os.close(fd)
+    except OSError:
+        pass
     args.rest = []
     cmd_run(args)
 
@@ -152,20 +325,157 @@ def cmd_unpair(args):
     sh("systemctl", "restart", SERVICE)
 
 
+# ---------------------------------------------------------------------- audience-counting add-on
+
+def addon_platform(machine=None, version=None, pointer_bits=None):
+    """The server's platform name (server/lib/audience-addon.js): the add-on holds compiled modules,
+    so it names the CPU AND the Python (this launcher runs on the same /usr/bin/python3 as the player).
+    ⚠️ uname is the KERNEL's architecture: 32-bit Pi OS on a 64-bit kernel says aarch64, so the
+    userland (this Python's pointer size) must be 64-bit too."""
+    machine = machine or os.uname().machine
+    version = version or sys.version_info[:2]
+    pointer_bits = pointer_bits or struct.calcsize("P") * 8
+    arch = {"aarch64": "aarch64", "arm64": "aarch64", "x86_64": "x86_64", "amd64": "x86_64"}.get(machine)
+    if not arch or pointer_bits != 64:
+        return None
+    return "linux-%s-cp%d%d" % (arch, version[0], version[1])
+
+
+def safe_extract(zf, dest):
+    """Extract every member under dest, refusing absolute paths, `..` and links."""
+    root = os.path.realpath(dest)
+    for info in zf.infolist():
+        name = info.filename
+        if name.startswith("/") or "\\" in name or any(part == ".." for part in name.split("/")):
+            raise ValueError("unsafe path in add-on: %r" % name)
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            raise ValueError("symlink in add-on: %r" % name)
+        target = os.path.realpath(os.path.join(root, name))
+        if target != root and not target.startswith(root + os.sep):
+            raise ValueError("unsafe path in add-on: %r" % name)
+        if name.endswith("/"):
+            os.makedirs(target, mode=0o755, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+        os.chmod(target, 0o644)
+
+
+def _restart_player(cfg):
+    if cfg.get("mode") == "desktop":
+        print("Log out and back in (or reboot) for the player to pick it up.")
+    elif subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode == 0:
+        sh("systemctl", "restart", SERVICE)
+        print("Player restarted.")
+
+
+def _remove_old_addons():
+    for d in OLD_AUDIENCE_DIRS:
+        if os.path.lexists(d):
+            if os.path.isdir(d) and not os.path.islink(d):
+                shutil.rmtree(d)
+            else:
+                os.unlink(d)
+            print("Removed the old add-on location %s (no longer used)." % d)
+
+
+def cmd_audience_addon(args):
+    cfg = load_cfg()
+    if args.action == "status":
+        try:
+            with open(os.path.join(AUDIENCE_DIR, "ADDON.json")) as f:
+                print(json.dumps(json.load(f), indent=1))
+        except (OSError, ValueError):
+            print("not installed")
+        return 0
+    need_root()
+    _remove_old_addons()
+    if args.action == "remove":
+        if os.path.isdir(AUDIENCE_DIR):
+            shutil.rmtree(AUDIENCE_DIR)
+            print("Audience-counting add-on removed.")
+            _restart_player(cfg)
+        else:
+            print("not installed")
+        return 0
+    platform = addon_platform()
+    if not platform:
+        sys.exit("Audience counting needs a 64-bit OS (aarch64 or x86_64) with a 64-bit userland; this is "
+                 "a %s kernel with a %d-bit Python. Install the 64-bit Pi OS."
+                 % (os.uname().machine, struct.calcsize("P") * 8))
+    server = (args.server or cfg.get("server_url") or "").rstrip("/")
+    if not server:
+        sys.exit("No server configured: sudo screentinker-pi audience-addon install --server https://your-server")
+    try:
+        with urllib.request.urlopen("%s/api/audience-addon/%s" % (server, platform), timeout=30) as r:
+            meta = json.load(r)
+    except Exception as e:
+        sys.exit("Could not ask %s for the add-on (the server may be older than the add-on): %s" % (server, e))
+    if not meta.get("available"):
+        sys.exit("%s does not offer the audience-counting add-on for %s (%s)." % (server, platform, meta.get("reason")))
+    sha = str(meta.get("sha256") or "").lower()
+    try:
+        with open(os.path.join(AUDIENCE_DIR, "ADDON-SHA256")) as f:
+            if f.read().strip() == sha and os.path.isfile(os.path.join(AUDIENCE_DIR, "ADDON.json")):
+                print("Audience-counting add-on %s is already installed." % meta.get("version"))
+                return 0
+    except OSError:
+        pass
+    print("Downloading the audience-counting add-on %s (%d MB)..." % (meta.get("version"), int(meta.get("size") or 0) // 1048576))
+    parent = os.path.dirname(AUDIENCE_DIR)
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".audience-", dir=parent) as tmp:
+        zpath = os.path.join(tmp, "addon.zip")
+        h = hashlib.sha256()
+        with urllib.request.urlopen(server + meta["download_url"], timeout=60) as r, open(zpath, "wb") as out:
+            for chunk in iter(lambda: r.read(1 << 20), b""):
+                h.update(chunk)
+                out.write(chunk)
+        if h.hexdigest() != sha:
+            sys.exit("Checksum mismatch: the download is not the add-on the server describes. Nothing was installed.")
+        new = os.path.join(tmp, "audience")
+        os.makedirs(new, mode=0o755)
+        os.chmod(new, 0o755)                   # whatever the umask: the player user must read it
+        with zipfile.ZipFile(zpath) as zf:
+            safe_extract(zf, new)
+        with open(os.path.join(new, "ADDON.json")) as f:
+            manifest = json.load(f)
+        want = "%d.%d" % sys.version_info[:2]
+        if manifest.get("python") != want:
+            sys.exit("The add-on is built for Python %s; this Pi runs %s." % (manifest.get("python"), want))
+        with open(os.path.join(new, "ADDON-SHA256"), "w") as f:
+            f.write(sha + "\n")
+        old = os.path.join(tmp, "old")
+        if os.path.isdir(AUDIENCE_DIR):
+            os.rename(AUDIENCE_DIR, old)
+        os.rename(new, AUDIENCE_DIR)
+    print("Audience-counting add-on %s installed in %s." % (manifest.get("version"), AUDIENCE_DIR))
+    print("It counts only when your organization switches audience counting on for this screen, and")
+    print("needs a USB webcam (a Pi camera module on the ribbon connector is not supported).")
+    _restart_player(cfg)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="screentinker-pi")
     sub = ap.add_subparsers(dest="cmd")
     s = sub.add_parser("setup")
     s.add_argument("url")
     s.add_argument("--name")
-    s.add_argument("--mode", choices=("lite", "desktop"), default="lite")
+    s.add_argument("--mode", choices=("lite", "desktop"), default=None,
+                   help="default: desktop if this Pi boots to a desktop, else lite")
     s.add_argument("--user")
+    s.add_argument("--timezone", help="IANA zone, e.g. America/Chicago (default: kept, or detected if it is still the image default)")
     s.add_argument("--allow-package-install", action="store_true",
                    help="let the dashboard install ANY .deb (maintainer scripts run as root)")
     sub.add_parser("run", help="start the player; any further options (--server, -v, --windowed) pass through")
     sub.add_parser("autostart")
     sub.add_parser("status")
     sub.add_parser("unpair")
+    a = sub.add_parser("audience-addon", help="the optional audience-counting add-on")
+    a.add_argument("action", choices=("install", "remove", "status"))
+    a.add_argument("--server", help="default: the configured server")
     # parse_known_args: `run` hands every option it does not know to the player itself.
     args, extra = ap.parse_known_args()
     if args.cmd not in (None, "run") and extra:
@@ -179,6 +489,8 @@ def main():
         return cmd_status(args)
     if args.cmd == "unpair":
         return cmd_unpair(args)
+    if args.cmd == "audience-addon":
+        return cmd_audience_addon(args)
     return cmd_run(args)
 
 

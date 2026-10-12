@@ -12,6 +12,7 @@ import { openTypeToConfirmModal } from '../components/type-to-confirm-modal.js';
 // 409 duplicate-email / weak-password / invalid-email cases) so we don't fork a
 // second mapper.
 import { mapMutationError } from './workspace-members.js';
+import { mountInstanceStorage } from '../components/storage-settings.js';
 
 const headers = () => ({ Authorization: `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 // A refused request must reject, not resolve.
@@ -154,16 +155,22 @@ ${section(t('admin.orgs.title'), t('admin.orgs.desc'), `
     html: () => section(t('admin.branding.title'), t('admin.branding.desc'), `<div id="brandingForm">${loading()}</div>`),
     load: () => loadBranding(),
   },
+  rollouts: {
+    tab: 'platform.tab.rollouts', title: 'platform.rollouts.title', subtitle: 'platform.rollouts.subtitle',
+    html: () => section(t('platform.rollouts.title'), t('platform.rollouts.desc'), `<div id="rolloutsBody">${loading()}</div>`),
+    load: () => loadRollouts(),
+  },
   system: {
     tab: 'platform.tab.system', title: 'platform.system.title', subtitle: 'platform.system.subtitle',
     html: () => `
       ${section(t('admin.system'), '', `<div id="systemInfo">${loading()}</div>`)}
+      ${section('Instance storage', '', `<div id="instanceStorage">${loading()}</div>`)}
     <div class="settings-section">
       <h3>${t('admin.diag.title')}</h3>
       <p style="color:var(--text-muted);font-size:12px;margin-bottom:12px">${t('admin.diag.desc')}</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
         <button class="btn btn-secondary" id="diagRefreshBtn">${t('admin.diag.refresh')}</button>
-        <select id="diagProfileSecs" class="form-control" style="width:auto">
+        <select id="diagProfileSecs" class="input" style="width:auto">
           <option value="30">30s</option><option value="60">60s</option><option value="15">15s</option>
         </select>
         <button class="btn btn-secondary" id="diagProfileBtn">${t('admin.diag.profile')}</button>
@@ -173,7 +180,7 @@ ${section(t('admin.orgs.title'), t('admin.orgs.desc'), `
     </div>
       ${section(esc(t('platform.system.status_endpoint')), '', `<div id="statusDebugForm">${loading()}</div>`)}
       ${section(esc(t('platform.system.player_debug')), esc(t('platform.system.player_debug_desc')), `<a class="btn btn-secondary" href="#/admin/player-debug">${esc(t('platform.system.player_debug_open'))} &rarr;</a>`)}`,
-    load: () => { loadSystem(); loadDiagnostics(); wireDiagnostics(); loadStatusDebug(); },
+    load: () => { loadSystem(); mountInstanceStorage(document.getElementById('instanceStorage')); loadDiagnostics(); wireDiagnostics(); loadStatusDebug(); },
   },
   cleanup: {
     tab: 'platform.tab.cleanup', title: 'platform.cleanup.title', subtitle: 'platform.cleanup.subtitle',
@@ -746,10 +753,19 @@ async function loadPlans() {
     // Admin endpoint, not /api/subscription/plans: that one filters `active = 1` because it feeds
     // the pricing page, so a deliberately hidden plan (a comped or beta tier) was invisible to the
     // operator too. Here we want every plan, plus who is actually on each one.
-    const { plans, orphaned } = await api.adminListPlans();
+    const { plans, orphaned, stripe_configured: stripeConfigured } = await api.adminListPlans();
+    // Platform operators look; only platform admins change plans (the server enforces it).
+    const canEdit = isPlatformAdmin(JSON.parse(localStorage.getItem('user') || '{}'));
+    // Whether a paid plan can actually be bought: checkout charges its linked Stripe price.
+    const checkout = (p) => {
+      if (!(p.price_monthly > 0) && !(p.price_yearly > 0)) return `<span style="color:var(--text-muted)">${esc(t('admin.plan.checkout_none'))}</span>`;
+      const missing = (p.price_monthly > 0 && !p.stripe_price_monthly) || (p.price_yearly > 0 && !p.stripe_price_yearly);
+      return missing ? `<span style="color:var(--warning)">${esc(t('admin.plan.checkout_missing'))}</span>` : esc(t('admin.plan.checkout_linked'));
+    };
     el.innerHTML = `
+      ${canEdit ? `<div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button type="button" class="btn btn-primary btn-sm" id="planNewBtn">${esc(t('admin.plan.new'))}</button></div>` : ''}
       <div class="table-wrap">
-      <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:500px">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:640px">
         <thead><tr style="border-bottom:1px solid var(--border)">
           <th style="padding:8px;text-align:left;color:var(--text-muted)">${t('admin.col.plan')}</th>
           <th style="padding:8px;text-align:right;color:var(--text-muted)">${t('admin.col.devices')}</th>
@@ -758,6 +774,8 @@ async function loadPlans() {
           <th style="padding:8px;text-align:right;color:var(--text-muted)">${t('admin.col.yearly')}</th>
           <th style="padding:8px;text-align:right;color:var(--text-muted)">${t('admin.col.accounts')}</th>
           <th style="padding:8px;text-align:right;color:var(--text-muted)">${t('admin.col.screens')}</th>
+          <th style="padding:8px;text-align:left;color:var(--text-muted)">${t('admin.plan.checkout')}</th>
+          ${canEdit ? `<th style="padding:8px"><span class="lib-visually-hidden">${esc(t('admin.col.actions'))}</span></th>` : ''}
         </tr></thead>
         <tbody>
           ${plans.map(p => `
@@ -772,6 +790,8 @@ async function loadPlans() {
               <td style="padding:8px;text-align:right">${p.price_yearly > 0 ? '$'+p.price_yearly : '-'}</td>
               <td style="padding:8px;text-align:right${p.user_count ? ';font-weight:500' : ';color:var(--text-muted)'}">${p.user_count}</td>
               <td style="padding:8px;text-align:right;color:var(--text-muted)">${p.device_count}</td>
+              <td style="padding:8px;font-size:12px">${checkout(p)}</td>
+              ${canEdit ? `<td style="padding:8px;text-align:right"><button type="button" class="btn btn-secondary btn-sm" data-plan-edit="${esc(p.id)}" aria-label="${esc(t('admin.plan.edit_named', { name: p.display_name }))}">${esc(t('admin.plan.edit'))}</button></td>` : ''}
             </tr>
           `).join('')}
         </tbody>
@@ -782,6 +802,14 @@ async function loadPlans() {
           ${t('admin.plan_orphaned')}: ${orphaned.map(o => `<strong>${esc(o.plan_id)}</strong> (${o.user_count})`).join(', ')}
         </p>` : ''}
     `;
+    el.querySelector('#planNewBtn')?.addEventListener('click', async () => {
+      const { openPlanEditor } = await import('../components/plan-editor.js');
+      openPlanEditor({ stripeConfigured, onSaved: () => loadPlans() });
+    });
+    el.querySelectorAll('[data-plan-edit]').forEach((b) => b.addEventListener('click', async () => {
+      const { openPlanEditor } = await import('../components/plan-editor.js');
+      openPlanEditor({ plan: plans.find((x) => x.id === b.dataset.planEdit), stripeConfigured, onSaved: () => loadPlans() });
+    }));
   } catch (err) { el.innerHTML = `<p style="color:var(--danger)">${esc(err.message)}</p>`; }
 }
 
@@ -790,6 +818,13 @@ async function loadSystem() {
   try {
     const version = await fetch('/api/version').then(r => r.json());
     const token = localStorage.getItem('token');
+    // Platform admins only (the route enforces it); anyone else just gets the version cards.
+    // ⚠️ isPlatformAdmin needs the user. Called bare it was always false, so this page never asked:
+    // no "Updater ready" card, no confirm before Update Now, and no progress after a reload.
+    const updateStatus = isPlatformAdmin(JSON.parse(localStorage.getItem('user') || '{}'))
+      ? await fetch('/api/admin/update-status', { headers: headers() }).then(r => (r.ok ? r.json() : null)).catch(() => null)
+      : null;
+    const updaterInfo = updateStatus?.updater || null;
 
     const versionComparison = version.latest_version
       ? `<div class="info-card">
@@ -809,6 +844,12 @@ async function loadSystem() {
       <div class="info-grid">
         <div class="info-card"><div class="info-card-label">${t('admin.version')}</div><div class="info-card-value small">${esc(version.version)}</div></div>
         ${versionComparison}
+        ${updaterInfo ? `<div class="info-card">
+           <div class="info-card-label">${t('admin.updater')}</div>
+           <div class="info-card-value small" style="color:${updaterInfo.available ? 'var(--success)' : 'var(--text-muted)'}">${
+             updaterInfo.available ? esc(t('admin.updater_ready', { kind: updaterInfo.kind }))
+             : updaterInfo.reason === 'not_running' ? t('admin.updater_not_running') : t('admin.updater_not_installed')}</div>
+         </div>` : ''}
       </div>
       <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
         <button class="btn btn-secondary btn-sm" id="checkUpdateBtn">${t('admin.check_now')}</button>
@@ -839,83 +880,133 @@ async function loadSystem() {
       }
     });
 
-    // Update Now button
+    // Update Now button. Queues an upgrade for the host-side updater (docs/instance-updater.md);
+    // without one installed, the server answers with the command to run by hand instead.
     document.getElementById('triggerUpdateBtn')?.addEventListener('click', async () => {
       const btn = document.getElementById('triggerUpdateBtn');
       const resultEl = document.getElementById('updateResult');
+      const target = version.latest_version;
+      if (updaterInfo?.available
+          && !confirm(t('admin.update_confirm', { from: version.version, to: target }))) return;
       btn.disabled = true;
       btn.textContent = t('admin.updating');
       try {
-        const res = await fetch('/api/admin/trigger-update', { method: 'POST', headers: headers() });
+        const res = await fetch('/api/admin/trigger-update', {
+          method: 'POST',
+          headers: { ...headers(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target }),
+        });
         const data = await res.json();
-        if (data.docker_enabled) {
-          // Docker executed — show output with Copy button
-          resultEl.innerHTML = `
-            <div style="margin-top:12px;border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-card)">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                <strong style="font-size:13px">${data.success ? (t('admin.update_success')) : (t('admin.update_failed'))}</strong>
-                <button class="btn btn-secondary btn-sm" id="copyOutputBtn">${t('admin.copy')}</button>
-              </div>
-              <pre style="max-height:300px;overflow:auto;font-size:11px;margin:0;background:var(--bg-primary);padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all">${esc(data.output || '')}</pre>
-            </div>`;
-          document.getElementById('copyOutputBtn')?.addEventListener('click', () => {
-            const pre = resultEl.querySelector('pre');
-            const text = pre ? pre.textContent : '';
-            if (navigator.clipboard) {
-              navigator.clipboard.writeText(text).then(() => showToast(t('admin.copied'), 'success'));
-            } else {
-              // Fallback for older browsers
-              const ta = document.createElement('textarea');
-              ta.value = text;
-              ta.style.position = 'fixed';
-              ta.style.opacity = '0';
-              document.body.appendChild(ta);
-              ta.select();
-              document.execCommand('copy');
-              document.body.removeChild(ta);
-              showToast(t('admin.copied'), 'success');
-            }
-          });
-        } else if (data.instructions) {
-          // Docker disabled — show manual instructions with Copy button
-          resultEl.innerHTML = `
-            <div style="margin-top:12px;border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-secondary)">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                <strong style="font-size:13px">${t('admin.manual_update')}</strong>
-                <button class="btn btn-secondary btn-sm" id="copyCmdBtn">${t('admin.copy_command')}</button>
-              </div>
-              <p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">${t('admin.manual_update_desc')}</p>
-              <pre style="font-size:11px;margin:0;background:var(--bg-primary);padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all">${esc(data.instructions)}</pre>
-            </div>`;
-          document.getElementById('copyCmdBtn')?.addEventListener('click', () => {
-            const pre = resultEl.querySelector('pre');
-            const text = pre ? pre.textContent : '';
-            if (navigator.clipboard) {
-              navigator.clipboard.writeText(text).then(() => showToast(t('admin.copied'), 'success'));
-            } else {
-              const ta = document.createElement('textarea');
-              ta.value = text;
-              ta.style.position = 'fixed';
-              ta.style.opacity = '0';
-              document.body.appendChild(ta);
-              ta.select();
-              document.execCommand('copy');
-              document.body.removeChild(ta);
-              showToast(t('admin.copied'), 'success');
-            }
-          });
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        if (data.queued) {
+          watchUpdate(resultEl, data.id);
+          return;  // the button stays disabled until the job ends
         }
+        resultEl.innerHTML = `
+          <div style="margin-top:12px;border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-secondary)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <strong style="font-size:13px">${t('admin.manual_update')}</strong>
+              <button class="btn btn-secondary btn-sm" id="copyCmdBtn">${t('admin.copy_command')}</button>
+            </div>
+            <p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">${t('admin.manual_update_desc')}</p>
+            <pre style="font-size:11px;margin:0;background:var(--bg-primary);padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all">${esc(data.instructions || '')}</pre>
+            <p style="font-size:12px;color:var(--text-muted);margin:8px 0 0">${t('admin.updater_hint')}</p>
+          </div>`;
+        document.getElementById('copyCmdBtn')?.addEventListener('click', () => copyText(resultEl.querySelector('pre')?.textContent || ''));
       } catch (err) {
         showToast(err.message, 'error');
-      } finally {
-        btn.disabled = false;
-        btn.textContent = t('admin.update_now');
       }
+      btn.disabled = false;
+      btn.textContent = t('admin.update_now');
     });
+
+    // An upgrade already running (this page was reloaded, or opened mid-upgrade): pick it up.
+    if (updateStatus?.running || updateStatus?.pending?.length) {
+      const btn = document.getElementById('triggerUpdateBtn');
+      if (btn) { btn.disabled = true; btn.textContent = t('admin.updating'); }
+      watchUpdate(document.getElementById('updateResult'), updateStatus.pending?.[0] || updateStatus.job?.id);
+    } else if (updateStatus?.job && ['failed', 'rolled_back'].includes(updateStatus.job.state)
+               && Date.now() / 1000 - updateStatus.job.updated_at < 86400) {
+      renderUpdateJob(document.getElementById('updateResult'), updateStatus);
+    }
   } catch (err) { el.innerHTML = `<p style="color:var(--danger)">${esc(err.message)}</p>`; }
 }
 
-export function cleanup() {}
+let updatePollTimer = null;
+
+function copyText(text) {
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(() => showToast(t('admin.copied'), 'success'));
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+  showToast(t('admin.copied'), 'success');
+}
+
+const UPDATE_STATE_KEYS = {
+  starting: 'admin.update_state_starting', backup: 'admin.update_state_backup', fetch: 'admin.update_state_fetch',
+  pull: 'admin.update_state_fetch', install: 'admin.update_state_install', restart: 'admin.update_state_restart',
+  verify: 'admin.update_state_verify', rollback: 'admin.update_state_rollback', done: 'admin.update_success',
+  failed: 'admin.update_failed', rolled_back: 'admin.update_rolled_back',
+};
+
+function renderUpdateJob(el, s, { unreachable = false } = {}) {
+  if (!el) return;
+  const job = s?.job;
+  const state = job?.state || 'starting';
+  const color = state === 'done' ? 'var(--success)' : ['failed', 'rolled_back'].includes(state) ? 'var(--danger)' : 'var(--text-primary)';
+  const title = unreachable ? t('admin.update_state_restart') : t(UPDATE_STATE_KEYS[state] || 'admin.updating');
+  el.innerHTML = `
+    <div style="margin-top:12px;border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-card)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px">
+        <strong style="font-size:13px;color:${color}">${esc(title)}${job?.target ? ` · v${esc(job.from || '?')} → v${esc(job.target)}` : ''}</strong>
+        <button class="btn btn-secondary btn-sm" id="copyUpdateLogBtn">${t('admin.copy')}</button>
+      </div>
+      ${job?.message ? `<p style="font-size:12px;margin:0 0 8px;color:var(--text-muted)">${esc(job.message)}</p>` : ''}
+      <pre style="max-height:300px;overflow:auto;font-size:11px;margin:0;background:var(--bg-primary);padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all">${esc(s?.log || '')}</pre>
+    </div>`;
+  document.getElementById('copyUpdateLogBtn')?.addEventListener('click', () => copyText(el.querySelector('pre')?.textContent || ''));
+}
+
+// Poll the updater's status until the job ends. The server going away mid-upgrade is the normal
+// case (it is being restarted), so a failed poll means "restarting", not an error.
+function watchUpdate(el, jobId) {
+  clearTimeout(updatePollTimer);
+  const tick = async () => {
+    let s = null;
+    try {
+      const r = await fetch('/api/admin/update-status', { headers: headers() });
+      if (r.ok) s = await r.json();
+    } catch (_) { /* restarting */ }
+    if (!s) {
+      renderUpdateJob(el, null, { unreachable: true });
+    } else {
+      const mine = !jobId || s.job?.id === jobId;
+      renderUpdateJob(el, mine ? s : { ...s, job: { state: 'starting' } });
+      if (mine && s.job && ['done', 'failed', 'rolled_back'].includes(s.job.state)) {
+        if (s.job.state === 'done') {
+          showToast(t('admin.update_success'), 'success');
+          setTimeout(() => location.reload(), 2500);  // load the new version's dashboard
+        } else {
+          const btn = document.getElementById('triggerUpdateBtn');
+          if (btn) { btn.disabled = false; btn.textContent = t('admin.update_now'); }
+        }
+        return;
+      }
+    }
+    if (document.getElementById('updateResult') === el) updatePollTimer = setTimeout(tick, 3000);
+  };
+  tick();
+}
+
+export function cleanup() { clearTimeout(updatePollTimer); }
 
 
 /* ------------------------------------------------------------------ server diagnostics */
@@ -969,7 +1060,7 @@ async function loadDiagnostics() {
     </div>
 
     <h4 style="margin:12px 0 6px">${t('admin.diag.lag_daily')}</h4>
-    <div style="overflow-x:auto"><table class="data-table"><thead><tr>
+    <div class="table-wrap"><table class="corp-table"><thead><tr>
       <th>day</th><th>samples</th><th>avg p50</th><th>avg p99</th><th>worst</th><th>not normal</th>
     </tr></thead><tbody>${daily || `<tr><td colspan="6">${t('admin.diag.no_history')}</td></tr>`}</tbody></table></div>
 
@@ -980,7 +1071,7 @@ async function loadDiagnostics() {
       <span>largest widget config: <b>${mb((shape.widgets || {}).max_config_bytes)}</b></span>
       <span>workspaces: <b>${num(shape.workspaces)}</b></span>
     </div>
-    <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>table</th><th>rows</th></tr></thead>
+    <div class="table-wrap"><table class="corp-table"><thead><tr><th>table</th><th>rows</th></tr></thead>
       <tbody>${tables}</tbody></table></div>
     <div id="diagProfileOut"></div>`;
 }
@@ -1024,7 +1115,7 @@ function wireDiagnostics() {
         <tr><td style="text-align:right">${x.pct}%</td><td>${esc(x.fn)}</td><td style="color:var(--text-muted)">${esc(x.at)}</td></tr>`).join('');
       if (out) out.innerHTML = `
         <h4 style="margin:16px 0 6px">${t('admin.diag.top_self')}</h4>
-        <div style="overflow-x:auto"><table class="data-table"><thead><tr>
+        <div class="table-wrap"><table class="corp-table"><thead><tr>
           <th>self</th><th>function</th><th>where</th></tr></thead><tbody>${rows}</tbody></table></div>`;
       const d = document.getElementById('diagDownloadBtn');
       if (d) d.style.display = '';
@@ -1081,7 +1172,7 @@ async function loadPlugins() {
       subHost.innerHTML = `<p style="color:var(--text-muted);font-size:12px">${t('admin.plugins.pending_empty')}</p>`;
     } else {
       subHost.innerHTML = pending.map((s) => `
-        <details class="card" style="margin-bottom:8px;padding:12px">
+        <details class="corp-card" style="margin-bottom:8px;padding:12px">
           <summary style="cursor:pointer;font-weight:600">${esc(s.name || s.plugin_id)} <span style="font-weight:400;color:var(--text-muted);font-family:monospace;font-size:12px">${esc(s.plugin_id)} @ ${esc(s.version || '')}</span></summary>
           <p style="font-size:12px;color:var(--text-muted);margin:8px 0">${esc(s.description || '')}</p>
           <p style="font-size:11px;font-family:monospace;word-break:break-all">sha256 ${esc(s.sha256)}</p>
@@ -1103,7 +1194,7 @@ async function loadPlugins() {
   if (!plugins.length) {
     host.innerHTML = `<p style="color:var(--text-muted)">${t('admin.plugins.empty')}</p>`;
   } else {
-    host.innerHTML = `<table class="data-table"><thead><tr>
+    host.innerHTML = `<div class="table-wrap"><table class="corp-table"><thead><tr>
       <th>${t('admin.plugins.col_name')}</th>
       <th>${t('admin.plugins.col_id')}</th>
       <th>${t('admin.plugins.col_origin')}</th>
@@ -1130,10 +1221,10 @@ async function loadPlugins() {
         <td>${hash}</td>
         <td style="display:flex;gap:6px;flex-wrap:wrap">${action}${pinBtn}</td>
       </tr>`;
-    }).join('')}</tbody></table>
+    }).join('')}</tbody></table></div>
     <p style="color:var(--text-muted);font-size:12px;margin-top:8px">${t('admin.plugins.restart')}</p>
     ${plugins.filter((p) => Array.isArray(p.settings_fields) && p.settings_fields.length).map((p) => `
-      <details class="card" style="margin-top:12px;padding:12px" data-plugin-settings="${esc(p.id)}">
+      <details class="corp-card" style="margin-top:12px;padding:12px" data-plugin-settings="${esc(p.id)}">
         <summary style="cursor:pointer;font-weight:600">${esc(p.name || p.id)} — ${t('admin.plugins.settings')}</summary>
         <form data-plugin-settings-form="${esc(p.id)}" style="margin-top:12px">
           ${pluginFieldsHtml(p.settings_fields, p.settings || {}, 'plugset_' + p.id + '_')}
@@ -1146,13 +1237,13 @@ async function loadPlugins() {
     if (!pins.length) {
       pinHost.innerHTML = `<p style="color:var(--text-muted);font-size:12px">${t('admin.plugins.allowlist_empty')}</p>`;
     } else {
-      pinHost.innerHTML = `<table class="data-table"><thead><tr>
+      pinHost.innerHTML = `<div class="table-wrap"><table class="corp-table"><thead><tr>
         <th>${t('admin.plugins.col_id')}</th><th>sha256</th><th>source</th></tr></thead><tbody>
         ${pins.map((r) => `<tr>
           <td style="font-family:monospace;font-size:12px">${esc(r.plugin_id)}</td>
           <td style="font-family:monospace;font-size:11px;word-break:break-all">${esc(r.sha256)}</td>
           <td>${esc(r.source)}</td>
-        </tr>`).join('')}</tbody></table>`;
+        </tr>`).join('')}</tbody></table></div>`;
     }
   }
 
@@ -1435,4 +1526,35 @@ async function mountCleanup(el, days = 180, lastResult = null, noticeDays = 14) 
       },
     });
   };
+}
+
+
+/* ── Player rollouts (server lib/ota-rollout.js) ─────────────────────────────────────────────── */
+const ROLLOUT_ACTIONS = { rolling: ['pause', 'release', 'halt'], paused: ['resume', 'release', 'halt'], halted: ['clear'], complete: [], superseded: [] };
+async function loadRollouts() {
+  const host = document.getElementById('rolloutsBody');
+  if (!host) return;
+  let data;
+  try { data = await api.get('/admin/ota-rollouts'); } catch (e) { host.innerHTML = `<p class="error">${esc(e.message)}</p>`; return; }
+  const rows = data.rollouts || [];
+  host.innerHTML = `
+    ${data.enabled ? '' : `<p style="color:#ca8a04;font-size:13px">${esc(t('platform.rollouts.disabled'))}</p>`}
+    ${rows.length ? `<div class="table-wrap"><table class="corp-table" style="min-width:640px"><thead><tr>
+      <th>${esc(t('platform.rollouts.col.player'))}</th><th>${esc(t('platform.rollouts.col.status'))}</th>
+      <th>${esc(t('platform.rollouts.col.health'))}</th><th></th></tr></thead><tbody>
+      ${rows.map((r) => `<tr>
+        <td><strong>${esc(t(`platform.rollouts.family.${r.family}`))} ${esc(r.version)}</strong>
+          <div class="corp-help">${esc(t('platform.rollouts.started', { when: new Date(r.started_at * 1000).toLocaleString() }))}</div></td>
+        <td>${esc(t(`platform.rollouts.status.${r.status}`, { pct: r.wave_percent }))}
+          ${r.status === 'halted' ? `<div style="font-size:12px;color:#dc2626;max-width:340px">${esc(r.halted_reason || '')}</div>
+            <div class="corp-help">${esc(r.family === 'android' ? t('platform.rollouts.android_note') : r.can_roll_back ? t('platform.rollouts.rolled_back', { v: r.prev_version }) : t('platform.rollouts.no_prev'))}</div>` : ''}</td>
+        <td style="font-size:12px">${r.health ? esc(t('platform.rollouts.health', { updated: r.health.updated, bad: r.health.bad, size: r.health.family_size })) : ''}</td>
+        <td style="white-space:nowrap">${(ROLLOUT_ACTIONS[r.status] || []).map((a) => `<button class="btn btn-secondary btn-sm" data-ro="${esc(r.family)}|${esc(r.version)}|${a}" style="margin:2px">${esc(t(`platform.rollouts.act.${a}`))}</button>`).join('')}</td>
+      </tr>`).join('')}</tbody></table></div>` : `<div class="corp-empty">${esc(t('platform.rollouts.empty'))}</div>`}`;
+  host.querySelectorAll('[data-ro]').forEach((b) => b.addEventListener('click', async () => {
+    const [family, version, action] = b.dataset.ro.split('|');
+    if ((action === 'halt' || action === 'release') && !confirm(t(`platform.rollouts.confirm.${action}`, { v: version }))) return;
+    try { await api.post(`/admin/ota-rollouts/${encodeURIComponent(family)}/${encodeURIComponent(version)}/${action}`, {}); showToast(t('platform.rollouts.done'), 'success'); loadRollouts(); }
+    catch (e) { showToast(e.message, 'error'); }
+  }));
 }

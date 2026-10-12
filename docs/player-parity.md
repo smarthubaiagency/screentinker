@@ -19,6 +19,31 @@ own package. Detail and the build steps are in [`vega-player.md`](vega-player.md
 stay not-supported on the certified-hardware page: three crashes on one stick, and a hard-cut that
 has not been re-run there, is not a certification.
 
+**Roku** (`roku/`, BrightScript + SceneGraph; client_type `roku`, platform `roku`) is not a column
+either, because almost every row is a ❌ for the same reason: a Roku app has no HTML engine, no web
+view and no JavaScript, and Roku OS gives an app no reboot, volume, screen-capture, input-injection,
+shell, TV-power or self-update API. It plays video (files, HLS) and images natively, in native zones
+with a cross-fade, with mute; everything browser-only (widgets, templates, slides, web pages, HTML
+bundles, menu boards) is a **still frame** the server renders in headless Chromium
+(`GET /api/player/raster`, capability `render.server_raster`), refreshed on the item's own clock — no
+animation, no video inside a page, no touch. `refresh` works (the scene is rebuilt); `launch` rides
+the same capability and means the same thing. The dashboard's time zone reaches it as an offset table
+in the payload (`clock.tz_table`). A power window blanks the screen; it cannot switch the TV.
+No YouTube, PiP, slide audio, walls, group sync, triggers or offline media cache. The baseline and the
+reason for every omission are in `BASELINE.roku`; the player itself is in
+[`roku-player.md`](roku-player.md). Nothing here has run on a Roku yet.
+
+| capability | Roku baseline |
+|---|---|
+| `playback.video` / `playback.image` / `playback.zones` | ✅ native Video / Poster nodes |
+| `playback.widget` / `playback.bundle` | ⚠️ as server-rendered still frames (`render.server_raster`) |
+| `playback.transitions` | ⚠️ cross-fade only |
+| `audio.mute` | ✅ |
+| `system.restart_player` | ✅ `refresh` rebuilds the scene |
+| `clock.tz_table` / `render.server_raster` | ✅ server-side contracts |
+| `playback.hls` / `display.power_schedule` | declared by the player, in no baseline (brand new) |
+| everything else | ❌ no app API, or not implemented |
+
 **Legend** — ✅ verified in source · ⚠️ partial/conditional (reason given) · ❌ not supported (reason
 given) · 💀 **dead**: the capability is declared or baselined but the control cannot work · ❓
 **unverifiable from source** — needs hardware, and is marked as such rather than asserted.
@@ -126,6 +151,8 @@ describe content rendering. They are informational, and shown to the operator in
 | `playback.widget` | ✅ WebView | ✅ iframe | ✅ iframe | ✅ iframe | ✅ `WebEngineView`, same-URL reuse like Android (e2e: clock widget in a zone) | ✅ as Pi — shared engine (`WebEngineView`) |
 | `playback.youtube` | ✅ WebView embed | ✅ IFrame API | ✅ iframe embed | ✅ IFrame API | ✅ Android's embed wrapper byte-for-byte, `screentinker.com` base; live mute via the IFrame API | ✅ as Pi — shared engine |
 | `playback.zones` | ✅ `ZoneManager` | ✅ | ✅ | ✅ | ✅ `ZoneRunner` — Android's rules incl. orphan→largest-zone fallback (e2e) | ✅ as Pi — shared engine |
+| `playback.wall_zones` | ✅ `WallZoneRenderer` — emulator: mid-hold join, clock-aligned timecodes, cold-boot restore | ✅ two-browser wall e2e (timeline, freeze, audio per zone, seam crop) | ✅ `WallZoneRenderer` — vm tests + headless Chrome smoke; ❓ not on a TV | ⚠️ declared (it is the web player) — not run on hardware; video is a hardware plane | ✅ `wallzones` mode — Xvfb scene runs on PySide6 6.11 and on Trixie's own Qt/PySide6 6.8.2 (container); ❓ not on Pi hardware | ✅ as Pi — shared engine; ❓ not run on Windows |
+| `playback.hold` | ✅ fullscreen, zones, wall zones | ✅ | ✅ (AVPlay freeze: stub-tested only) | ⚠️ as web, not run on hardware | ✅ single, zones, wall zones | ✅ as Pi — shared engine |
 | `playback.transitions` | ✅ `TransitionCompositor` | ⚠️ declared only when the bundle loads (`transitionRuntimeReady()`) — a failed load hard-cuts rather than breaking playback | ✅ `transitions.js` | ⚠️ composites DOM over video; with hwz it may be **invisible over video** and degrade to a hard cut | ✅ the shared GLSL wrapped for Qt 6 (GLSL-4.40 reserved words renamed) and baked with `qsb`: all 15 bake on Bookworm arm64, and VanEck ran on an OpenGL scene graph (e2e). On a **software** scene graph (no GPU) it crossfades instead — never the black frames ShaderEffect gives there. ❓ not yet seen on a Pi's V3D | ✅ as Pi — shared engine (the same baked shaders); ❓ not yet seen on a Windows GPU (D3D11 RHI) |
 | `playback.pip` | ✅ `PipOverlay` | ✅ `#pipContainer` | ✅ `pip-overlay.js` | ⚠️ same hwz caveat as transitions | ✅ `PipLayer.qml` (Android geometry) | ✅ as Pi — shared engine |
 | `playback.bundle` | ✅ WebView, `playItem` + `ZoneManager` | ✅ `renderBundleBuffered`, server-flattened document | ✅ `renderBundle` + zone branch | ✅ inherits the web player | ✅ server-flattened render, cached on disk (24 MB) like Android's `BundleCache` | ✅ as Pi — shared engine |
@@ -219,6 +246,35 @@ decline these explicitly and in writing in their own capability modules.
 | `offline.cache` | ✅ `ContentCache` + `DownloadCoordinator`, resumable (Range/If-Range), revision-keyed | ✅ service worker, resumable chunked prefetch, revision-keyed; declared only when a worker is genuinely **controlling** the page | ⚠️ `js/media-cache.js` caches media to `wgt-private` — **new at HEAD**, absent from the fielded build, and declared at runtime only where the platform grants storage | ❓ **unverified.** See gap 4 | ✅ Android's cache rules — resumable Range/If-Range, revision sidecars, READY-then-USABLE; cold start from the cached playlist before the network | ✅ as Pi — shared engine |
 
 ---
+
+## Emergency alerts cut in
+
+Every player holds an ordinary playlist change until the item on screen finishes (#157, with a
+60 s backstop) — unless the OUTGOING playlist has at most one item, which has no next item to
+rotate to, so its replacement lands at once (web `outgoingNeverAdvances`, Tizen `load()`, Android
+`PendingSwap.shouldDefer(outgoingCount)`; many -> one still defers). Raising an emergency alert replaces the playlist with its card, which is exactly
+that case, so the card used to arrive up to a minute late. The contract that fixes it:
+
+- **Server.** The CAP alert card (`server/lib/cap/feeds.js` `cardItem`, the hidden `cap_alert`
+  widget — emergency feeds, emergency-alert hooks and Zapier all show it) carries `interrupt: true`.
+  So does every item of a head office "activate now" alert (`lib/corporate/emergency-live.js`,
+  flagged in `buildPlaylistPayload`), so activating or ending one cuts in the same way.
+  Nothing else carries it: `buildPlaylistPayload` strips the field from every other item, on the one
+  path solo, group, wall and corporate payloads all leave by. A CAP feed configured with its own
+  playlist sends that playlist without the flag.
+- **Players.** When the SET of interrupt items (by item identity) differs between the playlist on
+  screen and the one arriving — raised, cleared, or another feed taking over — the player swaps at
+  once, mid-item. It also ends an interactive-page (#473) session that is holding the playlist,
+  instead of parking the update behind it. An ordinary edit, the set unchanged, defers exactly as before.
+- **Walls and groups.** A wall follower already applies every update at once and obeys the leader's
+  index; the flag makes the leader swap immediately too, so the whole wall switches together.
+  An alert payload carries no `group_sync`, so a synced group leaves sync for the alert and
+  every member swaps on its own; sync resumes from the payload after the all-clear.
+
+| | Android | Web (+ Vega, BrightSign) | Tizen | Raspberry Pi / Windows (native) |
+|---|---|---|---|---|
+| no deferral on an interrupt change | ✅ `PendingSwap.shouldDefer(interruptChanged)` + `Interrupt` (`PlaylistSelection.kt`), JVM-tested | ✅ `interruptChanged` in `handlePlaylistUpdate` (+ `legacy.html`) | ✅ `PlaylistPlayer.interruptChanged` in `load()` | same contract, implemented in `native/` |
+| interactive hold ended, not parked | ✅ `updatePlaylist` drops the hold | ✅ page hidden, `kioskDropHold()` | ✅ `dropHold()` before `park()` | same contract |
 
 ## Where the four declaration sites disagree with each other
 

@@ -15,7 +15,7 @@
   // packaged config.xml via the Tizen application API; fall back to a constant that
   // build-wgt.sh stamps from config.xml's version="" so the dashboard always shows the
   // version that is actually installed (never the old hardcoded '1.0.0').
-  var APP_VERSION_FALLBACK = '2.3.2'; // st:app-version — stamped by build-wgt.sh
+  var APP_VERSION_FALLBACK = '2.6.0'; // st:app-version — stamped by build-wgt.sh
   var APP_VERSION = (function () {
     try {
       var v = tizen.application.getCurrentApplication().appInfo.version;
@@ -143,6 +143,12 @@
     if (stageOwner === 'zones') {
       var cp = get(LS.payload);
       if (cp) { try { onPlaylist(JSON.parse(cp)); } catch (e) {} }
+    } else if (stageOwner === 'wallzones') {
+      // Wall zones re-mount from the cached payload too; invalidate so the unchanged signature does
+      // not keep a stalled element — every zone lands back on the shared clock.
+      wallZones.invalidate();
+      var wp = get(LS.payload);
+      if (wp) { try { onPlaylist(JSON.parse(wp)); } catch (e) {} }
     } else if (stageOwner === 'player') {
       player.playCurrent();
     }
@@ -366,9 +372,19 @@
       del(LS.code); clearToast(); show(elStage);
     });
 
-    socket.on('device:unpaired', function () {
+    socket.on('device:unpaired', function (data) {
       del(LS.id); del(LS.token); del(LS.code); del(LS.payload);
       deviceId = null; deviceToken = null;
+      // Deleted on the dashboard: nothing it downloaded belongs to a screen any more. ONLY on
+      // 'deleted' — the register path's 'not_found' is also what a restored backup or an
+      // unreplicated edge says, and wiping on it would empty every panel at once.
+      if (data && data.reason === 'deleted') {
+        try {
+          if (!window.__stMediaCache && window.MediaCache) window.__stMediaCache = window.MediaCache.create();
+          if (window.__stMediaCache) window.__stMediaCache.prune([]);
+        } catch (e) { /* best effort */ }
+        try { if (window.BundleStore) window.BundleStore.prune([]); } catch (e) { /* best effort */ }
+      }
       // FIX F — back off 3s before re-registering, symmetric with the auth-error path below,
       // so a repeatedly-unpaired device (e.g. MDM re-pair churn) can't tight-loop
       // register -> unpaired -> register.
@@ -456,6 +472,9 @@
       try {
         if (!data) return;
         if (player.kioskSessionActive()) { kioskLog('info', 'remote key refused: interactive session in progress'); return; }
+        // Wall zones run on the shared clock and own the stage: stepping the single-zone player
+        // here would paint its stale playlist over the zones.
+        if (stageOwner === 'wallzones') return;
         var v = player.getCurrentVideo();
         var n = player.getItemCount();
         switch (data.keycode) {
@@ -645,6 +664,9 @@
     // A torn-down AVPlay session cannot be resumed, so re-mount the current item from scratch.
     // playCurrent(), not gotoIndex(): gotoIndex early-returns when the index has not changed, so it
     // would leave a blanked portrait panel dark after screen_on.
+    // Wall zones own the stage instead: re-mount them (each zone rejoins the shared clock) rather
+    // than paint the single-zone player's stale playlist over them.
+    if (stageOwner === 'wallzones') { replayCurrent(); return; }
     try { if (player && player.playCurrent) player.playCurrent(); } catch (e) {}
   }
   // Diagnostic info overlay (parity with the web player). Toggled by the dashboard remote BACK key —
@@ -786,6 +808,7 @@
     stopHeartbeat();
     stopStreaming();
     try { player.stop(); } catch (e) {}
+    try { wallZones.clear(); } catch (e) {}
     stageOwner = ''; // #162: stage cleared — next playlist must repaint
     if (registerTimer) { clearTimeout(registerTimer); registerTimer = null; }
     authenticated = false;
@@ -924,6 +947,9 @@
   );
   // #group-sync: clock/schedule group sync (no leader, offline-native). Separate from WallController.
   var groupSync = new GroupSyncController(player, function () { return clockOffsetMs; }, reportSync);
+  // Wall zones: a video wall's own layout, every zone paced by the SAME server-disciplined clock
+  // group sync uses (syncedNow), no leader relay. Owns the stage as 'wallzones'.
+  var wallZones = new WallZoneRenderer(elStage, function () { return serverUrl.replace(/\/+$/, ''); }, function () { return deviceId || ''; }, function () { return syncedNow(); }, reportSync);
   // #109: PiP overlay layer. Renders into #pip (above #stage); never touches the
   // playlist. Reports show/clear over device:log (tag 'pip').
   var pipOverlay = new PipOverlay(elPip, { log: reportPip });
@@ -978,6 +1004,7 @@
     if (payload.suspended) {
       player.stop();
       zoneRenderer.clear();
+      wallZones.clear();
       wallController.exit();
       // #320: an operator's uploaded shaders ride in with the playlist, keyed by the ids the items
       // reference. Tizen resolves a shader from the same global the web player does, so merging is
@@ -1023,6 +1050,24 @@
     // it INSTEAD of the "nothing scheduled" card. It is NOT a playlist item — it never enters assignments
     // or the sig, so it can't restart playback.
     player.defaultContent = payload.default_content || null;
+
+    if (payload.wall_config && WallZoneRenderer.wanted(payload.wall_config, payload.layout)) {
+      // Video wall WITH its own layout (wall_config.canvas_layout): the zones are in percent of the
+      // wall's player rect, drawn inside the wall-positioned #stage, each on the shared clock. The
+      // single-zone player and the plain zone renderer give up the stage; there is no wall:sync relay
+      // in either direction (WallController zones mode). The whole payload — wall_config included —
+      // is already cached in LS.payload and replayed at cold boot before the socket connects, so an
+      // offline reboot comes back as this panel's slice.
+      if (stageOwner !== 'wallzones') { player.stop(); zoneRenderer.clear(); wallZones.invalidate(); }
+      groupSync.exit();
+      player.setScheduleDriven(false);
+      wallController.apply(payload.wall_config, { zones: true });   // positions #stage first
+      wallZones.setTimezone(payload.timezone || null);
+      wallZones.render(payload.layout, payload.assignments || [], payload.wall_config);
+      stageOwner = 'wallzones';
+      return;
+    }
+    wallZones.clear();   // no-op unless leaving wall-zone mode (layout cleared, wall left, emergency)
 
     if (payload.wall_config) {
       // Video wall: fullscreen content mapped into this screen's slice. No multi-zone,
@@ -1081,7 +1126,19 @@
   // ---- setup screen wiring ----
   if (serverUrl) elUrl.value = serverUrl;
   elConnect.addEventListener('click', doConnect);
-  elUrl.addEventListener('keydown', function (e) { if (e.keyCode === 13) doConnect(); });
+  /*
+   * ⚠️ THE REMOTE HAS NO TAB KEY. Down in a text field only moves its caret, so with no handler the
+   * Connect button was unreachable from a remote: a screen could be set up only with a USB keyboard
+   * (Tab). Down/Up now move between the field and the button. The on-screen keyboard's Done key
+   * (65376) connects like Enter; before, it only closed the keyboard.
+   */
+  elUrl.addEventListener('keydown', function (e) {
+    if (e.keyCode === 13 || e.keyCode === 65376) { e.preventDefault(); doConnect(); }
+    else if (e.keyCode === 40) { e.preventDefault(); elConnect.focus(); }
+  });
+  elConnect.addEventListener('keydown', function (e) {
+    if (e.keyCode === 38) { e.preventDefault(); elUrl.focus(); }
+  });
   function doConnect() {
     var v = (elUrl.value || '').trim();
     if (!v) { elSetupStatus.textContent = 'Enter a server URL'; return; }
@@ -1096,7 +1153,7 @@
     deviceId = null; deviceToken = null; serverUrl = null;
     if (socket) { try { socket.disconnect(); } catch (e) {} }
     teardownSession(); // H4: stop heartbeat/stream/player-loop + pending register (no dangling timers on setup)
-    show(elSetup);
+    show(elSetup); elUrl.focus();   // a remote has to land somewhere to type
   });
 
   // TV remote RETURN key (10009).

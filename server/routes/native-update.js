@@ -1,7 +1,8 @@
 'use strict';
 
 /*
- * Native player self-update — one factory, mounted twice (routes/pi-update.js, routes/win-update.js):
+ * Native player self-update — one factory, mounted for the Pi and Windows (routes/pi-update.js,
+ * routes/win-update.js), and download-only for macOS (routes/mac-update.js):
  *
  *   GET /api/<kind>/update/check?version=&device_id=[&forced=1]
  *     -> { update_available, latest_version, current_version, download_url, sha256, size, reason }
@@ -45,9 +46,13 @@ const logCoalescer = require('../lib/log-coalescer');
  * @param {string} spec.missingReason     reason when nothing is hosted ('deb-missing')
  * @param {string} spec.hashingReason     reason while the sha256 is being computed ('deb-hashing')
  * @param {boolean} [spec.anonymousLookup] a check WITHOUT device_id is a package lookup (see below)
+ * @param {boolean} [spec.selfUpdate]     false = a player that never installs itself (macOS): only the
+ *                                        download is mounted — no update check, and no rollback branch,
+ *                                        so no OTA rollout row is ever created for a family that cannot
+ *                                        take part in one
  */
 function createNativeUpdateRoutes(spec) {
-  const { kind, cache, label, contentType, missingReason, hashingReason, anonymousLookup = false } = spec;
+  const { kind, cache, label, contentType, missingReason, hashingReason, anonymousLookup = false, selfUpdate = true } = spec;
   const CHECK_URL = `/api/${kind}/update/check`;
   const DOWNLOAD_URL = `/download/${kind}`;
   const tag = `[ota/${kind}]`;
@@ -64,19 +69,20 @@ function createNativeUpdateRoutes(spec) {
     const getDb = () => deps.db || require('../db/database').db;
     const getBand = deps.getBand || (() => require('../services/loop-lag').getBand());
 
-    app.get(CHECK_URL, (req, res) => {
+    if (selfUpdate) app.get(CHECK_URL, (req, res) => {
       const currentVersion = typeof req.query.version === 'string' ? req.query.version : '';
       const deviceId = typeof req.query.device_id === 'string' && req.query.device_id ? req.query.device_id : null;
       const forced = req.query.forced === '1' || req.query.forced === 'true';
-      const pkg = cache.get();
-      const latestVersion = pkg.version || null;
+      let pkg = cache.get();
+      let latestVersion = pkg.version || null;
+      let downloadUrl = DOWNLOAD_URL;
       const answer = (update_available, reason, extra = {}, withHash = update_available) => {
         logCheck(latestVersion, update_available, reason);
         res.setHeader('Cache-Control', 'no-store');
         return res.json(Object.assign({
           update_available, reason,
           latest_version: latestVersion, current_version: currentVersion || 'unknown',
-          download_url: DOWNLOAD_URL,
+          download_url: downloadUrl,
           sha256: withHash ? pkg.sha256 : null,
           size: withHash ? pkg.size : 0,
         }, extra));
@@ -97,6 +103,25 @@ function createNativeUpdateRoutes(spec) {
       // polling a server with no package cannot accumulate rate/no-progress state against a version
       // that does not exist.
       if (!pkg.exists || !latestVersion) return answer(false, missingReason);
+      /*
+       * Health-checked rollout (lib/ota-rollout.js). ⚠️ During a ROLLBACK the previous package IS the
+       * release: it is what this check announces to everyone, including the install helper's own
+       * anonymous sha256 lookup, or the helper would refuse the very package we offered.
+       */
+      const staged = pkg;
+      const isUpgrade = (v) => !!v && (otaBreaker.cmp(v.replace(/~/g, '-'), staged.version) || 0) < 0;
+      const g = require('../lib/ota-rollout').gate(kind, staged, { deviceId, currentVersion, forced });
+      if (g.action === 'rollback') {
+        pkg = g.release;
+        latestVersion = g.release.version;
+        downloadUrl = `${DOWNLOAD_URL}?version=${encodeURIComponent(g.release.version)}`;
+        // A screen on the halted version is sent back now, past the breaker (it would call this a
+        // downgrade and refuse it). Anything else is compared with the rollback release as usual.
+        const cur = (currentVersion || '').replace(/~/g, '-');
+        if (deviceId && cur && cur === staged.version) return answer(true, 'rollback');
+      } else if ((g.action === 'wait' || g.action === 'halted') && deviceId && isUpgrade(currentVersion)) {
+        return answer(false, g.reason, { retry_after_seconds: 1800 });
+      }
 
       /*
        * ANONYMOUS PACKAGE LOOKUP (Windows). The Windows player is split in two: the player runs as the
@@ -142,7 +167,14 @@ function createNativeUpdateRoutes(spec) {
     });
 
     app.get(DOWNLOAD_URL, (req, res) => {
-      const pkg = cache.get();
+      let pkg = cache.get();
+      // ?version=<previous> during a rollback: the archived previous package (lib/ota-rollout.js).
+      if (req.query.version && pkg.exists && String(req.query.version) !== pkg.version) {
+        if (!selfUpdate) return res.status(404).type('text/plain').send(`That ${label} version is not offered.`);
+        const g = require('../lib/ota-rollout').gate(kind, pkg, {});
+        if (g.action === 'rollback' && g.release.version === String(req.query.version)) pkg = g.release;
+        else return res.status(404).type('text/plain').send(`That ${label} version is not offered.`);
+      }
       if (!pkg.exists) {
         return res.status(404).type('text/plain').send(`No ${label} is hosted on this instance.`);
       }
@@ -164,7 +196,7 @@ function createNativeUpdateRoutes(spec) {
   }
 
   mount.DOWNLOAD_URL = DOWNLOAD_URL;
-  mount.CHECK_URL = CHECK_URL;
+  mount.CHECK_URL = selfUpdate ? CHECK_URL : null;
   return mount;
 }
 

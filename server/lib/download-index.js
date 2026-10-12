@@ -38,6 +38,7 @@ function entries(state = {}) {
   const brightsign = state.brightsign || {};
   const deb = state.deb || {};
   const exe = state.exe || {};
+  const dmg = state.dmg || {};
 
   return [
     {
@@ -158,6 +159,39 @@ function entries(state = {}) {
       size: null,
     },
     {
+      /*
+       * The NATIVE macOS player (native/, ScreenTinker.app in a .dmg). Like the Pi and Windows rows it
+       * exists only where someone built it or mounted it (lib/mac-cache.js). Unlike them it never
+       * updates itself — a Mac is updated from this file or by MDM — so the row says so.
+       */
+      id: 'macos-native',
+      name: 'Mac (native player, beta)',
+      file: dmg.filename || 'ScreenTinker-<version>.dmg',
+      what: 'A native player for macOS 12 or later. Drag it to Applications; update it from here or with your device management (it does not update itself).',
+      url: '/download/mac',
+      guide: '/guides/mac-ipad-digital-signage.html',
+      available: !!dmg.exists,
+      version: dmg.version || null,
+      size: formatSize(dmg.size),
+      absent: 'No macOS player is hosted on this instance. The web player in Safari or Chrome works on any Mac meanwhile.',
+      fallback: '/player',
+    },
+    {
+      id: 'ios',
+      name: 'iPad and iPhone (app, beta)',
+      file: null,
+      // Not a download: an iOS app installs only through Apple (TestFlight, the App Store, or an
+      // MDM/enterprise distribution) — a link to a file here could never install.
+      what: 'Not a download. The ScreenTinker app is distributed by your organisation through TestFlight or device management; it shows this instance’s player full screen.',
+      url: null,
+      guide: '/guides/mac-ipad-digital-signage.html',
+      available: false,
+      version: null,
+      size: null,
+      absent: 'Ask whoever runs this instance for the app, or open the web player in Safari meanwhile.',
+      fallback: '/player',
+    },
+    {
       id: 'web',
       name: 'Any browser, ChromeOS, smart TVs',
       file: null,
@@ -182,6 +216,21 @@ function entries(state = {}) {
       version: null,
       size: null,
       absent: 'These two sticks are not Android and the APK does not install. Read the guide before buying one for a sign.',
+    },
+    {
+      id: 'roku',
+      name: 'Roku',
+      file: null,
+      // Not a download: a Roku app installs from the Roku Channel Store. A sideloaded zip needs
+      // developer mode on every Roku, which is not how a sign should be set up. Until Roku publishes
+      // the app there is no store link either, so the row explains instead of offering.
+      what: 'Not a download. The ScreenTinker app installs from the Roku Channel Store (in Roku’s review). Needs Roku OS 15.1 or later.',
+      url: null,
+      guide: '/guides/roku-digital-signage.html',
+      available: false,
+      version: null,
+      size: null,
+      absent: 'The Roku app is in Roku’s store review; once published it is added with the channel code Screentinker. Read the guide first: a Roku cannot start itself after a power cut.',
     },
   ];
 }

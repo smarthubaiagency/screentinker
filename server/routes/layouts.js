@@ -6,7 +6,8 @@ const { PLATFORM_ROLES, ELEVATED_ROLES } = require('../middleware/auth');
 // Phase 2.2h: workspace-aware access. Templates (is_template=1) are the
 // platform-shared pair (NULL user_id, NULL workspace_id) and are visible
 // everywhere, writable only by platform_admin.
-const { accessContext, denyReadOnly } = require('../lib/tenancy');
+const { denyReadOnly, resourceAccess } = require('../lib/tenancy');
+const { SCREENS_ON_LAYOUT_SQL } = require('../lib/wall-layout');
 
 // List layouts in the caller's current workspace plus all templates.
 // Phase 2.2h: workspace-scoped. Templates (is_template=1) remain visible to
@@ -45,7 +46,7 @@ function checkLayoutRead(req, res) {
     res.status(403).json({ error: 'Layout not assigned to a workspace' }); return null;
   }
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(layout.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   return layout;
 }
@@ -65,10 +66,16 @@ function checkLayoutWrite(req, res) {
     res.status(403).json({ error: 'Layout not assigned to a workspace' }); return null;
   }
   const ws = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(layout.workspace_id);
-  const ctx = ws && accessContext(req.user.id, req.user.role, ws);
+  const ctx = ws && resourceAccess(req, ws);
   if (!ctx) { res.status(403).json({ error: 'Access denied' }); return null; }
   if (!ctx.actingAs && ctx.workspaceRole === 'workspace_viewer') {
     res.status(403).json({ error: 'Read-only access' }); return null;
+  }
+  // CORPORATE: a layout head office's mandate uses may be changed only by a corporate author. Every
+  // caller of this helper mutates (PUT, DELETE, zone add/edit/delete).
+  try { require('../lib/corporate/guard').assertMediaWritable(req, 'layout', layout.id); } catch (e) {
+    if (require('../lib/corporate/guard').send(res, e, req)) return null;
+    throw e;
   }
   return layout;
 }
@@ -255,7 +262,7 @@ router.put('/:id', (req, res) => {
     if (io) {
       const { buildPlaylistPayload } = require('../ws/deviceSocket');
       const commandQueue = require('../lib/command-queue');
-      for (const d of db.prepare('SELECT id FROM devices WHERE layout_id = ?').all(req.params.id)) {
+      for (const d of db.prepare(SCREENS_ON_LAYOUT_SQL).all(req.params.id, req.params.id)) {
         commandQueue.queueOrEmitPlaylistUpdate(io.of('/device'), d.id, buildPlaylistPayload);
       }
     }
@@ -271,6 +278,8 @@ router.delete('/:id', (req, res) => {
   if (layout.is_template && !PLATFORM_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Cannot delete templates' });
 
   db.prepare('DELETE FROM layouts WHERE id = ?').run(req.params.id);
+  // foreign_keys is OFF here, so ON DELETE SET NULL never fires: clear walls that used it by hand.
+  db.prepare('UPDATE video_walls SET layout_id = NULL WHERE layout_id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
@@ -404,10 +413,19 @@ router.put('/device/:deviceId', (req, res) => {
   if (!device.workspace_id) return res.status(403).json({ error: 'Device not assigned to a workspace' });
 
   const deviceWs = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(device.workspace_id);
-  const ctx = deviceWs && accessContext(req.user.id, req.user.role, deviceWs);
+  const ctx = deviceWs && resourceAccess(req, deviceWs);
   if (!ctx) return res.status(403).json({ error: 'Access denied' });
   if (!ctx.actingAs && ctx.workspaceRole === 'workspace_viewer') {
     return res.status(403).json({ error: 'Read-only access' });
+  }
+
+  // CORPORATE: head office's mandate decides this screen's layout; a store layout would never show.
+  {
+    const corpGuard = require('../lib/corporate/guard');
+    try { corpGuard.assertNotMandated(req, req.params.deviceId); } catch (e) {
+      if (corpGuard.send(res, e, req)) return;
+      throw e;
+    }
   }
 
   const { layout_id } = req.body;

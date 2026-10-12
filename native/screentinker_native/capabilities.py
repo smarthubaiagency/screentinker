@@ -16,15 +16,24 @@ CAPABILITIES_ALWAYS = [
     "playback.video", "playback.image", "playback.widget", "playback.youtube", "playback.hls",
     "playback.rtsp", "playback.zones", "playback.transitions", "playback.pip", "playback.bundle",
     "playback.slide_audio", "playback.web_interactive",
+    # Hold items (blank / freeze for their duration) and a video wall's own layout, zones on the
+    # shared clock (player/engine.py "wall zones", logic/wall_zones.py).
+    "playback.hold", "playback.wall_zones",
     "audio.mute", "audio.volume",
     "display.rotation", "display.brightness", "display.power", "display.power_schedule",
     "remote.screenshot", "remote.stream", "remote.input", "remote.talk", "remote.set_server_url",
     "system.restart_player", "system.self_update", "system.shell", "system.pty", "system.kiosk",
     "net.http_request", "sync.clock", "offline.cache",
+    # A meeting-room display's buttons work here: the engine passes #panel (player/engine.py) and the
+    # screen is a touch panel. The server's no-show release waits for a screen that declares it.
+    "room.panel",
 ]
 
 
 def declared_capabilities(brightness_supported=False):
     # The OS backend adds what depends on privilege and hardware (platform/*/ops.extra_capabilities):
     # reboot/time/install need the privileged helper, system brightness needs a controllable panel.
-    return list(CAPABILITIES_ALWAYS) + ops.extra_capabilities(brightness_supported)
+    # And it can withdraw an "always" row its OS cannot honour (platform/macos: no self-update) — a
+    # declaration is a promise, so a row the backend cannot keep is not declared at all.
+    withdrawn = set(getattr(ops, "UNSUPPORTED_CAPABILITIES", ()))
+    return [c for c in CAPABILITIES_ALWAYS if c not in withdrawn] + ops.extra_capabilities(brightness_supported)

@@ -194,7 +194,7 @@ class DeviceLink:
         sio.on("disconnect", self._on_disconnect, namespace=NS)
         on("device:registered", self._on_registered)
         on("device:heartbeat-ack", self._on_ack)
-        on("device:unpaired", lambda d: self._rejected("device:unpaired (removed on server)"))
+        on("device:unpaired", self._on_unpaired)
         on("device:auth-error", lambda d: self._rejected("auth-error: %s" % ((d or {}).get("error") or "Authentication failed")))
         on("device:throttled", self._on_throttled)
         on("device:paired", self._on_paired)
@@ -209,7 +209,7 @@ class DeviceLink:
                    "device:mute-changed", "device:trigger-wire",
                    "wall:sync", "wall:sync-request", "group:sync", "group:sync-request", "group:resync",
                    "device:pty-open", "device:pty-input", "device:pty-resize", "device:pty-close",
-                   "device:kiosk-sessions-ack"):
+                   "device:kiosk-sessions-ack", "device:audience-ack"):
             on(ev, (lambda e: (lambda d: self.h.on_event(e, d)))(ev))
 
     async def _on_connect(self):
@@ -338,6 +338,19 @@ class DeviceLink:
         if pin:
             self.config.set("settings_pin", pin)
             log.info("settings PIN updated from dashboard")   # never log the PIN itself
+
+    def _on_unpaired(self, d):
+        # Deleted on the dashboard: everything downloaded belongs to nobody now. ONLY on 'deleted' —
+        # the register path's 'not_found' is also what a restored backup or an unreplicated edge
+        # says, and wiping on that would empty every panel at once.
+        if isinstance(d, dict) and d.get("reason") == "deleted":
+            wipe = getattr(self.h, "on_deleted", None)
+            if wipe:
+                try:
+                    wipe()
+                except Exception:
+                    log.exception("wiping downloads after delete failed")
+        self._rejected("device:unpaired (removed on server)")
 
     def _rejected(self, reason):
         m = re.search(r"offline for (\d+) seconds", reason or "")

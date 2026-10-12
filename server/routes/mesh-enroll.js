@@ -409,8 +409,7 @@ module.exports = function meshEnrollRoutes(db, { requireAuth, config, onUplinkCh
           screens: c ? { total: c.total, online: c.online, attachedHere: c.attached_here, stale: Math.max(0, c.total - c.online) }
                      : (m ? { total: m.total, online: m.online, stale: m.stale, attachedHere: 0 }
                           : { total: 0, online: 0, stale: 0, attachedHere: 0 }) });
-        const state = e.revoked_at ? 'revoked' : (r ? (r.edge === 'up' ? ((r.lag_s != null && r.lag_s > 60) ? 'lagging' : 'connected') : 'down')
-                                                    : (require('../lib/mesh/mirror-store').freshnessOf(e, now) === 'fresh' ? 'connected' : 'down'));
+        const state = edgeStatus.childLinkState(e, r, now);
         links.push({
           from: e.peer_node_id, to: me, edgeId: e.id, direction: 'down', state,
           lag_s: r ? r.lag_s : null, phase: r ? r.phase : null, lastAppliedRev: r ? r.last_applied_rev : null, error: r ? r.error : null,
@@ -746,6 +745,24 @@ module.exports = function meshEnrollRoutes(db, { requireAuth, config, onUplinkCh
       const offered = Array.isArray(answer.grant) ? answer.grant : [];
       const readOnlyGrant = offered.filter((c) => !grants.isWriteCategory(c));
       const refusedWrites = offered.filter((c) => grants.isWriteCategory(c));
+
+      /*
+       * ⚠️ CORPORATE (critique R10, risk R8): corporate state — mandates, slots, slot content — is not
+       * replicated in v1, so a replica of a store would not know head office's playlist plays there,
+       * and a replicated head office workspace carries slot references the replica cannot resolve.
+       * Replicating such a workspace is refused, before the edge exists.
+       */
+      if (readOnlyGrant.includes('workspace-replication')) {
+        const corpGuard = require('../lib/corporate/guard');
+        const wsIds = sharedWorkspaces || db.prepare('SELECT id FROM workspaces').all().map((w) => w.id);
+        for (const wid of wsIds) {
+          if (corpGuard.workspaceHasCorporateState(db, wid)) {
+            const ws = db.prepare('SELECT name FROM workspaces WHERE id = ?').get(wid);
+            const e = corpGuard.err('CORPORATE_MESH_UNSUPPORTED', { workspace: `"${(ws && ws.name) || wid}"` });
+            return res.status(409).json({ error: e.message, code: e.code });
+          }
+        }
+      }
 
       db.prepare(`INSERT INTO mesh_edges
           (id, peer_node_id, direction, role_capabilities, grant_categories, transport_direction,

@@ -20,6 +20,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const oidc = require('../lib/oidc');
 const oidcProviders = require('../lib/oidc-providers');
+const saml = require('../lib/saml');
 
 // Phase 2.1: find or create the user's default org+workspace. Returns the
 // workspace_id to embed in the JWT. Idempotent: if the user already has
@@ -1202,7 +1203,7 @@ function asyncRoute(handler) {
     try {
       if (res.headersSent) return;
       // These are browser redirects, not API calls; a JSON body would be shown as text.
-      if (req.path.startsWith('/oidc/')) return backToApp(res, { sso_error: 'server_error' });
+      if (req.path.startsWith('/oidc/') || req.path.startsWith('/saml/')) return backToApp(res, { sso_error: 'server_error' });
       res.status(500).json({ error: 'Something went wrong' });
     } catch (e2) {
       console.error('[auth] failed to report an error:', e2 && e2.message);
@@ -1308,7 +1309,7 @@ router.post('/sso/start', express.urlencoded({ extended: false }), (req, res) =>
     if (wantsJson) return res.status(404).json({ error: 'unknown_provider', code: 'unknown_provider' });
     return res.redirect('/app#/login?sso_error=unknown_provider');
   }
-  const startUrl = `/api/auth/oidc/${encodeURIComponent(provider.slug)}/start`;
+  const startUrl = `/api/auth/${provider.kind === 'saml' ? 'saml' : 'oidc'}/${encodeURIComponent(provider.slug)}/start`;
   if (wantsJson) return res.json({ start_url: startUrl });
   res.redirect(startUrl);
 });
@@ -1373,8 +1374,125 @@ async function beginOidc(req, res, provider, extra = {}, onError = backToApp, as
 router.get('/oidc/:slug/start', asyncRoute(async (req, res) => {
   const provider = oidcProviders.get(req.params.slug);
   if (!provider) return backToApp(res, { sso_error: 'unknown_provider' });
+  if (provider.kind === 'saml') return res.redirect(`/api/auth/saml/${encodeURIComponent(provider.slug)}/start`);
   await beginOidc(req, res, provider);
 }));
+
+/*
+ * SAML 2.0 (lib/saml.js): an organization's provider can be SAML instead of OIDC. SP-initiated only.
+ * After the assertion is verified, the SAME post-login path as OIDC runs (completeFederatedLogin),
+ * so every rule that makes per-org SSO safe applies identically.
+ */
+/*
+ * ⚠️ LOGIN CSRF. node-saml checks that a response answers SOME request we issued (saml_requests is
+ * global, so a scaled-out node can finish it), but not that THIS browser issued it. Without a binding,
+ * an attacker starts a login, keeps their own SAMLResponse, and auto-posts it from a victim's browser:
+ * the victim is signed into the attacker's account and whatever they upload lands there. OIDC binds
+ * with the signed st_oidc_tx cookie; this is the same idea for SAML.
+ *
+ * ⚠️ SameSite=None, not Lax: the IdP returns with a cross-site POST, which Lax does not carry. None
+ * requires Secure, so over plain http (dev) it falls back to Lax — SAML sign-in needs HTTPS in
+ * practice, which every IdP demands of an ACS URL anyway.
+ */
+const SAML_TX_COOKIE = 'st_saml_tx';
+const SAML_TX_PATH = '/api/auth/saml';
+
+router.get('/saml/:slug/start', asyncRoute(async (req, res) => {
+  const provider = oidcProviders.get(req.params.slug);
+  if (!provider || provider.kind !== 'saml') return backToApp(res, { sso_error: 'unknown_provider' });
+  try {
+    const requestId = saml.newRequestId();
+    const url = await saml.samlFor(provider, publicOrigin(req), { generateUniqueId: () => requestId })
+      .getAuthorizeUrlAsync('', undefined, {});
+    const tx = jwt.sign(
+      { typ: 'saml-tx', slug: provider.slug, rid: requestId },
+      config.jwtSecret,
+      { expiresIn: OIDC_TX_TTL_S, algorithm: 'HS256' },   // a typ no other verifier accepts
+    );
+    const secure = req.protocol === 'https';
+    res.cookie(SAML_TX_COOKIE, tx, {
+      httpOnly: true,
+      secure,
+      sameSite: secure ? 'none' : 'lax',
+      maxAge: OIDC_TX_TTL_S * 1000,
+      path: SAML_TX_PATH,
+    });
+    res.redirect(url);
+  } catch (err) {
+    console.error(`[saml] ${provider.slug} start failed:`, err.message);
+    backToApp(res, { sso_error: 'provider_unavailable' });
+  }
+}));
+
+// The IdP posts here, cross-site, so this route has its own form parser (urlencoded is not global).
+router.post('/saml/:slug/acs', express.urlencoded({ extended: false, limit: '512kb' }), asyncRoute(async (req, res) => {
+  const provider = oidcProviders.get(req.params.slug);
+  if (!provider || provider.kind !== 'saml') return backToApp(res, { sso_error: 'unknown_provider' });
+  const body = req.body || {};
+  if (typeof body.SAMLResponse !== 'string' || !body.SAMLResponse) return backToApp(res, { sso_error: 'no_code' });
+
+  // The browser binding (see SAML_TX_COOKIE). Checked BEFORE validation so a response posted from a
+  // browser that never started a login does not even spend the request ID; one-shot either way.
+  const raw = readCookie(req, SAML_TX_COOKIE);
+  const secure = req.protocol === 'https';
+  res.clearCookie(SAML_TX_COOKIE, { path: SAML_TX_PATH, httpOnly: true, secure, sameSite: secure ? 'none' : 'lax' });
+  let tx = null;
+  try {
+    tx = raw ? jwt.verify(raw, config.jwtSecret, { algorithms: ['HS256'] }) : null;
+    if (tx && (tx.typ !== 'saml-tx' || tx.slug !== provider.slug || typeof tx.rid !== 'string')) tx = null;
+  } catch { tx = null; }
+  if (!tx) {
+    console.warn(`[saml] ${provider.slug} response without this browser's login transaction`);
+    return backToApp(res, { sso_error: 'expired' });
+  }
+
+  let profile;
+  try {
+    ({ profile } = await saml.samlFor(provider, publicOrigin(req)).validatePostResponseAsync({ SAMLResponse: body.SAMLResponse }));
+    if (!profile) throw new Error('no assertion in the response');
+  } catch (err) {
+    console.warn(`[saml] ${provider.slug} response refused: ${err.message}`);
+    return backToApp(res, { sso_error: 'verification_failed' });
+  }
+  // A valid response to a request someone ELSE started (login CSRF), or to an older one of ours.
+  if (profile.inResponseTo !== tx.rid) {
+    console.warn(`[saml] ${provider.slug} response answers a request this browser did not start`);
+    return backToApp(res, { sso_error: 'bad_state' });
+  }
+  if (!saml.issuerMatches(profile, provider)) {
+    console.warn(`[saml] ${provider.slug} assertion issuer ${JSON.stringify(String(profile.issuer || '').slice(0, 200))} is not the configured IdP`);
+    return backToApp(res, { sso_error: 'verification_failed' });
+  }
+  if (saml.isTransientNameId(profile)) {
+    console.warn(`[saml] ${provider.slug} sent a transient NameID; a persistent one is required`);
+    return backToApp(res, { sso_error: 'saml_transient_nameid' });
+  }
+  // One use per assertion, atomically: a replayed (or doubly submitted) response fails here.
+  if (!saml.consumeAssertion(saml.assertionIdOf(profile))) {
+    console.warn(`[saml] ${provider.slug} assertion replayed or without an ID`);
+    return backToApp(res, { sso_error: 'verification_failed' });
+  }
+  const claims = saml.profileToClaims(profile);
+  if (!claims.sub) return backToApp(res, { sso_error: 'verification_failed' });
+  try {
+    return await completeFederatedLogin(req, res, { provider, claims, tag: 'saml' });
+  } catch (err) {
+    console.error(`[saml] ${provider.slug} sign-in failed:`, err.message);
+    return backToApp(res, { sso_error: 'server_error' });
+  }
+}));
+
+// What the IdP needs from us: our entityID, ACS address and the bindings we use.
+router.get('/saml/:slug/metadata', (req, res) => {
+  const provider = oidcProviders.get(req.params.slug);
+  if (!provider || provider.kind !== 'saml') return res.status(404).type('text/plain').send('Unknown provider');
+  try {
+    const xml = saml.samlFor(provider, publicOrigin(req)).generateServiceProviderMetadata(null, null);
+    res.type('application/samlmetadata+xml').send(xml);
+  } catch (err) {
+    res.status(500).type('text/plain').send('This provider is not fully configured.');
+  }
+});
 
 /*
  * Link an EXISTING account to an instance-wide provider.
@@ -1427,7 +1545,7 @@ router.get('/oidc/:slug/link/start', requireAuth, asyncRoute(async (req, res) =>
 
 router.get('/oidc/:slug/callback', asyncRoute(async (req, res) => {
   const provider = oidcProviders.get(req.params.slug);
-  if (!provider) return backToApp(res, { sso_error: 'unknown_provider' });
+  if (!provider || provider.kind === 'saml') return backToApp(res, { sso_error: 'unknown_provider' });
 
   // The provider itself can refuse (consent declined, admin policy). That is not an error here.
   if (req.query.error) {
@@ -1488,8 +1606,19 @@ router.get('/oidc/:slug/callback', asyncRoute(async (req, res) => {
     return backToApp(res, { sso_error: 'verification_failed' });
   }
 
+  return completeFederatedLogin(req, res, { provider, claims, link: tx.link || null });
+}));
+
+/*
+ * EVERY federated sign-in ends here — OIDC (the callback above) and SAML (the ACS below) alike — so
+ * the rules that make per-org SSO safe are written once: confinement to verified domains, SSO-only
+ * enforcement, the email-verified policy, account linking and adoption, org membership, and the
+ * cookie hand-off. `claims` is { sub, email, name, picture?, email_verified? }; `link` is the
+ * account a "link" flow started from (OIDC only).
+ */
+async function completeFederatedLogin(req, res, { provider, claims, link = null, tag = 'oidc' }) {
   const email = String(claims.email || '').toLowerCase().trim();
-  const linking = !!tx.link;
+  const linking = !!link;
   const fail = linking ? backToSettings : backToApp;
   if (!email) return fail(res, { sso_error: 'no_email' });
 
@@ -1520,12 +1649,12 @@ router.get('/oidc/:slug/callback', asyncRoute(async (req, res) => {
    */
   const enforcedOrg = oidcProviders.ssoOnlyForEmail(email);
   if (enforcedOrg && enforcedOrg.slug !== provider.slug) {
-    console.warn(`[oidc] ${provider.slug} asserted ${email}, but that organization requires ${enforcedOrg.slug}`);
+    console.warn(`[${tag}] ${provider.slug} asserted ${email}, but that organization requires ${enforcedOrg.slug}`);
     return backToApp(res, { sso_error: 'sso_required' });
   }
 
   if (!emailAllowedForProvider(provider, email)) {
-    console.warn(`[oidc] ${provider.slug} asserted ${email}, outside its verified domains [${provider.emailDomains}]`);
+    console.warn(`[${tag}] ${provider.slug} asserted ${email}, outside its verified domains [${provider.emailDomains}]`);
     return backToApp(res, { sso_error: 'domain_not_allowed' });
   }
   /*
@@ -1556,10 +1685,10 @@ router.get('/oidc/:slug/callback', asyncRoute(async (req, res) => {
    * — a password left behind is a second way in that the user believes they replaced.
    */
   if (linking) {
-    const target = db.prepare('SELECT id, email, auth_provider FROM users WHERE id = ?').get(tx.link);
+    const target = db.prepare('SELECT id, email, auth_provider FROM users WHERE id = ?').get(link);
     if (!target) return backToSettings(res, { sso_error: 'server_error' });
     if (target.email.toLowerCase() !== email) {
-      console.warn(`[oidc] link refused: ${provider.slug} asserted ${email} for account ${target.email}`);
+      console.warn(`[${tag}] link refused: ${provider.slug} asserted ${email} for account ${target.email}`);
       return backToSettings(res, { sso_error: 'link_email_mismatch' });
     }
     // Someone else already signed in with this provider identity. Two accounts must never share one
@@ -1571,7 +1700,7 @@ router.get('/oidc/:slug/callback', asyncRoute(async (req, res) => {
     db.prepare('UPDATE users SET auth_provider = ?, provider_id = ?, password_hash = NULL, avatar_url = COALESCE(?, avatar_url) WHERE id = ?')
       .run(provider.slug, String(claims.sub), claims.picture || null, target.id);
     logActivity(target.id, 'auth:sso_linked', `provider=${provider.slug}`, null, getClientIp(req));
-    console.log(`[oidc] ${provider.slug} linked to ${target.email} (password cleared)`);
+    console.log(`[${tag}] ${provider.slug} linked to ${target.email} (password cleared)`);
     return backToSettings(res, { sso_linked: provider.slug });
   }
 
@@ -1614,7 +1743,7 @@ router.get('/oidc/:slug/callback', asyncRoute(async (req, res) => {
           db.prepare("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role) VALUES (?, ?, 'workspace_viewer')")
             .run(target.id, user.id);
         } else {
-          console.warn(`[oidc] org ${provider.organizationId} has no workspace; ${user.email} has no place to land`);
+          console.warn(`[${tag}] org ${provider.organizationId} has no workspace; ${user.email} has no place to land`);
         }
         // (userId, action, details, deviceId, ipAddress, workspaceId) — the org id is NOT the 4th
         // arg; it was landing in device_id, which has no FK to catch it.
@@ -1660,10 +1789,10 @@ router.get('/oidc/:slug/callback', asyncRoute(async (req, res) => {
     });
     backToApp(res, { sso: '1' });
   } catch (err) {
-    console.error(`[oidc] ${provider.slug} sign-in failed:`, err.message);
+    console.error(`[${tag}] ${provider.slug} sign-in failed:`, err.message);
     backToApp(res, { sso_error: 'server_error' });
   }
-}));
+}
 
 /*
  * Exchange the one-shot cookie for the session token.
